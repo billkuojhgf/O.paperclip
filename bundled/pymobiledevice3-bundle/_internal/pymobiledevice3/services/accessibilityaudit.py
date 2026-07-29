@@ -1,41 +1,46 @@
+import asyncio
 import json
 import typing
-from collections.abc import Generator
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from types import TracebackType
 
 from packaging.version import Version
 
-from pymobiledevice3.lockdown import LockdownClient
+from pymobiledevice3.dtx_service_provider import DtxServiceProvider
+from pymobiledevice3.exceptions import DvtException
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
-from pymobiledevice3.services.remote_server import MessageAux, RemoteServer
 
 
 class SerializedObject:
-    def __init__(self, fields: dict):
+    def __init__(self, fields: dict[str, typing.Any]):
         self._fields = fields
 
 
 class AXAuditInspectorFocus_v1(SerializedObject):
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
 
     @property
-    def caption(self) -> str:
+    def caption(self) -> typing.Optional[str]:
         return self._fields.get("CaptionTextValue_v1")
 
     @property
-    def spoken_description(self) -> str:
+    def spoken_description(self) -> typing.Optional[str]:
         return self._fields.get("SpokenDescriptionValue_v1")
 
     @property
-    def element(self) -> bytes:
+    def element(self) -> typing.Optional["AXAuditElement_v1"]:
         return self._fields.get("ElementValue_v1")
 
     @property
     def platform_identifier(self) -> str:
         """Converts the element bytes to a hexadecimal string."""
-        return self.element.identifier.hex().upper()
+        element = self.element
+        if element is None:
+            raise DvtException("focus event carries no element")
+        return element.identifier.hex().upper()
 
     @property
     def estimated_uid(self) -> str:
@@ -63,7 +68,7 @@ class AXAuditInspectorFocus_v1(SerializedObject):
 
         return uid
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, typing.Any]:
         """Serializes the focus element into a dictionary."""
         return {
             "platform_identifier": self.platform_identifier,
@@ -77,7 +82,7 @@ class AXAuditInspectorFocus_v1(SerializedObject):
 
 
 class AXAuditElement_v1(SerializedObject):
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
 
     @property
@@ -89,19 +94,19 @@ class AXAuditElement_v1(SerializedObject):
 
 
 class AXAuditInspectorSection_v1(SerializedObject):
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
 
 
 class AXAuditElementAttribute_v1(SerializedObject):
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
 
 
 class AXAuditDeviceSetting_v1(SerializedObject):
     FIELDS = ("IdentiifierValue_v1", "CurrentValueNumber_v1")
 
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
         for k in self.FIELDS:
             if k not in self._fields:
@@ -120,6 +125,8 @@ class AXAuditDeviceSetting_v1(SerializedObject):
 
 
 class AuditType(IntEnum):
+    """Accessibility audit issue classifications reported by the device."""
+
     DYNAMIC_TEXT = 3001
     DYNAMIC_TEXT_ALT = 3002
     TEXT_CLIPPED = 3003
@@ -153,7 +160,7 @@ class AXAuditIssue_v1(SerializedObject):
         "ForegroundColorValue_v1",
     )
 
-    def __init__(self, fields):
+    def __init__(self, fields: dict[str, typing.Any]):
         super().__init__(fields)
 
         for k in self.FIELDS:
@@ -192,8 +199,8 @@ class AXAuditIssue_v1(SerializedObject):
     def background_color(self) -> typing.Any:
         return self._fields["BackgroundColorValue_v1"]
 
-    def json(self) -> dict:
-        resp = {
+    def json(self) -> dict[str, typing.Any]:
+        resp: dict[str, typing.Any] = {
             "element_rect_value": self.rect,
             "issue_classification": self.issue_type,
             "font_size": self.font_size,
@@ -210,7 +217,7 @@ class AXAuditIssue_v1(SerializedObject):
         return json.dumps(self.json())
 
 
-SERIALIZABLE_OBJECTS = {
+SERIALIZABLE_OBJECTS: dict[str, type[SerializedObject]] = {
     "AXAuditDeviceSetting_v1": AXAuditDeviceSetting_v1,
     "AXAuditInspectorFocus_v1": AXAuditInspectorFocus_v1,
     "AXAuditElement_v1": AXAuditElement_v1,
@@ -219,29 +226,43 @@ SERIALIZABLE_OBJECTS = {
     "AXAuditIssue_v1": AXAuditIssue_v1,
 }
 
+SHELL_USAGE = """
+# AccessibilityAudit shell (DTX API)
+# Use `accessibility` object methods directly, for example:
+# await accessibility.capabilities()
+# await accessibility.supported_audits_types()
+# await accessibility.settings()
+# await accessibility.run_audit([...])
+"""
+
 
 @dataclass
 class Event:
+    """An accessibility event: the device selector name and its deserialized payload."""
+
     name: str
-    data: SerializedObject
+    data: typing.Any
 
 
 class Direction(Enum):
+    """Focus-movement directions for the accessibility inspector."""
+
     Previous = 3
     Next = 4
     First = 5
     Last = 6
 
 
-def deserialize_object(d):
+def deserialize_object(d: typing.Any) -> typing.Any:
     if not isinstance(d, dict):
         if isinstance(d, list):
-            return [deserialize_object(x) for x in d]
+            return [deserialize_object(x) for x in typing.cast(list[typing.Any], d)]
         return d
 
+    d = typing.cast(dict[str, typing.Any], d)
     if "ObjectType" not in d:
         # simple dictionary
-        new_dict = {}
+        new_dict: dict[str, typing.Any] = {}
         for k, v in d.items():
             new_dict[k] = deserialize_object(v)
         return new_dict
@@ -249,91 +270,251 @@ def deserialize_object(d):
     if d["ObjectType"] == "passthrough":
         return deserialize_object(d["Value"])
     else:
-        return SERIALIZABLE_OBJECTS[d["ObjectType"]](deserialize_object(d["Value"]))
+        return typing.cast(typing.Any, SERIALIZABLE_OBJECTS[d["ObjectType"]](deserialize_object(d["Value"])))
 
 
-class AccessibilityAudit(RemoteServer):
+class _AccessibilityAuditProvider(DtxServiceProvider):
     SERVICE_NAME = "com.apple.accessibility.axAuditDaemon.remoteserver"
     RSD_SERVICE_NAME = "com.apple.accessibility.axAuditDaemon.remoteserver.shim.remote"
 
     def __init__(self, lockdown: LockdownServiceProvider):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME, remove_ssl_context=True, is_developer_service=False)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME, remove_ssl_context=True, is_developer_service=False)
+        super().__init__(lockdown, strip_ssl=True)
+        self.sent_capabilities = None
 
-        # flush previously received messages
-        self.recv_plist()
+
+class AccessibilityAudit:
+    """
+    Drive the device's accessibility audit daemon over DTX.
+
+    Provides access to accessibility capabilities and settings, on-device audits, the element
+    inspector (focus traversal, simulated activation), and a stream of live accessibility events.
+    Behavior differs across iOS versions (the iOS 15+ branch uses audit *types*, older versions use
+    audit *case IDs*).
+
+    Use as an async context manager to establish the connection and flush the daemon's initial
+    messages on entry and tear it down on exit::
+
+        async with AccessibilityAudit(lockdown) as audit:
+            issues = await audit.run_audit(await audit.supported_audits_types())
+    """
+
+    SERVICE_NAME = "com.apple.accessibility.axAuditDaemon.remoteserver"
+    RSD_SERVICE_NAME = "com.apple.accessibility.axAuditDaemon.remoteserver.shim.remote"
+
+    def __init__(self, lockdown: LockdownServiceProvider):
+        self._lockdown = lockdown
+        self._provider = _AccessibilityAuditProvider(lockdown)
+        self._event_queue: typing.Optional[asyncio.Queue[tuple[str, list[typing.Any]]]] = None
         self.product_version = Version(lockdown.product_version)
-        if Version(lockdown.product_version) >= Version("15.0"):
-            self.recv_plist()
+        self._initial_messages_to_flush = 2 if self.product_version >= Version("15.0") else 1
+        self._initial_messages_flushed = False
 
-    @property
-    def capabilities(self) -> list[str]:
-        self.broadcast.deviceCapabilities()
-        return self.recv_plist()[0]
-
-    def run_audit(self, value: list) -> list[AXAuditIssue_v1]:
-        if self.product_version >= Version("15.0"):
-            self.broadcast.deviceBeginAuditTypes_(MessageAux().append_obj(value))
+    async def __aenter__(self):
+        try:
+            await self._ensure_ready()
+        except Exception:
+            await self.close()
+            raise
         else:
-            self.broadcast.deviceBeginAuditCaseIDs_(MessageAux().append_obj(value))
+            return self
+
+    async def __aexit__(
+        self,
+        exc_type: typing.Optional[type[BaseException]],
+        exc_val: typing.Optional[BaseException],
+        exc_tb: typing.Optional[TracebackType],
+    ):
+        await self.close()
+
+    async def close(self) -> None:
+        """Tear down the event queue and close the underlying DTX connection."""
+        if self._event_queue is not None:
+            self._provider.dtx.ctx.pop("control_dispatch_queue", None)
+            self._event_queue = None
+        await self._provider.close()
+
+    def shell(self) -> None:
+        """
+        Open an interactive IPython shell with the connection ready.
+
+        The service is exposed as ``accessibility`` and the raw DTX channel as ``dtx``; the
+        connection is closed when the shell exits.
+        """
+        from pymobiledevice3.utils import run_in_loop, start_ipython_shell
+
+        run_in_loop(self._ensure_ready())
+        try:
+            start_ipython_shell(header=SHELL_USAGE, user_ns={"accessibility": self, "dtx": self._provider.dtx})
+        finally:
+            run_in_loop(self.close())
+
+    async def _invoke(self, selector: str, *args: typing.Any, expects_reply: bool = True) -> typing.Any:
+        await self._provider.connect()
+        return await self._provider.dtx._ctrl_channel.invoke(selector, *args, expects_reply=expects_reply)
+
+    @staticmethod
+    def _extract_event_payload(args: list[typing.Any]) -> typing.Any:
+        if not args:
+            return None
+        payload: typing.Any = args[0] if len(args) == 1 else args
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "value" in payload[0]:
+            return [x["value"] for x in typing.cast(list[typing.Any], payload)]
+        return typing.cast(typing.Any, payload)
+
+    async def _ensure_ready(self) -> None:
+        await self._provider.connect()
+        if self._event_queue is None:
+            self._event_queue = asyncio.Queue()
+            self._provider.dtx.ctx["control_dispatch_queue"] = self._event_queue
+        if self._initial_messages_flushed:
+            return
+        for _ in range(self._initial_messages_to_flush):
+            try:
+                await asyncio.wait_for(self._event_queue.get(), timeout=0.3)
+            except asyncio.TimeoutError:
+                break
+        self._initial_messages_flushed = True
+
+    async def capabilities(self) -> list[str]:
+        """
+        Query the accessibility capabilities reported by the device.
+
+        :returns: The list of capability identifiers the device supports.
+        """
+        await self._ensure_ready()
+        return await self._invoke("deviceCapabilities")
+
+    async def run_audit(self, value: list[typing.Any]) -> list[AXAuditIssue_v1]:
+        """
+        Run accessibility audits on the device and wait for the results.
+
+        Begins the requested audits (by audit type on iOS 15+, by audit case ID on older versions)
+        and blocks until the device reports completion, ignoring unrelated events in the meantime.
+
+        :param value: The audit types (iOS 15+) or audit case IDs to run.
+        :returns: The accessibility issues found by the audits.
+        """
+        await self._ensure_ready()
+        if self.product_version >= Version("15.0"):
+            await self._invoke("deviceBeginAuditTypes:", value, expects_reply=False)
+        else:
+            await self._invoke("deviceBeginAuditCaseIDs:", value, expects_reply=False)
 
         while True:
-            message = self.recv_plist()
-            if message[1] is None or message[0] != "hostDeviceDidCompleteAuditCategoriesWithAuditIssues:":
+            assert self._event_queue is not None
+            name, args = await self._event_queue.get()
+            if name != "hostDeviceDidCompleteAuditCategoriesWithAuditIssues:":
                 continue
-            return deserialize_object(message[1])[0]["value"]
+            payload = self._extract_event_payload(args)
+            if payload is None:
+                continue
+            raw = deserialize_object(payload)
+            issues = typing.cast(list[typing.Any], raw) if isinstance(raw, list) else [raw]
+            if issues and isinstance(issues[0], dict) and "value" in issues[0]:
+                # older aux-shaped payload: [{"type": ..., "value": [issues]}]
+                return typing.cast(list[AXAuditIssue_v1], issues[0]["value"])
+            # modern shape: the deserialized payload IS the issue list (empty when the audit passes)
+            return typing.cast(list[AXAuditIssue_v1], issues)
 
-    def supported_audits_types(self) -> None:
+    async def supported_audits_types(self) -> list[typing.Any]:
+        """
+        Query the audit types (iOS 15+) or audit case IDs (older versions) the device supports.
+
+        :returns: The supported audit identifiers, suitable for passing to `run_audit`.
+        """
+        await self._ensure_ready()
         if self.product_version >= Version("15.0"):
-            self.broadcast.deviceAllSupportedAuditTypes()
+            response = await self._invoke("deviceAllSupportedAuditTypes")
         else:
-            self.broadcast.deviceAllAuditCaseIDs()
-        return deserialize_object(self.recv_plist()[0])
+            response = await self._invoke("deviceAllAuditCaseIDs")
+        return deserialize_object(response)
 
-    @property
-    def settings(self) -> list[AXAuditDeviceSetting_v1]:
-        self.broadcast.deviceAccessibilitySettings()
-        return deserialize_object(self.recv_plist()[0])
+    async def settings(self) -> list[AXAuditDeviceSetting_v1]:
+        """
+        Read the device's current accessibility settings.
 
-    def perform_handshake(self) -> None:
-        # this service acts differently from others, requiring no handshake
-        pass
+        :returns: The accessibility settings, each as a key/value pair.
+        """
+        await self._ensure_ready()
+        return deserialize_object(await self._invoke("deviceAccessibilitySettings"))
 
-    def set_app_monitoring_enabled(self, value: bool) -> None:
-        self.broadcast.deviceSetAppMonitoringEnabled_(MessageAux().append_obj(value), expects_reply=False)
+    async def set_app_monitoring_enabled(self, value: bool) -> None:
+        """
+        Enable or disable monitoring of the foreground app's accessibility elements.
 
-    def set_monitored_event_type(self, event_type: typing.Optional[int] = None) -> None:
+        :param value: True to enable monitoring, False to disable.
+        """
+        await self._ensure_ready()
+        await self._invoke("deviceSetAppMonitoringEnabled:", value, expects_reply=False)
+
+    async def set_monitored_event_type(self, event_type: typing.Optional[int] = None) -> None:
+        """
+        Set which inspector event type the device should report.
+
+        :param event_type: The event type to monitor; None resets it to 0 (no specific type).
+        """
+        await self._ensure_ready()
         if event_type is None:
             event_type = 0
-        self.broadcast.deviceInspectorSetMonitoredEventType_(MessageAux().append_obj(event_type), expects_reply=False)
+        await self._invoke("deviceInspectorSetMonitoredEventType:", event_type, expects_reply=False)
 
-    def set_show_ignored_elements(self, value: bool) -> None:
-        self.broadcast.deviceInspectorShowIgnoredElements_(MessageAux().append_obj(int(value)), expects_reply=False)
+    async def set_show_ignored_elements(self, value: bool) -> None:
+        """
+        Toggle whether the inspector includes accessibility-ignored elements.
 
-    def set_show_visuals(self, value: bool) -> None:
-        self.broadcast.deviceInspectorShowVisuals_(MessageAux().append_obj(int(value)), expects_reply=False)
+        :param value: True to include ignored elements, False to hide them.
+        """
+        await self._ensure_ready()
+        await self._invoke("deviceInspectorShowIgnoredElements:", int(value), expects_reply=False)
 
-    def iter_events(
-        self, app_monitoring_enabled=True, monitored_event_type: typing.Optional[int] = None
-    ) -> typing.Generator[Event, None, None]:
-        self.set_app_monitoring_enabled(app_monitoring_enabled)
-        self.set_monitored_event_type(monitored_event_type)
+    async def set_show_visuals(self, value: bool) -> None:
+        """
+        Toggle the on-device visual overlay highlighting inspected elements.
+
+        :param value: True to show the overlay, False to hide it.
+        """
+        await self._ensure_ready()
+        await self._invoke("deviceInspectorShowVisuals:", int(value), expects_reply=False)
+
+    async def iter_events(
+        self, app_monitoring_enabled: bool = True, monitored_event_type: typing.Optional[int] = None
+    ) -> AsyncGenerator[Event, None]:
+        """
+        Stream accessibility events from the device indefinitely.
+
+        Configures app monitoring and the monitored event type, then yields every event the device
+        publishes.
+
+        :param app_monitoring_enabled: Whether to enable foreground-app monitoring before streaming.
+        :param monitored_event_type: The event type to monitor; None means no specific type.
+        :yields: Each accessibility `Event` with its deserialized payload.
+        """
+        await self._ensure_ready()
+        await self.set_app_monitoring_enabled(app_monitoring_enabled)
+        await self.set_monitored_event_type(monitored_event_type)
 
         while True:
-            message = self.recv_plist()
-            if message[1] is None:
+            assert self._event_queue is not None
+            name, args = await self._event_queue.get()
+            payload = self._extract_event_payload(args)
+            if payload is None:
                 continue
-            data = [x["value"] for x in message[1]]
-            yield Event(name=message[0], data=deserialize_object(data))
+            yield Event(name=name, data=deserialize_object(payload))
 
-    def move_focus_next(self) -> None:
-        self.move_focus(Direction.Next)
+    async def move_focus_next(self) -> None:
+        """Move the inspector focus to the next element."""
+        await self.move_focus(Direction.Next)
 
-    def perform_press(self, element: bytes) -> None:
-        """simulate click (can be used only for processes with task_for_pid-allow"""
-        element = {
+    async def perform_press(self, element: bytes) -> None:
+        """
+        Simulate a press/activation on an accessibility element.
+
+        Can only be used for processes that carry the ``task_for_pid-allow`` entitlement.
+
+        :param element: The platform element value identifying the target element.
+        """
+        await self._ensure_ready()
+        serialized_element: dict[str, typing.Any] = {
             "ObjectType": "AXAuditElement_v1",
             "Value": {
                 "ObjectType": "passthrough",
@@ -344,7 +525,7 @@ class AccessibilityAudit(RemoteServer):
             },
         }
 
-        action = {
+        action: dict[str, typing.Any] = {
             "ObjectType": "AXAuditElementAttribute_v1",
             "Value": {
                 "ObjectType": "passthrough",
@@ -381,12 +562,16 @@ class AccessibilityAudit(RemoteServer):
             },
         }
 
-        self.broadcast.deviceElement_performAction_withValue_(
-            MessageAux().append_obj(element).append_obj(action).append_obj(0), expects_reply=False
-        )
+        await self._invoke("deviceElement:performAction:withValue:", serialized_element, action, 0, expects_reply=False)
 
-    def move_focus(self, direction: Direction) -> None:
-        options = {
+    async def move_focus(self, direction: Direction) -> None:
+        """
+        Move the inspector focus in the given direction.
+
+        :param direction: The `Direction` to move the focus (previous, next, first, or last).
+        """
+        await self._ensure_ready()
+        options: dict[str, typing.Any] = {
             "ObjectType": "passthrough",
             "Value": {
                 "allowNonAX": {
@@ -404,10 +589,17 @@ class AccessibilityAudit(RemoteServer):
             },
         }
 
-        self.broadcast.deviceInspectorMoveWithOptions_(MessageAux().append_obj(options), expects_reply=False)
+        await self._invoke("deviceInspectorMoveWithOptions:", options, expects_reply=False)
 
-    def set_setting(self, name: str, value: typing.Any) -> None:
-        setting = {
+    async def set_setting(self, name: str, value: typing.Any) -> None:
+        """
+        Update a single accessibility setting on the device.
+
+        :param name: The setting identifier (matching `AXAuditDeviceSetting_v1.key`).
+        :param value: The new value to assign to the setting.
+        """
+        await self._ensure_ready()
+        setting: dict[str, typing.Any] = {
             "ObjectType": "AXAuditDeviceSetting_v1",
             "Value": {
                 "ObjectType": "passthrough",
@@ -420,29 +612,64 @@ class AccessibilityAudit(RemoteServer):
                 },
             },
         }
-        self.broadcast.deviceUpdateAccessibilitySetting_withValue_(
-            MessageAux().append_obj(setting).append_obj({"ObjectType": "passthrough", "Value": value}),
+        await self._invoke(
+            "deviceUpdateAccessibilitySetting:withValue:",
+            setting,
+            {"ObjectType": "passthrough", "Value": value},
             expects_reply=False,
         )
 
-    def reset_settings(self) -> None:
-        self.broadcast.deviceResetToDefaultAccessibilitySettings()
+    async def reset_settings(self) -> None:
+        """Reset all accessibility settings to their device defaults."""
+        await self._ensure_ready()
+        await self._invoke("deviceResetToDefaultAccessibilitySettings")
 
-    def iter_elements(self) -> Generator[AXAuditInspectorFocus_v1, None, None]:
-        iterator = self.iter_events()
+    async def iter_elements(self) -> AsyncGenerator[AXAuditInspectorFocus_v1, None]:
+        """
+        Walk the focusable accessibility elements of the foreground app.
 
-        # every focus change is expected publish a "hostInspectorCurrentElementChanged:"
-        self.move_focus_next()
+        Enables app monitoring, then repeatedly advances the focus and yields each newly focused
+        element. Stops once an already-seen element is revisited (loop detected). If the focus does
+        not advance, it retries; persistent silence raises a timeout.
 
-        visited_identifiers = set()
+        :yields: Each focused element as it is reached.
+        :raises TimeoutError: If no focus events arrive after repeated retries.
+        """
+        await self._ensure_ready()
+        await self.set_app_monitoring_enabled(True)
+        await self.set_monitored_event_type()
 
-        for event in iterator:
+        # Every focus change is expected to publish "hostInspectorCurrentElementChanged:".
+        await self.move_focus_next()
+        visited_identifiers: set[typing.Any] = set()
+        consecutive_timeouts = 0
+
+        while True:
+            try:
+                assert self._event_queue is not None
+                name, args = await asyncio.wait_for(self._event_queue.get(), timeout=1.0)
+                consecutive_timeouts = 0
+            except asyncio.TimeoutError as err:
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= 5:
+                    raise TimeoutError("timed out waiting for accessibility focus events") from err
+                await self.move_focus_next()
+                continue
+            payload = self._extract_event_payload(args)
+            if payload is None:
+                continue
+            event = Event(name=name, data=deserialize_object(payload))
             if event.name != "hostInspectorCurrentElementChanged:":
                 # ignore any other events
                 continue
 
             # each such event should contain exactly one element that became in focus
-            current_item = event.data[0]
+            if isinstance(event.data, list):
+                if not typing.cast(typing.Any, event).data:
+                    continue
+                current_item = typing.cast(list[typing.Any], event.data)[0]
+            else:
+                current_item = event.data
             current_identifier = current_item.platform_identifier
 
             if current_identifier in visited_identifiers:
@@ -450,4 +677,4 @@ class AccessibilityAudit(RemoteServer):
 
             yield current_item
             visited_identifiers.add(current_identifier)
-            self.move_focus_next()
+            await self.move_focus_next()

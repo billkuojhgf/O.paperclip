@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass
-from typing import Optional
+from typing import Any, Optional, Union
 
-from pymobiledevice3.services.web_protocol.automation_session import RESOURCES, Point, Rect, Size
+from pymobiledevice3.services.web_protocol.automation_session import RESOURCES, AutomationSession, Point, Rect, Size
 from pymobiledevice3.services.web_protocol.element import WebElement
 from pymobiledevice3.services.web_protocol.selenium_api import By, SeleniumApi
 from pymobiledevice3.services.web_protocol.switch_to import SwitchTo
@@ -22,20 +22,20 @@ class Cookie:
     sameSite: str = "None"
 
     @classmethod
-    def from_automation(cls, d):
+    def from_automation(cls, d: dict[str, Any]):
         d.pop("size")
         return cls(**d)
 
 
 class WebDriver(SeleniumApi):
-    def __init__(self, session):
+    def __init__(self, session: AutomationSession):
         """
         :param pymobiledevice3.services.web_protocol.automation_session.AutomationSession session: Automation session.
         """
         self.session = session
         self.switch_to = SwitchTo(session)
 
-    async def add_cookie(self, cookie: Cookie):
+    async def add_cookie(self, cookie: Union[Cookie, dict[str, Any]]):
         """Adds a cookie to your current session."""
         if isinstance(cookie, Cookie):
             cookie = asdict(cookie)
@@ -51,14 +51,12 @@ class WebDriver(SeleniumApi):
         """Closes the current window."""
         await self.session.close_window()
 
-    @property
-    async def current_url(self):
+    async def get_current_url(self):
         """Gets the URL of the current page."""
         await self.session.wait_for_navigation_to_complete()
         return (await self.session.get_browsing_context())["url"]
 
-    @property
-    async def current_window_handle(self):
+    async def get_current_window_handle(self):
         """Returns the handle of the current window."""
         return (await self.session.get_browsing_context())["handle"]
 
@@ -70,7 +68,7 @@ class WebDriver(SeleniumApi):
         """Deletes a single cookie with the given name."""
         await self.session.delete_single_cookie(name)
 
-    async def execute_async_script(self, script: str, *args):
+    async def execute_async_script(self, script: str, *args: Any):
         """
         Asynchronously Executes JavaScript in the current window/frame.
         :param script: The JavaScript to execute.
@@ -78,7 +76,7 @@ class WebDriver(SeleniumApi):
         """
         return await self.session.execute_script(script, args, async_=True)
 
-    async def execute_script(self, script: str, *args):
+    async def execute_script(self, script: str, *args: Any):
         """
         Synchronously Executes JavaScript in the current window/frame.
         :param script: The JavaScript to execute.
@@ -86,12 +84,12 @@ class WebDriver(SeleniumApi):
         """
         return await self.session.execute_script(script, args)
 
-    async def find_element(self, by=By.ID, value=None) -> Optional[WebElement]:
+    async def find_element(self, by: By = By.ID, value: Optional[str] = None) -> Optional[WebElement]:
         """Find an element given a By strategy and locator."""
         elem = await self.session.find_elements(by, value)
         return None if elem is None else WebElement(self.session, elem)
 
-    async def find_elements(self, by=By.ID, value=None) -> list[WebElement]:
+    async def find_elements(self, by: By = By.ID, value: Optional[str] = None) -> list[WebElement]:
         """Find elements given a By strategy and locator."""
         elements = await self.session.find_elements(by, value, single=False)
         return [WebElement(self.session, elem) for elem in elements]
@@ -112,18 +110,18 @@ class WebDriver(SeleniumApi):
         await self.session.navigate_broswing_context(url)
         await self.session.switch_to_browsing_context("")
 
-    async def get_cookie(self, name: str) -> Cookie:
+    async def get_cookie(self, name: str) -> Optional[Cookie]:
         """Get a single cookie by name. Returns the cookie if found, None if not."""
         for cookie in await self.get_cookies():
             if cookie.name == name:
                 return cookie
+        return None
 
     async def get_cookies(self) -> list[Cookie]:
         """Returns cookies visible in the current session."""
         return list(map(Cookie.from_automation, await self.session.get_all_cookies()))
 
-    @property
-    async def screenshot_as_base64(self) -> str:
+    async def _get_screenshot_as_base64(self) -> str:
         """Gets the screenshot of the current window as a base64 encoded string."""
         return await self.session.screenshot_as_base64()
 
@@ -147,7 +145,7 @@ class WebDriver(SeleniumApi):
         rect = await self.get_window_rect()
         return Size(height=rect.height, width=rect.width)
 
-    def implicitly_wait(self, time_to_wait):
+    def implicitly_wait(self, time_to_wait: int):
         """Sets a sticky timeout to implicitly wait for an element to be found, or a command to complete."""
         self.session.implicit_wait_timeout = time_to_wait * 1000
 
@@ -159,8 +157,7 @@ class WebDriver(SeleniumApi):
         """Invokes the window manager-specific 'minimize' operation."""
         await self.session.hide_window()
 
-    @property
-    async def page_source(self) -> str:
+    async def get_page_source(self) -> str:
         """Gets the source of the current page."""
         return await self.session.evaluate_js_function("function() { return document.documentElement.outerHTML; }")
 
@@ -170,15 +167,21 @@ class WebDriver(SeleniumApi):
         await self.session.reload_browsing_context()
         await self.session.switch_to_browsing_context("")
 
-    async def set_window_position(self, x, y):
+    async def set_window_position(self, x: str, y: str):
         """Sets the x,y position of the current window."""
         await self.set_window_rect(x=int(x, 0), y=int(y, 0))
 
-    async def set_window_rect(self, x=None, y=None, width=None, height=None):
+    async def set_window_rect(
+        self,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ):
         """Sets the x, y coordinates of the window as well as height and width of the current window."""
         await self.session.set_window_frame(x, y, width, height)
 
-    async def set_window_size(self, width, height):
+    async def set_window_size(self, width: str, height: str):
         """Sets the width and height of the current window."""
         await self.set_window_rect(width=int(width, 0), height=int(height, 0))
 
@@ -186,13 +189,11 @@ class WebDriver(SeleniumApi):
         """Creates a new session."""
         await self.session.start_session()
 
-    @property
-    async def title(self) -> str:
+    async def get_title(self) -> str:
         """Returns the title of the current page."""
         await self.session.wait_for_navigation_to_complete()
         return await self.session.evaluate_js_function("function() { return document.title; }")
 
-    @property
-    async def window_handles(self) -> list[str]:
+    async def get_window_handles(self) -> list[str]:
         """Returns the handles of all windows within the current session."""
         return await self.session.get_window_handles()

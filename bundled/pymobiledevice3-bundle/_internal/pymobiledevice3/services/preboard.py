@@ -6,6 +6,15 @@ from pymobiledevice3.services.lockdown_service import LockdownService
 
 
 class PreboardService(LockdownService):
+    """
+    Manage preboard stashbags on the device via the ``com.apple.preboardservice_v2`` lockdown service.
+
+    A stashbag holds key material that allows the device to unlock data-protection classes during an
+    unattended reboot (e.g. before the user enters their passcode). This service creates and commits
+    such stashbags. This is a lockdown service and is used as an async context manager; the
+    RSD/tunnel variant is selected automatically for non-`LockdownClient` providers.
+    """
+
     RSD_SERVICE_NAME = "com.apple.preboardservice_v2.shim.remote"
     SERVICE_NAME = "com.apple.preboardservice_v2"
 
@@ -15,8 +24,24 @@ class PreboardService(LockdownService):
         else:
             super().__init__(lockdown, self.RSD_SERVICE_NAME)
 
-    def create_stashbag(self, manifest):
-        return self.service.send_recv_plist({"Command": "CreateStashbag", "Manifest": manifest})
+    async def create_stashbag(self, manifest: bytes):
+        """
+        Create a stashbag on the device.
 
-    def commit(self, manifest):
-        return self.service.send_recv_plist({"Command": "CommitStashbag", "Manifest": manifest})
+        Sends a ``CreateStashbag`` command with the given manifest.
+
+        :param manifest: the stashbag manifest describing the key material to stash.
+        :returns: the device's response to the command.
+        """
+        return await self.service.send_recv_plist({"Command": "CreateStashbag", "Manifest": manifest})
+
+    async def commit(self, manifest: bytes):
+        """
+        Commit a previously created stashbag on the device.
+
+        Sends a ``CommitStashbag`` command with the given manifest.
+
+        :param manifest: the stashbag manifest to commit.
+        :returns: the device's response to the command.
+        """
+        return await self.service.send_recv_plist({"Command": "CommitStashbag", "Manifest": manifest})

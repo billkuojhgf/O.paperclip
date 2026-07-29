@@ -10,7 +10,7 @@
 
 import io
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from construct import Bytes, ChecksumError, Int16ul, Int32ul, Int64ul, Struct
 
@@ -192,8 +192,8 @@ def _read_elf_headers(data: bytes):
     return None, None
 
 
-def _read_program_headers(data: bytes, kind: str, hdr) -> list:
-    phdrs = []
+def _read_program_headers(data: bytes, kind: str, hdr: Any) -> list[Any]:
+    phdrs: list[Any] = []
     if hdr.e_phnum == 0:
         logger.error("%s: ELF has no program sections", "_read_program_headers")
         return phdrs
@@ -213,7 +213,7 @@ def _read_program_headers(data: bytes, kind: str, hdr) -> list:
 
 def _elf_last_segment_end(data: bytes) -> Optional[int]:
     kind, hdr = _read_elf_headers(data)
-    if not hdr:
+    if kind is None or not hdr:
         return None
     phdrs = _read_program_headers(data, kind, hdr)
     if not phdrs:
@@ -223,7 +223,7 @@ def _elf_last_segment_end(data: bytes) -> Optional[int]:
     return int(last.p_offset + last.p_filesz)
 
 
-def _mbn_v7_header_sizes_valid(h, sect_size: int) -> bool:
+def _mbn_v7_header_sizes_valid(h: Any, sect_size: int) -> bool:
     total = (
         MBN_V7.sizeof()
         + h.common_metadata_size
@@ -238,7 +238,7 @@ def _mbn_v7_header_sizes_valid(h, sect_size: int) -> bool:
     return total <= sect_size
 
 
-def _mbn_v7_header_sizes_expected(h) -> bool:
+def _mbn_v7_header_sizes_expected(h: Any) -> bool:
     return (
         (h.qti_metadata_size in (0, 0xE0))
         and (h.oem_metadata_size in (0, 0xE0))
@@ -247,7 +247,7 @@ def _mbn_v7_header_sizes_expected(h) -> bool:
     )
 
 
-def _mbn_v7_log(h, func: str, prefix: str) -> None:
+def _mbn_v7_log(h: Any, func: str, prefix: str) -> None:
     logger.debug(
         "%s: %s header {version=0x%x, common_metadata_size=0x%x, qti_metadata_size=0x%x, "
         "oem_metadata_size=0x%x, hash_table_size=0x%x, qti_signature_size=0x%x, "
@@ -276,14 +276,8 @@ def mbn_stitch(data: bytes, blob: bytes) -> Optional[bytes]:
     Overwrite the tail of `data` with `blob`. Format-aware size logging/checks.
     Returns new bytes or None.
     """
-    if data is None:
-        logger.error("%s: data is NULL", "mbn_stitch")
-        return None
     if not data:
         logger.error("%s: data size is 0", "mbn_stitch")
-        return None
-    if blob is None:
-        logger.error("%s: blob is NULL", "mbn_stitch")
         return None
     if not blob:
         logger.error("%s: blob size is 0", "mbn_stitch")
@@ -394,14 +388,8 @@ def mbn_mav25_stitch(data: bytes, blob: bytes) -> Optional[bytes]:
     - Writes OEM sig+chain after existing dest qti sig+chain
     Returns new bytes or None.
     """
-    if data is None:
-        logger.error("%s: data is NULL", "mbn_mav25_stitch")
-        return None
     if not data:
         logger.error("%s: data size is 0", "mbn_mav25_stitch")
-        return None
-    if blob is None:
-        logger.error("%s: blob is NULL", "mbn_mav25_stitch")
         return None
     if not blob:
         logger.error("%s: blob size is 0", "mbn_mav25_stitch")
@@ -410,7 +398,7 @@ def mbn_mav25_stitch(data: bytes, blob: bytes) -> Optional[bytes]:
     data_size, blob_size = len(data), len(blob)
 
     kind, ehdr = _read_elf_headers(data)
-    if not ehdr:
+    if kind is None or not ehdr:
         logger.error("%s: data is not a valid ELF", "mbn_mav25_stitch")
         return None
 

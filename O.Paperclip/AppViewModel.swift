@@ -1043,5 +1043,6 @@ final class AppViewModel {
         stopPinnedLocationKeepAlive()
         moveTimer?.invalidate()
         moveTimer = nil
+        deviceManager.disconnect()
     }
 }

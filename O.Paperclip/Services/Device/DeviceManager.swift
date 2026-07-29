@@ -92,6 +92,62 @@ enum PrivilegedTunnelPIDParser {
     }
 }
 
+enum USBMuxConnectionTypePolicy {
+    static func isUSB(_ connectionType: String?) -> Bool {
+        connectionType?.caseInsensitiveCompare("USB") == .orderedSame
+    }
+}
+
+enum TunnelCommandPolicy {
+    static func arguments(connectionType: String, transport: String, udid: String?) -> [String] {
+        if connectionType.caseInsensitiveCompare("usb") == .orderedSame {
+            return ["lockdown", "start-tunnel", "--script-mode"]
+                + (udid.map { ["--udid", $0] } ?? [])
+        }
+        return [
+            "remote", "start-tunnel",
+            "--connection-type", connectionType,
+            "--script-mode",
+            "-p", transport
+        ] + (udid.map { ["--udid", $0] } ?? [])
+    }
+}
+
+enum PrivilegedTunnelAttemptIdentity {
+    static let directoryPrefix = "attempt-"
+
+    static func directoryName(identifier: UUID = UUID()) -> String {
+        directoryPrefix + identifier.uuidString.lowercased()
+    }
+}
+
+struct ConnectionAttemptState {
+    private(set) var generation: UInt64 = 0
+    private(set) var isInFlight = false
+
+    mutating func begin() -> UInt64? {
+        guard !isInFlight else { return nil }
+        generation &+= 1
+        isInFlight = true
+        return generation
+    }
+
+    mutating func invalidate() -> UInt64 {
+        generation &+= 1
+        isInFlight = false
+        return generation
+    }
+
+    mutating func finish(_ finishedGeneration: UInt64) {
+        guard generation == finishedGeneration else { return }
+        isInFlight = false
+    }
+
+    func isCurrent(_ candidate: UInt64) -> Bool {
+        generation == candidate
+    }
+}
+
 enum DeviceLogRedactor {
     private static let redactedEndpoint = "[RSD 已遮罩]"
     private static let redactedHost = "[RSD_HOST]"
@@ -309,16 +365,39 @@ private struct PrivilegedTunnelFiles {
     let directoryURL: URL
     let logURL: URL
     let pidURL: URL
+    let wrapperPIDURL: URL
     let stopURL: URL
     let scriptURL: URL
 
-    static func makeDefault() -> Self {
-        let directoryURL = DiagnosticsPaths.directoryURL(named: "PrivilegedTunnel")
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
+    static var rootDirectoryURL: URL {
+        DiagnosticsPaths.directoryURL(named: "PrivilegedTunnel")
+    }
+
+    static func makeUnique() -> Self {
+        files(in: rootDirectoryURL.appendingPathComponent(
+            PrivilegedTunnelAttemptIdentity.directoryName(),
+            isDirectory: true
+        ))
+    }
+
+    static func files(in directoryURL: URL) -> Self {
+        return PrivilegedTunnelFiles(
+            directoryURL: directoryURL,
+            logURL: directoryURL.appendingPathComponent("tunnel.log"),
+            pidURL: directoryURL.appendingPathComponent("child.pid"),
+            wrapperPIDURL: directoryURL.appendingPathComponent("wrapper.pid"),
+            stopURL: directoryURL.appendingPathComponent("stop"),
+            scriptURL: directoryURL.appendingPathComponent("wrapper.sh")
+        )
+    }
+
+    static func legacy() -> Self {
+        let directoryURL = rootDirectoryURL
         return PrivilegedTunnelFiles(
             directoryURL: directoryURL,
             logURL: directoryURL.appendingPathComponent("opaperclip_tunnel.log"),
             pidURL: directoryURL.appendingPathComponent("opaperclip_tunnel.pid"),
+            wrapperPIDURL: directoryURL.appendingPathComponent("opaperclip_tunnel_wrapper.pid"),
             stopURL: directoryURL.appendingPathComponent("opaperclip_tunnel.stop"),
             scriptURL: directoryURL.appendingPathComponent("opaperclip_tunnel_wrapper.sh")
         )
@@ -330,7 +409,7 @@ private enum PrivilegedTunnelArtifactPreparer {
         files: PrivilegedTunnelFiles,
         fileManager: FileManager = .default
     ) {
-        for url in [files.logURL, files.pidURL] {
+        for url in [files.logURL, files.pidURL, files.wrapperPIDURL] {
             if !fileManager.fileExists(atPath: url.path) {
                 fileManager.createFile(atPath: url.path, contents: Data())
             } else {
@@ -528,7 +607,8 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
     private let sendQueue = DispatchQueue(label: "paperclip.gps.sender", qos: .utility)
     private let connectionQueue = DispatchQueue(label: "paperclip.connection", qos: .utility)
-    private var isConnectionInFlight = false
+    private let connectionLifecycleLock = NSLock()
+    private var connectionAttemptState = ConnectionAttemptState()
     private let sendQueueSpecificKey = DispatchSpecificKey<String>()
     private let sendQueueSpecificValue = "paperclip.gps.sender"
     private var inFlight = false
@@ -546,7 +626,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     private var expectedDvtStreamExit = false
     private var sentLocationCount: Int = 0
     private var activeTunnelConnectionType: TunnelConnectionType?
-    private let privilegedTunnelFiles = PrivilegedTunnelFiles.makeDefault()
+    private var activePrivilegedTunnelFiles: PrivilegedTunnelFiles?
     private let runtimeLogStore = RotatingRuntimeLogStore(logURL: DiagnosticsPaths.logFileURL(named: "device-runtime.log"))
     private let runtimeLogQueue = DispatchQueue(label: "paperclip.runtime.log", qos: .utility)
     private static let manualRsdHostKey = "paperclip.connection.manualRsdHost"
@@ -567,11 +647,72 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         manualRsdPort = defaults.string(forKey: Self.manualRsdPortKey) ?? ""
         tunnelUDID = defaults.string(forKey: Self.tunnelUDIDKey) ?? ""
         isWirelessMode = defaults.bool(forKey: Self.wirelessModeKey)
+        connectionQueue.async { [weak self] in
+            self?.recoverOrphanedPrivilegedTunnels()
+        }
     }
 
     deinit {
         cancelAutoReconnect()
         stopTunnel()
+    }
+
+    private func beginConnectionAttempt() -> UInt64? {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        return connectionAttemptState.begin()
+    }
+
+    @discardableResult
+    private func invalidateConnectionAttempt() -> UInt64 {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        return connectionAttemptState.invalidate()
+    }
+
+    private func finishConnectionAttempt(_ generation: UInt64) {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        connectionAttemptState.finish(generation)
+    }
+
+    private func isCurrentConnectionAttempt(_ generation: UInt64) -> Bool {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        return connectionAttemptState.isCurrent(generation)
+    }
+
+    private func currentConnectionGeneration() -> UInt64 {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        return connectionAttemptState.generation
+    }
+
+    private func ensureCurrentConnectionAttempt(_ generation: UInt64) throws {
+        guard isCurrentConnectionAttempt(generation) else {
+            throw NSError(domain: "DeviceManager.ConnectionAttempt", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "連線流程已取消"
+            ])
+        }
+    }
+
+    private func registerPrivilegedTunnelFiles(
+        _ files: PrivilegedTunnelFiles,
+        generation: UInt64
+    ) -> Bool {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        guard connectionAttemptState.isCurrent(generation) else { return false }
+        activePrivilegedTunnelFiles = files
+        return true
+    }
+
+    private func takeActivePrivilegedTunnelFiles() -> PrivilegedTunnelFiles? {
+        connectionLifecycleLock.lock()
+        defer { connectionLifecycleLock.unlock() }
+        let files = activePrivilegedTunnelFiles
+        activePrivilegedTunnelFiles = nil
+        return files
     }
 
     func connectDevice() {
@@ -598,24 +739,24 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
     private func connectDeviceInternal(autoTriggered: Bool, force: Bool) {
         guard force || !isConnected else { return }
+        guard let generation = beginConnectionAttempt() else {
+            appendLog("已有連線流程進行中，略過重複請求")
+            return
+        }
         if !autoTriggered {
             cancelAutoReconnect()
             appendLog("開始連線 Apple 裝置")
-            setConnectionState(.connecting(step: "初始化"), deviceName: "連線中…", lastError: nil)
+            setConnectionState(.connecting(step: "初始化"), deviceName: "連線中…", lastError: nil, generation: generation)
         } else {
-            setConnectionState(.connecting(step: "自動重連中"), deviceName: "重新連線中…", lastError: nil)
+            setConnectionState(.connecting(step: "自動重連中"), deviceName: "重新連線中…", lastError: nil, generation: generation)
             appendLog("執行自動重連（第 \(reconnectAttempt) 次）")
         }
 
         connectionQueue.async {
-            if self.isConnectionInFlight {
-                self.appendLog("已有連線流程進行中，略過重複請求")
-                return
-            }
-            self.isConnectionInFlight = true
-            defer { self.isConnectionInFlight = false }
+            defer { self.finishConnectionAttempt(generation) }
 
             do {
+                try self.ensureCurrentConnectionAttempt(generation)
                 self.activeTunnelConnectionType = self.isWirelessMode ? .wifi : .usb
                 let cmd = try self.resolveCLI()
                 self.appendLog("CLI: \(cmd.joined(separator: " "))")
@@ -624,31 +765,33 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                     timeout: AppConstants.Timeouts.pymobiledeviceCheck,
                     step: "檢查 pymobiledevice3"
                 )
+                try self.ensureCurrentConnectionAttempt(generation)
 
                 if let manual = self.manualEndpointIfValid() {
-                    self.setStage("使用手動 RSD")
+                    self.setStage("使用手動 RSD", generation: generation)
                     self.rsdEndpoint = manual
-                    try self.verifyRsdEndpoint(using: cmd, ep: manual)
+                    try self.verifyRsdEndpoint(using: cmd, ep: manual, generation: generation)
                 } else {
-                    let tunnelUDID = try self.preferredConnectionUDID(using: cmd)
-                    self.setStage("準備建立連線")
+                    let tunnelUDID = try self.preferredConnectionUDID(using: cmd, generation: generation)
+                    try self.ensureCurrentConnectionAttempt(generation)
+                    self.setStage("準備建立連線", generation: generation)
                     do {
-                        try self.startTunnelAndResolveEndpoint(using: cmd, udid: tunnelUDID)
+                        try self.startTunnelAndResolveEndpoint(using: cmd, udid: tunnelUDID, generation: generation)
                     } catch {
                         let err = error.localizedDescription
                         if err.localizedCaseInsensitiveContains("requires root privileges") {
                             self.appendLog("start-tunnel 需要管理員權限，改用提示模式重試")
-                            try self.startTunnelWithAdminPrompt(using: cmd, udid: tunnelUDID)
+                            try self.startTunnelWithAdminPrompt(using: cmd, udid: tunnelUDID, generation: generation)
                         }
                         else if self.shouldFallbackToAnyDevice(for: err) {
                             self.appendLog("指定 UDID 連線失敗，改為自動選擇目前已連線裝置重試")
-                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: nil)
+                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: nil, generation: generation)
                         } else if try self.shouldFallbackToUSBTunnel(using: cmd, errorMessage: err) {
                             self.appendLog("Wi‑Fi tunnel 不支援，改用 USB tunnel 重試")
                             self.activeTunnelConnectionType = .usb
                             let usbUDID = try self.preferredTunnelUDID(using: cmd)
-                            self.setStage("切換連線方式")
-                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: usbUDID)
+                            self.setStage("切換連線方式", generation: generation)
+                            try self.startTunnelAndResolveEndpoint(using: cmd, udid: usbUDID, generation: generation)
                         } else {
                             throw error
                         }
@@ -659,8 +802,9 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                             NSLocalizedDescriptionKey: "無法取得 RSD host/port"
                         ])
                     }
-                    try self.verifyRsdEndpoint(using: cmd, ep: ep)
+                    try self.verifyRsdEndpoint(using: cmd, ep: ep, generation: generation)
                 }
+                try self.ensureCurrentConnectionAttempt(generation)
                 guard let ep = self.rsdEndpoint else {
                     throw NSError(domain: "DeviceManager", code: -1, userInfo: [
                         NSLocalizedDescriptionKey: "RSD endpoint 在連線完成前遺失，請重試"
@@ -668,7 +812,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 }
                 let deviceLabel = self.connectedDeviceLabel(using: cmd)
 
-                self.setConnectionState(.connected, deviceName: "\(deviceLabel) (RSD: \(ep.host):\(ep.port))", lastError: nil)
+                self.setConnectionState(.connected, deviceName: "\(deviceLabel) (RSD: \(ep.host):\(ep.port))", lastError: nil, generation: generation)
 #if DEBUG
                 print("✅ Tunnel OK: \(DeviceLogRedactor.maskedEndpoint(host: ep.host, port: ep.port))")
 #endif
@@ -677,8 +821,12 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 self.reconnectAttempt = 0
             } catch {
                 self.stopTunnel()
+                guard self.isCurrentConnectionAttempt(generation) else {
+                    self.appendLog("已取消過期的連線流程")
+                    return
+                }
                 let lowered = error.localizedDescription.lowercased()
-                self.setConnectionState(.failed, deviceName: "連線失敗", lastError: error.localizedDescription)
+                self.setConnectionState(.failed, deviceName: "連線失敗", lastError: error.localizedDescription, generation: generation)
 #if DEBUG
                 print("❌ connectDevice error: \(DeviceLogRedactor.sanitizedMessage(error.localizedDescription))")
 #endif
@@ -698,9 +846,9 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return Endpoint(host: h, port: p)
     }
 
-    private func preferredConnectionUDID(using cmd: [String]) throws -> String? {
+    private func preferredConnectionUDID(using cmd: [String], generation: UInt64) throws -> String? {
         if isWirelessMode {
-            setStage("搜尋可用裝置")
+            setStage("搜尋可用裝置", generation: generation)
             appendLog("Wi‑Fi 模式：開始搜尋裝置 UDID")
             let requested = effectiveTunnelUDID
             if let requested, !requested.isEmpty {
@@ -749,7 +897,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     }
 
     private func preferredActiveDeviceUDID(using cmd: [String]) throws -> String? {
-        let devices = try listConnectedDevices(using: cmd)
+        let devices = try listConnectedDevices(using: cmd).filter(isUSBDevice)
         guard !devices.isEmpty else { return nil }
 
         if let requested = effectiveTunnelUDID,
@@ -757,22 +905,19 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             return matched.identifier ?? matched.uniqueDeviceID
         }
 
-        let preferredDevice =
-            devices.first(where: { ($0.connectionType ?? "").uppercased() == "USB" }) ??
-            devices.first
-
-        return preferredDevice?.identifier ?? preferredDevice?.uniqueDeviceID
+        return devices.first?.identifier ?? devices.first?.uniqueDeviceID
     }
 
     private func preferredTunnelUDID(using cmd: [String]) throws -> String? {
-        let devices = try listConnectedDevices(using: cmd)
+        let allDevices = try listConnectedDevices(using: cmd)
+        let devices = allDevices.filter(isUSBDevice)
         guard !devices.isEmpty else {
             throw NSError(domain: "DeviceManager", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "未偵測到已連線的 iPhone/iPad。請確認裝置已用 USB 接上、已解鎖並信任這台 Mac，且 Finder 或 Xcode 能看到裝置；若你已知 RSD，也可在進階連線直接輸入 host/port。"
             ])
         }
 
-        appendLog("偵測到裝置：" + devices.map(deviceDebugLabel(for:)).joined(separator: "、"))
+        appendLog("偵測到裝置：" + allDevices.map(deviceDebugLabel(for:)).joined(separator: "、"))
 
         guard let requested = effectiveTunnelUDID else { return nil }
         if devices.contains(where: { matchesDevice($0, requestedUDID: requested) }) {
@@ -783,8 +928,9 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return nil
     }
 
-    private func verifyRsdEndpoint(using cmd: [String], ep: Endpoint) throws {
-        setStage("驗證裝置服務")
+    private func verifyRsdEndpoint(using cmd: [String], ep: Endpoint, generation: UInt64) throws {
+        try ensureCurrentConnectionAttempt(generation)
+        setStage("驗證裝置服務", generation: generation)
         appendLog("RSD endpoint: \(ep.host):\(ep.port)")
 
         try ensureDeveloperModeEnabledIfSupported(using: cmd, ep: ep)
@@ -799,12 +945,14 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             "--rsd", ep.host, ep.port
         ], timeout: AppConstants.Timeouts.rsdInfo, step: "讀取 RSD 資訊")
 
-        simulateLocationMode = try detectSimulateLocationMode(using: cmd, ep: ep)
+        try ensureCurrentConnectionAttempt(generation)
+        simulateLocationMode = try detectSimulateLocationMode(using: cmd, ep: ep, generation: generation)
         appendLog("simulate-location 使用：\(simulateLocationMode?.rawValue ?? "unknown")")
     }
 
-    private func detectSimulateLocationMode(using cmd: [String], ep: Endpoint) throws -> SimulateLocationMode {
-        setStage("偵測 simulate-location 模式")
+    private func detectSimulateLocationMode(using cmd: [String], ep: Endpoint, generation: UInt64) throws -> SimulateLocationMode {
+        try ensureCurrentConnectionAttempt(generation)
+        setStage("偵測 simulate-location 模式", generation: generation)
         do {
             _ = try runWithTimeoutLogged(
                 cmd + SimulateLocationMode.dvt.clearArgs(host: ep.host, port: ep.port),
@@ -880,7 +1028,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             return false
         }
         let devices = try listConnectedDevices(using: cmd)
-        return !devices.isEmpty
+        return devices.contains(where: isUSBDevice)
     }
 
     private func shouldFallbackToAnyDevice(for errorMessage: String) -> Bool {
@@ -933,6 +1081,10 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         device.identifier == requestedUDID || device.uniqueDeviceID == requestedUDID
     }
 
+    private func isUSBDevice(_ device: USBMuxDevice) -> Bool {
+        USBMuxConnectionTypePolicy.isUSB(device.connectionType)
+    }
+
     private func deviceDebugLabel(for device: USBMuxDevice) -> String {
         let name = device.deviceName ?? device.productType ?? device.deviceClass ?? "Apple Device"
         let transport = device.connectionType?.uppercased() ?? "UNKNOWN"
@@ -973,7 +1125,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return (try? resolveConnectedDeviceLabel(using: cmd, preferredUDID: effectiveTunnelUDID)) ?? "Apple Device"
     }
 
-    private func startTunnelWithAdminPrompt(using cmd: [String], udid: String?) throws {
+    private func startTunnelWithAdminPrompt(using cmd: [String], udid: String?, generation: UInt64) throws {
         var failures: [String] = []
         let candidates: [String?] = udid == nil ? [nil] : [udid, nil]
 
@@ -982,9 +1134,14 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 appendLog("改用目前已連線裝置重試管理員 tunnel")
             }
             var shouldMoveToNextCandidate = false
-            for transport in TunnelTransport.allCases {
+            for transport in tunnelTransports {
                 do {
-                    try startTunnelWithAdminPrompt(using: cmd, udid: candidateUDID, transport: transport)
+                    try startTunnelWithAdminPrompt(
+                        using: cmd,
+                        udid: candidateUDID,
+                        transport: transport,
+                        generation: generation
+                    )
                     return
                 } catch {
                     let failure = "\(transport.rawValue): \(error.localizedDescription)"
@@ -1006,10 +1163,22 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         ])
     }
 
-    private func startTunnelWithAdminPrompt(using cmd: [String], udid: String?, transport: TunnelTransport) throws {
-        setStage("請求系統授權")
+    private func startTunnelWithAdminPrompt(
+        using cmd: [String],
+        udid: String?,
+        transport: TunnelTransport,
+        generation: UInt64
+    ) throws {
+        try ensureCurrentConnectionAttempt(generation)
+        setStage("請求系統授權", generation: generation)
         let full = cmd + startTunnelArguments(transport: transport, udid: udid)
-        let scriptURL = try preparePrivilegedTunnelWrapperScript(for: full)
+        let files = PrivilegedTunnelFiles.makeUnique()
+        let scriptURL = try preparePrivilegedTunnelWrapperScript(for: full, files: files)
+        guard registerPrivilegedTunnelFiles(files, generation: generation) else {
+            cleanupPrivilegedTunnelArtifacts(files: files)
+            try ensureCurrentConnectionAttempt(generation)
+            return
+        }
         let shellCmd = privilegedTunnelLaunchCommand(for: scriptURL)
 
         if runWithNonInteractiveSudo(shellCmd) {
@@ -1022,7 +1191,8 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
 
         let deadline = Date().addingTimeInterval(AppConstants.Timeouts.tunnelReady)
         while Date() < deadline {
-            if let text = try? String(contentsOf: privilegedTunnelFiles.logURL, encoding: .utf8) {
+            try ensureCurrentConnectionAttempt(generation)
+            if let text = try? String(contentsOf: files.logURL, encoding: .utf8) {
                 if let pair = TunnelOutputParser.endpoint(in: text) {
                     rsdEndpoint = Endpoint(host: pair.host, port: pair.port)
                     let ep = rsdEndpoint!
@@ -1038,7 +1208,7 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
             Thread.sleep(forTimeInterval: AppConstants.Timeouts.pollInterval)
         }
 
-        let logText = (try? String(contentsOf: privilegedTunnelFiles.logURL, encoding: .utf8))
+        let logText = (try? String(contentsOf: files.logURL, encoding: .utf8))
             .map(DeviceLogRedactor.sanitizedMessage) ?? ""
         throw NSError(domain: "DeviceManager", code: -1, userInfo: [
             NSLocalizedDescriptionKey: "已要求管理員權限，但仍未拿到 RSD 位址。\n\(logText)"
@@ -1046,12 +1216,15 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     }
 
     private func startTunnelArguments(transport: TunnelTransport, udid: String?) -> [String] {
-        [
-            "remote", "start-tunnel",
-            "--connection-type", preferredConnectionType,
-            "--script-mode",
-            "-p", transport.rawValue
-        ] + (udid.map { ["--udid", $0] } ?? [])
+        TunnelCommandPolicy.arguments(
+            connectionType: preferredConnectionType,
+            transport: transport.rawValue,
+            udid: udid
+        )
+    }
+
+    private var tunnelTransports: [TunnelTransport] {
+        effectiveTunnelConnectionType == .usb ? [.tcp] : TunnelTransport.allCases
     }
 
     private func shellEscape(_ s: String) -> String {
@@ -1059,65 +1232,76 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
-    private func ensurePrivilegedTunnelDirectory() {
+    private func ensurePrivilegedTunnelDirectory(for files: PrivilegedTunnelFiles) throws {
         let fileManager = FileManager.default
-        try? fileManager.createDirectory(
-            at: privilegedTunnelFiles.directoryURL,
+        try fileManager.createDirectory(
+            at: files.directoryURL,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try? fileManager.setAttributes(
+        try fileManager.setAttributes(
             [.posixPermissions: 0o700],
-            ofItemAtPath: privilegedTunnelFiles.directoryURL.path
+            ofItemAtPath: files.directoryURL.path
         )
     }
 
-    private func cleanupPrivilegedTunnelArtifacts(removeScript: Bool = false) {
-        let urls = [
-            privilegedTunnelFiles.logURL,
-            privilegedTunnelFiles.pidURL,
-            privilegedTunnelFiles.stopURL
-        ] + (removeScript ? [privilegedTunnelFiles.scriptURL] : [])
-
-        for url in urls {
-            try? FileManager.default.removeItem(at: url)
-        }
+    private func cleanupPrivilegedTunnelArtifacts(files: PrivilegedTunnelFiles) {
+        try? FileManager.default.removeItem(at: files.directoryURL)
     }
 
-    private func preparePrivilegedTunnelWrapperScript(for command: [String]) throws -> URL {
-        ensurePrivilegedTunnelDirectory()
-        cleanupPrivilegedTunnelArtifacts(removeScript: false)
-        PrivilegedTunnelArtifactPreparer.prepareReadableArtifacts(files: privilegedTunnelFiles)
+    private func preparePrivilegedTunnelWrapperScript(
+        for command: [String],
+        files: PrivilegedTunnelFiles
+    ) throws -> URL {
+        try ensurePrivilegedTunnelDirectory(for: files)
+        PrivilegedTunnelArtifactPreparer.prepareReadableArtifacts(files: files)
 
         let commandLine = command.map(shellEscape).joined(separator: " ")
         let script = """
         #!/bin/sh
         umask 077
-        LOG=\(shellEscape(privilegedTunnelFiles.logURL.path))
-        PIDFILE=\(shellEscape(privilegedTunnelFiles.pidURL.path))
-        STOPFILE=\(shellEscape(privilegedTunnelFiles.stopURL.path))
-        rm -f "$STOPFILE"
+        LOG=\(shellEscape(files.logURL.path))
+        PIDFILE=\(shellEscape(files.pidURL.path))
+        WRAPPERPIDFILE=\(shellEscape(files.wrapperPIDURL.path))
+        STOPFILE=\(shellEscape(files.stopURL.path))
+        echo "$$" > "$WRAPPERPIDFILE"
         : > "$LOG"
+        if [ -f "$STOPFILE" ]; then
+          rm -f "$PIDFILE" "$WRAPPERPIDFILE"
+          exit 0
+        fi
         \(commandLine) >> "$LOG" 2>&1 &
         CHILD=$!
         echo "$CHILD" > "$PIDFILE"
-        while kill -0 "$CHILD" >/dev/null 2>&1; do
-          if [ -f "$STOPFILE" ]; then
-            kill "$CHILD" >/dev/null 2>&1 || true
-            break
-          fi
-          sleep 1
-        done
+        (
+          while kill -0 "$CHILD" >/dev/null 2>&1; do
+            if [ -f "$STOPFILE" ]; then
+              kill "$CHILD" >/dev/null 2>&1 || true
+              sleep 1
+              if kill -0 "$CHILD" >/dev/null 2>&1; then
+                kill -9 "$CHILD" >/dev/null 2>&1 || true
+              fi
+              exit 0
+            fi
+            sleep 0.2
+          done
+        ) &
+        WATCHER=$!
         wait "$CHILD" >/dev/null 2>&1 || true
-        rm -f "$PIDFILE" "$STOPFILE"
+        kill "$WATCHER" >/dev/null 2>&1 || true
+        wait "$WATCHER" >/dev/null 2>&1 || true
+        if [ -f "$STOPFILE" ]; then
+          rm -f "$STOPFILE"
+        fi
+        rm -f "$PIDFILE" "$WRAPPERPIDFILE"
         """
 
-        try script.write(to: privilegedTunnelFiles.scriptURL, atomically: true, encoding: .utf8)
+        try script.write(to: files.scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o700],
-            ofItemAtPath: privilegedTunnelFiles.scriptURL.path
+            ofItemAtPath: files.scriptURL.path
         )
-        return privilegedTunnelFiles.scriptURL
+        return files.scriptURL
     }
 
     private func privilegedTunnelLaunchCommand(for scriptURL: URL) -> String {
@@ -1133,10 +1317,11 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         _ = try run(["/usr/bin/osascript", "-e", source, scriptURL.path])
     }
 
-    private func loadPrivilegedTunnelPID() -> Int? {
-        guard let raw = try? String(contentsOf: privilegedTunnelFiles.pidURL, encoding: .utf8) else {
+    private func loadPrivilegedTunnelPID(from url: URL) -> Int? {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
             return nil
         }
+        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         guard let pid = PrivilegedTunnelPIDParser.parse(raw) else {
             appendLog("管理員 tunnel PID 檔內容無效，將僅使用 stop file 結束")
             return nil
@@ -1144,12 +1329,12 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         return pid
     }
 
-    private func requestPrivilegedTunnelStop() throws {
-        ensurePrivilegedTunnelDirectory()
-        try Data().write(to: privilegedTunnelFiles.stopURL, options: .atomic)
+    private func requestPrivilegedTunnelStop(files: PrivilegedTunnelFiles) throws {
+        try ensurePrivilegedTunnelDirectory(for: files)
+        try Data().write(to: files.stopURL, options: .atomic)
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
-            ofItemAtPath: privilegedTunnelFiles.stopURL.path
+            ofItemAtPath: files.stopURL.path
         )
     }
 
@@ -1161,22 +1346,33 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
     }
 
     private func stopPrivilegedTunnelProcessIfNeeded() {
+        guard let files = takeActivePrivilegedTunnelFiles() else { return }
+        stopPrivilegedTunnelProcess(files: files)
+    }
+
+    private func stopPrivilegedTunnelProcess(files: PrivilegedTunnelFiles) {
         let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: privilegedTunnelFiles.pidURL.path)
-                || fileManager.fileExists(atPath: privilegedTunnelFiles.scriptURL.path)
-                || fileManager.fileExists(atPath: privilegedTunnelFiles.logURL.path) else {
+        guard fileManager.fileExists(atPath: files.directoryURL.path) else {
             return
         }
 
-        let pid = loadPrivilegedTunnelPID()
+        var childPID = loadPrivilegedTunnelPID(from: files.pidURL)
+        var wrapperPID = loadPrivilegedTunnelPID(from: files.wrapperPIDURL)
+        var observedWrapper = wrapperPID != nil
         do {
-            try requestPrivilegedTunnelStop()
-            let deadline = Date().addingTimeInterval(2.0)
+            try requestPrivilegedTunnelStop(files: files)
+            let wrapperStartupDeadline = Date().addingTimeInterval(1.0)
+            let deadline = Date().addingTimeInterval(3.0)
             while Date() < deadline {
-                if !fileManager.fileExists(atPath: privilegedTunnelFiles.pidURL.path) {
+                childPID = childPID ?? loadPrivilegedTunnelPID(from: files.pidURL)
+                wrapperPID = wrapperPID ?? loadPrivilegedTunnelPID(from: files.wrapperPIDURL)
+                observedWrapper = observedWrapper || wrapperPID != nil
+                let childRunning = childPID.map(isProcessRunning(pid:)) ?? false
+                let wrapperRunning = wrapperPID.map(isProcessRunning(pid:)) ?? false
+                if observedWrapper && !childRunning && !wrapperRunning {
                     break
                 }
-                if let pid, !isProcessRunning(pid: pid) {
+                if !observedWrapper && Date() >= wrapperStartupDeadline {
                     break
                 }
                 Thread.sleep(forTimeInterval: AppConstants.Timeouts.pollInterval)
@@ -1184,14 +1380,56 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         } catch {
             appendLog("寫入 stop file 失敗：\(error.localizedDescription)")
         }
+
+        let childRunning = childPID.map(isProcessRunning(pid:)) ?? false
+        let wrapperRunning = wrapperPID.map(isProcessRunning(pid:)) ?? false
+        if childRunning || wrapperRunning {
+            appendLog("管理員 tunnel 尚未完全結束，保留 stop file 等待回收")
+            return
+        }
+        cleanupPrivilegedTunnelArtifacts(files: files)
+    }
+
+    private func recoverOrphanedPrivilegedTunnels() {
+        let fileManager = FileManager.default
+        let rootURL = PrivilegedTunnelFiles.rootDirectoryURL
+        let urls = (try? fileManager.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        for url in urls where url.lastPathComponent.hasPrefix(PrivilegedTunnelAttemptIdentity.directoryPrefix) {
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+            appendLog("回收前次未結束的管理員 tunnel")
+            stopPrivilegedTunnelProcess(files: PrivilegedTunnelFiles.files(in: url))
+        }
+
+        let legacy = PrivilegedTunnelFiles.legacy()
+        guard fileManager.fileExists(atPath: legacy.pidURL.path)
+                || fileManager.fileExists(atPath: legacy.scriptURL.path)
+                || fileManager.fileExists(atPath: legacy.logURL.path) else {
+            return
+        }
+
+        appendLog("回收舊版共用檔案的管理員 tunnel")
+        for _ in 0..<12 {
+            try? requestPrivilegedTunnelStop(files: legacy)
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        try? requestPrivilegedTunnelStop(files: legacy)
+        for url in [legacy.logURL, legacy.pidURL, legacy.wrapperPIDURL, legacy.scriptURL] {
+            try? fileManager.removeItem(at: url)
+        }
     }
 
     func disconnect() {
         userInitiatedDisconnect = true
+        let generation = invalidateConnectionAttempt()
         cancelAutoReconnect()
         clearSimulatedLocation()
         stopTunnel()
-        setConnectionState(.disconnected, deviceName: "未連接", lastError: nil)
+        setConnectionState(.disconnected, deviceName: "未連接", lastError: nil, generation: generation)
         appendLog("裝置已中斷")
     }
 
@@ -1391,11 +1629,16 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         ])
     }
 
-    private func startTunnelAndResolveEndpoint(using cmd: [String], udid: String?) throws {
+    private func startTunnelAndResolveEndpoint(using cmd: [String], udid: String?, generation: UInt64) throws {
         var failures: [String] = []
-        for transport in TunnelTransport.allCases {
+        for transport in tunnelTransports {
             do {
-                try startTunnelAndResolveEndpoint(using: cmd, udid: udid, transport: transport)
+                try startTunnelAndResolveEndpoint(
+                    using: cmd,
+                    udid: udid,
+                    transport: transport,
+                    generation: generation
+                )
                 return
             } catch {
                 let failure = "\(transport.rawValue): \(error.localizedDescription)"
@@ -1409,9 +1652,15 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         ])
     }
 
-    private func startTunnelAndResolveEndpoint(using cmd: [String], udid: String?, transport: TunnelTransport) throws {
+    private func startTunnelAndResolveEndpoint(
+        using cmd: [String],
+        udid: String?,
+        transport: TunnelTransport,
+        generation: UInt64
+    ) throws {
+        try ensureCurrentConnectionAttempt(generation)
         stopTunnel()
-        setStage("等待連線就緒")
+        setStage("等待連線就緒", generation: generation)
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -1442,24 +1691,30 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         }
 
         try p.run()
+        tunnelProcess = p
+        tunnelOutPipe = out
+        tunnelErrPipe = err
 
         p.terminationHandler = { [weak self] proc in
             guard let self else { return }
             out.fileHandleForReading.readabilityHandler = nil
             err.fileHandleForReading.readabilityHandler = nil
-            if self.rsdEndpoint != nil && !self.userInitiatedDisconnect {
-                self.handleUnexpectedConnectionLoss(reason: "tunnel 行程已結束（code: \(proc.terminationStatus)）")
+            self.connectionQueue.async {
+                guard self.isCurrentConnectionAttempt(generation), self.tunnelProcess === proc else { return }
+                if self.rsdEndpoint != nil && !self.userInitiatedDisconnect {
+                    self.handleUnexpectedConnectionLoss(
+                        reason: "tunnel 行程已結束（code: \(proc.terminationStatus)）",
+                        generation: generation
+                    )
+                }
             }
         }
-
-        tunnelProcess = p
-        tunnelOutPipe = out
-        tunnelErrPipe = err
 
         let deadline = Date().addingTimeInterval(AppConstants.Timeouts.tunnelReady)
         appendLog("等待 tunnel 輸出 RSD 位址 (\(transport.rawValue))")
 
         while Date() < deadline {
+            try ensureCurrentConnectionAttempt(generation)
             let currentText = snapshotText()
             if let pair = TunnelOutputParser.endpoint(in: currentText) {
                 let ep = Endpoint(host: pair.host, port: pair.port)
@@ -1529,31 +1784,59 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         tunnelOutPipe?.fileHandleForReading.readabilityHandler = nil
         tunnelErrPipe?.fileHandleForReading.readabilityHandler = nil
 
-        if let p = tunnelProcess {
-            p.terminationHandler = nil
-        }
-
-        if let p = tunnelProcess, p.isRunning {
-            p.terminate()
-            Thread.sleep(forTimeInterval: AppConstants.Timeouts.pollInterval)
-            if p.isRunning { p.interrupt() }
-        }
-
+        let process = tunnelProcess
         tunnelProcess = nil
         tunnelOutPipe = nil
         tunnelErrPipe = nil
+
+        if let p = process {
+            p.terminationHandler = nil
+        }
+
+        if let process {
+            stopDirectTunnelProcess(process)
+        }
 
         stopPrivilegedTunnelProcessIfNeeded()
 
     }
 
-    private func handleUnexpectedConnectionLoss(reason: String) {
+    private func stopDirectTunnelProcess(_ process: Process) {
+        guard process.isRunning else {
+            process.waitUntilExit()
+            return
+        }
+
+        process.terminate()
+        var deadline = Date().addingTimeInterval(0.8)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            process.interrupt()
+            deadline = Date().addingTimeInterval(0.5)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        if process.isRunning {
+            _ = kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
+    private func handleUnexpectedConnectionLoss(reason: String, generation: UInt64) {
+        guard isCurrentConnectionAttempt(generation) else { return }
         guard !userInitiatedDisconnect else { return }
         guard rsdEndpoint != nil || connectionState.isConnected else { return }
         appendLog("連線中斷：\(reason)")
         stopTunnel()
-        setConnectionState(.failed, deviceName: "連線已中斷", lastError: reason)
+        setConnectionState(.failed, deviceName: "連線已中斷", lastError: reason, generation: generation)
         scheduleAutoReconnect(reason: reason)
+    }
+
+    private func handleUnexpectedConnectionLoss(reason: String) {
+        handleUnexpectedConnectionLoss(reason: reason, generation: currentConnectionGeneration())
     }
 
     @discardableResult
@@ -1591,16 +1874,20 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         autoReconnectWorkItem = nil
     }
 
-    private func setStage(_ stage: String) {
-        setConnectionState(.connecting(step: stage), lastError: nil)
+    private func setStage(_ stage: String, generation: UInt64) {
+        setConnectionState(.connecting(step: stage), lastError: nil, generation: generation)
     }
 
     private func setConnectionState(
         _ state: DeviceConnectionState,
         deviceName: String? = nil,
-        lastError: String? = nil
+        lastError: String? = nil,
+        generation: UInt64? = nil
     ) {
         DispatchQueue.main.async {
+            if let generation, !self.isCurrentConnectionAttempt(generation) {
+                return
+            }
             self.connectionState = state
             if let deviceName {
                 self.deviceName = deviceName

@@ -1,4 +1,3 @@
-import asyncio
 import hashlib
 import logging
 import os
@@ -7,8 +6,9 @@ import typing
 
 from tqdm import trange
 
-from pymobiledevice3.exceptions import PyMobileDevice3Exception
+from pymobiledevice3.exceptions import NotConnectedError, PyMobileDevice3Exception
 from pymobiledevice3.service_connection import ServiceConnection
+from pymobiledevice3.utils import current_task_name
 
 ASR_VERSION = 1
 ASR_STREAM_ID = 1
@@ -29,13 +29,23 @@ class ASRClient:
 
     def __init__(self, udid: str) -> None:
         self._udid: str = udid
-        self.logger = logging.getLogger(f"{asyncio.current_task().get_name()}-{__name__}")
-        self.service: typing.Optional[ServiceConnection] = None
+        self.logger = logging.getLogger(f"{current_task_name()}-{__name__}")
+        self._service: typing.Optional[ServiceConnection] = None
         self.checksum_chunks: bool = False
 
+    @property
+    def service(self) -> ServiceConnection:
+        """The ASR service connection.
+
+        :raises NotConnectedError: if accessed before ``connect()`` has run.
+        """
+        if self._service is None:
+            raise NotConnectedError("ASRClient is not connected; call connect() first")
+        return self._service
+
     async def connect(self, port: int = DEFAULT_ASR_SYNC_PORT) -> None:
-        self.service = ServiceConnection.create_using_usbmux(self._udid, port, connection_type="USB")
-        await self.service.aio_start()
+        self._service = await ServiceConnection.create_using_usbmux(self._udid, port, connection_type="USB")
+        await self._service.start()
 
         # receive Initiate command message
         data = await self.recv_plist()
@@ -48,20 +58,20 @@ class ASRClient:
         self.checksum_chunks = data.get("Checksum Chunks", False)
         self.logger.debug(f"Checksum Chunks: {self.checksum_chunks}")
 
-    async def recv_plist(self) -> dict:
+    async def recv_plist(self) -> dict[str, typing.Any]:
         buf = b""
         while not buf.endswith(b"</plist>\n"):
-            buf += await self.service.aio_recvall(1)
+            buf += await self.service.recvall(1)
         return plistlib.loads(buf)
 
-    async def send_plist(self, plist: dict) -> None:
+    async def send_plist(self, plist: dict[str, typing.Any]) -> None:
         self.logger.debug(plistlib.dumps(plist).decode())
         await self.send_buffer(plistlib.dumps(plist))
 
     async def send_buffer(self, buf: bytes) -> None:
-        await self.service.aio_sendall(buf)
+        await self.service.sendall(buf)
 
-    async def handle_oob_data_request(self, packet: dict, filesystem: typing.IO):
+    async def handle_oob_data_request(self, packet: dict[str, typing.Any], filesystem: typing.IO[bytes]):
         oob_length = packet["OOB Length"]
         oob_offset = packet["OOB Offset"]
         filesystem.seek(oob_offset, os.SEEK_SET)
@@ -71,7 +81,7 @@ class ASRClient:
 
         await self.send_buffer(oob_data)
 
-    async def perform_validation(self, filesystem: typing.IO) -> None:
+    async def perform_validation(self, filesystem: typing.IO[bytes]) -> None:
         filesystem.seek(0, os.SEEK_END)
         length = filesystem.tell()
         filesystem.seek(0, os.SEEK_SET)
@@ -81,7 +91,7 @@ class ASRClient:
             "Size": length,
         }
 
-        packet_info = {}
+        packet_info: dict[str, typing.Any] = {}
         if self.checksum_chunks:
             packet_info["Checksum Chunk Size"] = ASR_CHECKSUM_CHUNK_SIZE
 
@@ -108,7 +118,7 @@ class ASRClient:
             else:
                 raise PyMobileDevice3Exception(f"unknown packet: {packet}")
 
-    async def send_payload(self, filesystem: typing.IO) -> None:
+    async def send_payload(self, filesystem: typing.IO[bytes]) -> None:
         filesystem.seek(0, os.SEEK_END)
         length = filesystem.tell()
         filesystem.seek(0, os.SEEK_SET)
@@ -122,4 +132,6 @@ class ASRClient:
             await self.send_buffer(chunk)
 
     async def close(self) -> None:
-        await self.service.aio_close()
+        # Tolerant of never-connected instances.
+        if self._service is not None:
+            await self._service.close()

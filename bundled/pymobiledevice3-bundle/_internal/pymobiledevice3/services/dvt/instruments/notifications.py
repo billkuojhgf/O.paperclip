@@ -1,22 +1,58 @@
-from pymobiledevice3.services.remote_server import MessageAux
+import typing
+from typing import Any
+
+from pymobiledevice3.dtx import DTXContext, DTXQueue, DTXService, dtx_method, dtx_on_dispatch, dtx_on_notification
+from pymobiledevice3.dtx_service import DtxService
 
 
-class Notifications:
+class NotificationsService(DTXService):
     IDENTIFIER = "com.apple.instruments.server.services.mobilenotifications"
 
-    def __init__(self, dvt):
-        self._dvt = dvt
-        self._channel = dvt.make_channel(self.IDENTIFIER)
+    def __init__(self, ctx: DTXContext):
+        super().__init__(ctx)
+        self.events: DTXQueue[Any] = DTXQueue()
 
-    def __enter__(self):
-        self._channel.setApplicationStateNotificationsEnabled_(MessageAux().append_obj(True))
-        self._channel.setMemoryNotificationsEnabled_(MessageAux().append_obj(True))
+    def on_closed(self, reason: str = "") -> None:
+        self.shutdown_queue(self.events)
+        super().on_closed(reason)
+
+    @dtx_method("setApplicationStateNotificationsEnabled:", expects_reply=False)
+    async def set_application_state_notifications_enabled_(self, enabled: bool) -> None: ...
+
+    @dtx_method("setMemoryNotificationsEnabled:", expects_reply=False)
+    async def set_memory_notifications_enabled_(self, enabled: bool) -> None: ...
+
+    @dtx_on_dispatch
+    async def _on_dispatch(self, selector: str, *args: Any) -> None:
+        await self.events.put((selector, list(args)))
+
+    @dtx_on_notification
+    async def _on_notification(self, payload: Any) -> None:
+        await self.events.put(payload)
+
+
+class Notifications(DtxService[NotificationsService]):
+    """
+    Stream application-state and memory notifications from the device over the
+    `com.apple.instruments.server.services.mobilenotifications` DTX channel.
+
+    Constructed with a `DvtProvider`, e.g. ``Notifications(DvtProvider(service_provider))``.
+    Entering the async context manager opens the channel and enables both
+    application-state and memory notifications; exiting disables them. The class
+    is async-iterable: iterating yields each notification payload as the device
+    pushes it.
+    """
+
+    async def __aenter__(self):
+        await self.connect()
+        await self.service.set_application_state_notifications_enabled_(True)
+        await self.service.set_memory_notifications_enabled_(True)
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._channel.setApplicationStateNotificationsEnabled_(MessageAux().append_obj(False))
-        self._channel.setMemoryNotificationsEnabled_(MessageAux().append_obj(False))
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):
+        await self.service.set_application_state_notifications_enabled_(False)
+        await self.service.set_memory_notifications_enabled_(False)
 
-    def __iter__(self):
+    async def __aiter__(self) -> typing.AsyncGenerator[Any, None]:
         while True:
-            yield self._dvt.recv_plist(self._channel)
+            yield await self.service.events.get()

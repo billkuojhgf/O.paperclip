@@ -8,9 +8,10 @@ import traceback
 import warnings
 from contextlib import asynccontextmanager, suppress
 from ssl import SSLEOFError
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
-import construct
+import pydantic
+import requests
 
 from pymobiledevice3.bonjour import browse_remoted
 
@@ -28,6 +29,7 @@ from pymobiledevice3 import usbmux
 from pymobiledevice3.exceptions import (
     ConnectionFailedError,
     ConnectionFailedToUsbmuxdError,
+    ConnectionTerminatedError,
     DeviceNotFoundError,
     GetProhibitedError,
     IncorrectModeError,
@@ -46,12 +48,14 @@ from pymobiledevice3.remote.remote_service_discovery import RSD_PORT, RemoteServ
 from pymobiledevice3.remote.tunnel_service import (
     CoreDeviceTunnelProxy,
     RemotePairingProtocol,
+    RemotePairingTunnelService,
     TunnelResult,
     create_core_device_tunnel_service_using_rsd,
     get_remote_pairing_tunnel_services,
 )
 from pymobiledevice3.remote.utils import get_rsds, stop_remoted
 from pymobiledevice3.utils import asyncio_print_traceback
+from pymobiledevice3.utils import current_task_name as _current_task_name
 
 logger = logging.getLogger(__name__)
 
@@ -71,10 +75,21 @@ USB_MONITOR_RESCAN_INTERVAL = 30
 USBMUX_INTERVAL = 2
 OSUTILS = get_os_utils()
 
+_UPSTREAM_FETCH_TIMEOUT = 2.0
+
+
+def _fetch_upstream(url: str) -> dict[str, Any]:
+    """Fetch a tunneld listing from an upstream URL. Called in a worker thread
+    via asyncio.to_thread; raises on any error so the caller can skip the
+    upstream silently."""
+    resp = requests.get(url, timeout=_UPSTREAM_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
 
 @dataclasses.dataclass
 class TunnelTask:
-    task: asyncio.Task
+    task: asyncio.Task[None]
     udid: Optional[str] = None
     tunnel: Optional[TunnelResult] = None
 
@@ -86,15 +101,22 @@ class TunneldCore:
         wifi_monitor: bool = True,
         usb_monitor: bool = True,
         usbmux_monitor: bool = True,
+        usbmux_address: Optional[str] = None,
         mobdev2_monitor: bool = True,
     ) -> None:
         self.protocol = protocol
-        self.tasks: list[asyncio.Task] = []
+        self.tasks: list[asyncio.Task[None]] = []
         self.tunnel_tasks: dict[str, TunnelTask] = {}
         self.usb_monitor = usb_monitor
         self.wifi_monitor = wifi_monitor
         self.usbmux_monitor = usbmux_monitor
+        self.usbmux_address = usbmux_address
         self.mobdev2_monitor = mobdev2_monitor
+        # Upstream tunneld URLs registered at runtime via POST /upstream.
+        # Each `GET /` request merges these tunnelds' listings into the local
+        # one, letting an external coordinator (mobiletun, ssh-port-forwards,
+        # etc.) federate remote devices without a second tunneld process.
+        self.upstream_urls: set[str] = set()
 
     def start(self) -> None:
         """Register all tasks"""
@@ -173,32 +195,43 @@ class TunneldCore:
     async def monitor_wifi_task(self) -> None:
         try:
             while True:
+                remote_pairing_tunnel_services = []
+                claimed_services: set[RemotePairingTunnelService] = set()
                 try:
                     remote_pairing_tunnel_services = await get_remote_pairing_tunnel_services()
                     for service in remote_pairing_tunnel_services:
-                        if service.hostname in self.tunnel_tasks:
+                        hostname = service.hostname
+                        if hostname is None:
+                            # a discovered RemotePairing service always carries the hostname it was
+                            # browsed at; skip defensively rather than crash the monitor loop.
+                            continue
+                        if hostname in self.tunnel_tasks:
                             # skip tunnel if already exists for this ip
-                            await service.close()
                             continue
                         if self.tunnel_exists_for_udid(service.remote_identifier):
                             # skip tunnel if already exists for this udid
-                            await service.close()
                             continue
-                        self.tunnel_tasks[service.hostname] = TunnelTask(
+                        self.tunnel_tasks[hostname] = TunnelTask(
                             task=asyncio.create_task(
-                                self.start_tunnel_task(service.hostname, service),
-                                name=f"start-tunnel-task-wifi-{service.hostname}",
+                                self.start_tunnel_task(hostname, service),
+                                name=f"start-tunnel-task-wifi-{hostname}",
                             ),
                             udid=service.remote_identifier,
                         )
+                        claimed_services.add(service)
                 except asyncio.exceptions.IncompleteReadError:
-                    continue
+                    logger.debug("Got IncompleteReadError from monitor-wifi-task")
                 except asyncio.CancelledError:
                     # Raise and cancel gracefully
                     raise
                 except Exception:
-                    logger.error(f"Got exception from {asyncio.current_task().get_name()}")
-                    continue
+                    logger.error(f"Got exception from {_current_task_name()}")
+                finally:
+                    for service in remote_pairing_tunnel_services:
+                        if service in claimed_services:
+                            continue
+                        with suppress(Exception):
+                            await service.close()
                 await asyncio.sleep(REMOTEPAIRING_INTERVAL)
         except asyncio.CancelledError:
             # Cancel gracefully
@@ -209,13 +242,14 @@ class TunneldCore:
         while True:
             mux = None
             try:
-                mux = usbmux.create_mux()
-                mux.listen()
+                mux = await usbmux.create_mux(usbmux_address=self.usbmux_address)
+                await mux.listen()
 
                 while True:
-                    await asyncio.to_thread(mux.receive_device_state_update)
+                    await mux.receive_device_state_update()
 
-                    for mux_device in mux.devices:
+                    mux_devices: list[usbmux.MuxDevice] = mux.devices
+                    for mux_device in mux_devices:
                         task_identifier = f"usbmux-{mux_device.serial}-{mux_device.connection_type}"
                         if self.tunnel_exists_for_udid(mux_device.serial):
                             # Skip if already established a tunnel for this udid
@@ -225,14 +259,16 @@ class TunneldCore:
                             continue
                         service = None
                         try:
-                            with create_using_usbmux(mux_device.serial) as lockdown:
+                            async with await create_using_usbmux(
+                                mux_device.serial, usbmux_address=self.usbmux_address
+                            ) as lockdown:
                                 service = await CoreDeviceTunnelProxy.create(lockdown)
                         except (
                             MuxException,
                             InvalidServiceError,
                             GetProhibitedError,
-                            construct.core.StreamError,
-                            ConnectionAbortedError,
+                            StreamError,
+                            ConnectionTerminatedError,
                             DeviceNotFoundError,
                             LockdownError,
                             IncorrectModeError,
@@ -248,28 +284,35 @@ class TunneldCore:
                                 name=f"start-tunnel-task-{task_identifier}",
                             ),
                         )
-            except (BlockingIOError, StreamError) as e:
-                # Connection lost - will reconnect on next iteration
-                logger.debug(f"usbmux connection error: {e}, reconnecting...")
-                await asyncio.sleep(USBMUX_INTERVAL)
             except (ConnectionFailedToUsbmuxdError, OSError):
                 # This is exception is expected to occur repeatedly on linux running usbmuxd
-                # as long as there isn't any physical iDevice connected
+                # as long as there isn't any physical iDevice connected.
+                # NOTE: ConnectionFailedToUsbmuxdError subclasses MuxException, so this more
+                # specific handler must stay above the MuxException handler below.
                 logger.debug("failed to connect to usbmux. waiting for it to restart")
+                await asyncio.sleep(USBMUX_INTERVAL)
+            except (BlockingIOError, StreamError, MuxException) as e:
+                # Connection lost - will reconnect on next iteration.
+                # MuxException("socket connection broken") is raised when usbmuxd drops the
+                # listen socket on device replug/reboot (notably on Linux); reconnect instead
+                # of letting the monitor task die (see issue #1742).
+                logger.debug(f"usbmux connection error: {e}, reconnecting...")
                 await asyncio.sleep(USBMUX_INTERVAL)
             except asyncio.CancelledError:
                 break
             finally:
                 if mux is not None:
-                    mux.close()
+                    await mux.close()
 
     @asyncio_print_traceback
     async def monitor_mobdev2_task(self) -> None:
         try:
             while True:
                 async for ip, lockdown in get_mobdev2_lockdowns(only_paired=True):
-                    with lockdown:
+                    async with lockdown:
                         udid = lockdown.udid
+                        # a paired lockdown always exposes UniqueDeviceID
+                        assert udid is not None
                         task_identifier = f"mobdev2-{udid}-{ip}"
                         if self.tunnel_exists_for_udid(udid):
                             # Skip tunnel if already exists for this udid
@@ -298,7 +341,7 @@ class TunneldCore:
         self,
         task_identifier: str,
         protocol_handler: Union[RemotePairingProtocol, CoreDeviceTunnelProxy],
-        queue: Optional[asyncio.Queue] = None,
+        queue: Optional[asyncio.Queue[Optional[TunnelResult]]] = None,
         protocol: Optional[TunnelProtocol] = None,
     ) -> None:
         if protocol is None:
@@ -320,18 +363,18 @@ class TunneldCore:
                         queue.put_nowait(tun)
                         # avoid sending another message if succeeded
                         queue = None
-                    logger.info(f"[{asyncio.current_task().get_name()}] Created tunnel --rsd {tun.address} {tun.port}")
+                    logger.info(f"[{_current_task_name()}] Created tunnel --rsd {tun.address} {tun.port}")
                     await tun.client.wait_closed()
                 else:
                     bailed_out = True
                     logger.debug(
-                        f"[{asyncio.current_task().get_name()}] Not establishing tunnel since there is already an "
+                        f"[{_current_task_name()}] Not establishing tunnel since there is already an "
                         f"active one for same udid"
                     )
         except asyncio.CancelledError:
             pass
         except QuicProtocolNotSupportedError as e:
-            logger.warning(f"[{asyncio.current_task().get_name()}] {e.__class__.__name__}: {e}")
+            logger.warning(f"[{_current_task_name()}] {e.__class__.__name__}: {e}")
         except (
             asyncio.exceptions.IncompleteReadError,
             TimeoutError,
@@ -341,11 +384,11 @@ class TunneldCore:
             InvalidServiceError,
         ) as e:
             if tun is None:
-                logger.debug(f"Got {e.__class__.__name__} from {asyncio.current_task().get_name()}")
+                logger.debug(f"Got {e.__class__.__name__} from {_current_task_name()}")
             else:
                 logger.debug(f"Got {e.__class__.__name__} from tunnel --rsd {tun.address} {tun.port}")
         except Exception:
-            logger.exception(f"Got exception from {asyncio.current_task().get_name()}")
+            logger.exception(f"Got exception from {_current_task_name()}")
         finally:
             if queue is not None:
                 # notify something went wrong
@@ -355,9 +398,8 @@ class TunneldCore:
                 logger.info(f"Disconnected from tunnel --rsd {tun.address} {tun.port}")
                 await tun.client.stop_tunnel()
 
-            if protocol_handler is not None:
-                with suppress(OSError):
-                    await protocol_handler.close()
+            with suppress(OSError):
+                await protocol_handler.close()
 
             if task_identifier in self.tunnel_tasks:
                 # in case the tunnel was removed just now
@@ -395,7 +437,7 @@ class TunneldCore:
                 core_device_tunnel = await create_core_device_tunnel_service_using_rsd(rsd)
             except InvalidServiceError as e:
                 logger.warning(
-                    f"[{asyncio.current_task().get_name()}] Skipping {rsd.product_type} ({rsd.product_version}): "
+                    f"[{_current_task_name()}] Skipping {rsd.product_type} ({rsd.product_version}): "
                     f"{e.__class__.__name__}: {e}"
                 )
                 raise asyncio.CancelledError() from e
@@ -409,9 +451,9 @@ class TunneldCore:
         except PairingError:
             logger.exception(f"Failed to pair with {ip}")
         except RuntimeError:
-            logger.debug(f"Got RuntimeError from: {asyncio.current_task().get_name()}")
+            logger.debug(f"Got RuntimeError from: {_current_task_name()}")
         except Exception:
-            logger.exception(f"Error raised from: {asyncio.current_task().get_name()}: {traceback.format_exc()}")
+            logger.exception(f"Error raised from: {_current_task_name()}: {traceback.format_exc()}")
         finally:
             if rsd is not None:
                 with suppress(OSError):
@@ -428,9 +470,9 @@ class TunneldCore:
             with suppress(asyncio.CancelledError):
                 await task
 
-    def get_tunnels_ips(self) -> dict:
+    def get_tunnels_ips(self) -> dict[str, list[str]]:
         """Retrieve the available tunnel tasks and format them as {UDID: [IP]}"""
-        tunnels_ips = {}
+        tunnels_ips: dict[str, list[str]] = {}
         for ip, active_tunnel in self.tunnel_tasks.items():
             if (active_tunnel.udid is None) or (active_tunnel.tunnel is None):
                 continue
@@ -466,6 +508,7 @@ class TunneldRunner:
         usb_monitor: bool = True,
         wifi_monitor: bool = True,
         usbmux_monitor: bool = True,
+        usbmux_address: Optional[str] = None,
         mobdev2_monitor: bool = True,
     ) -> None:
         cls(
@@ -475,6 +518,7 @@ class TunneldRunner:
             usb_monitor=usb_monitor,
             wifi_monitor=wifi_monitor,
             usbmux_monitor=usbmux_monitor,
+            usbmux_address=usbmux_address,
             mobdev2_monitor=mobdev2_monitor,
         )._run_app()
 
@@ -486,6 +530,7 @@ class TunneldRunner:
         usb_monitor: bool = True,
         wifi_monitor: bool = True,
         usbmux_monitor: bool = True,
+        usbmux_address: Optional[str] = None,
         mobdev2_monitor: bool = True,
     ):
         @asynccontextmanager
@@ -504,13 +549,16 @@ class TunneldRunner:
             wifi_monitor=wifi_monitor,
             usb_monitor=usb_monitor,
             usbmux_monitor=usbmux_monitor,
+            usbmux_address=usbmux_address,
             mobdev2_monitor=mobdev2_monitor,
         )
 
         @self._app.get("/")
-        async def list_tunnels() -> dict[str, list[dict]]:
-            """Retrieve the available tunnels and format them as {UUID: TUNNEL_ADDRESS}"""
-            tunnels = {}
+        async def list_tunnels() -> dict[str, list[dict[str, Any]]]:
+            """Retrieve the available tunnels and format them as {UUID: TUNNEL_ADDRESS}.
+            Listings from any registered upstream tunnelds (see POST /upstream) are
+            fetched in parallel and merged into the response."""
+            tunnels: dict[str, list[dict[str, Any]]] = {}
             for ip, active_tunnel in self._tunneld_core.tunnel_tasks.items():
                 if (active_tunnel.udid is None) or (active_tunnel.tunnel is None):
                     continue
@@ -521,25 +569,72 @@ class TunneldRunner:
                     "tunnel-port": active_tunnel.tunnel.port,
                     "interface": ip,
                 })
+
+            upstream_urls = list(self._tunneld_core.upstream_urls)
+            if upstream_urls:
+                results = await asyncio.gather(
+                    *(asyncio.to_thread(_fetch_upstream, url) for url in upstream_urls),
+                    return_exceptions=True,
+                )
+                for url, result in zip(upstream_urls, results):
+                    if isinstance(result, BaseException):
+                        logger.debug(f"upstream tunneld {url} unreachable: {result!r}")
+                        continue
+                    for udid, entries in (result or {}).items():
+                        tunnels.setdefault(udid, []).extend(entries)
             return tunnels
+
+        class _UpstreamBody(pydantic.BaseModel):
+            url: str
+
+        @self._app.get("/upstream")
+        async def list_upstreams() -> list[str]:
+            return sorted(self._tunneld_core.upstream_urls)
+
+        @self._app.post("/upstream")
+        async def add_upstream(body: _UpstreamBody) -> fastapi.Response:
+            self._tunneld_core.upstream_urls.add(body.url)
+            data: dict[str, Any] = {
+                "operation": "add_upstream",
+                "url": body.url,
+                "data": True,
+                "message": f"upstream {body.url} added",
+            }
+            return generate_http_response(data)
+
+        @self._app.delete("/upstream")
+        async def remove_upstream(body: _UpstreamBody) -> fastapi.Response:
+            self._tunneld_core.upstream_urls.discard(body.url)
+            data: dict[str, Any] = {
+                "operation": "remove_upstream",
+                "url": body.url,
+                "data": True,
+                "message": f"upstream {body.url} removed",
+            }
+            return generate_http_response(data)
 
         @self._app.get("/shutdown")
         async def shutdown() -> fastapi.Response:
             """Shutdown Tunneld"""
             os.kill(os.getpid(), signal.SIGINT)
-            data = {"operation": "shutdown", "data": True, "message": "Server shutting down..."}
+            data: dict[str, Any] = {"operation": "shutdown", "data": True, "message": "Server shutting down..."}
             return generate_http_response(data)
 
         @self._app.get("/clear_tunnels")
         async def clear_tunnels() -> fastapi.Response:
             self._tunneld_core.clear()
-            data = {"operation": "clear_tunnels", "data": True, "message": "Cleared tunnels..."}
+            data: dict[str, Any] = {"operation": "clear_tunnels", "data": True, "message": "Cleared tunnels..."}
             return generate_http_response(data)
 
         @self._app.get("/cancel")
         async def cancel_tunnel(udid: str) -> fastapi.Response:
             self._tunneld_core.cancel(udid=udid)
-            data = {"operation": "cancel", "udid": udid, "data": True, "message": f"tunnel {udid} Canceled ..."}
+            data: dict[str, Any] = {
+                "operation": "cancel",
+                "udid": udid,
+                "data": True,
+                "message": f"tunnel {udid} Canceled ...",
+            }
             return generate_http_response(data)
 
         @self._app.get("/hello")
@@ -548,7 +643,7 @@ class TunneldRunner:
             return generate_http_response(data)
 
         def generate_http_response(
-            data: dict, status_code: int = 200, media_type: str = "application/json"
+            data: dict[str, Any], status_code: int = 200, media_type: str = "application/json"
         ) -> fastapi.Response:
             return fastapi.Response(status_code=status_code, media_type=media_type, content=json.dumps(data))
 
@@ -560,21 +655,23 @@ class TunneldRunner:
                 t.tunnel for t in self._tunneld_core.tunnel_tasks.values() if t.udid == udid and t.tunnel is not None
             ]
             if len(udid_tunnels) > 0:
-                data = {
+                data: dict[str, Any] = {
                     "interface": udid_tunnels[0].interface,
                     "port": udid_tunnels[0].port,
                     "address": udid_tunnels[0].address,
                 }
                 return generate_http_response(data)
 
-            queue = asyncio.Queue()
+            queue: asyncio.Queue[Optional[TunnelResult]] = asyncio.Queue()
             created_task = False
 
             try:
                 if not created_task and connection_type in ("usbmux", None):
                     task_identifier = f"usbmux-{udid}"
                     try:
-                        with create_using_usbmux(udid) as lockdown:
+                        async with await create_using_usbmux(
+                            udid, usbmux_address=self._tunneld_core.usbmux_address
+                        ) as lockdown:
                             service = await CoreDeviceTunnelProxy.create(lockdown)
                         task = asyncio.create_task(
                             self._tunneld_core.start_tunnel_task(
@@ -603,6 +700,8 @@ class TunneldRunner:
                 if not created_task and connection_type in ("wifi", None):
                     for remotepairing in await get_remote_pairing_tunnel_services(udid=udid):
                         remotepairing_ip = remotepairing.hostname
+                        # a discovered service always carries the hostname it was browsed at
+                        assert remotepairing_ip is not None
                         if ip is not None and remotepairing_ip != ip:
                             await remotepairing.close()
                             continue
@@ -630,7 +729,7 @@ class TunneldRunner:
 
             tunnel: Optional[TunnelResult] = await queue.get()
             if tunnel is not None:
-                data = {"interface": tunnel.interface, "port": tunnel.port, "address": tunnel.address}
+                data: dict[str, Any] = {"interface": tunnel.interface, "port": tunnel.port, "address": tunnel.address}
                 return generate_http_response(data)
             else:
                 return fastapi.Response(

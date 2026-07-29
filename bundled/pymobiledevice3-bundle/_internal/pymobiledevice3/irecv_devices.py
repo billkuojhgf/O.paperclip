@@ -1,8 +1,15 @@
-from collections import namedtuple
+from typing import NamedTuple
 
-IRecvDevice = namedtuple("IRecvDevice", "product_type hardware_model board_id chip_id display_name")
 
-IRECV_DEVICES = (
+class IRecvDevice(NamedTuple):
+    product_type: str
+    hardware_model: str
+    board_id: int
+    chip_id: int
+    display_name: str
+
+
+IRECV_DEVICES: tuple[IRecvDevice, ...] = (
     # iPhone
     IRecvDevice(
         product_type="iPhone1,1", hardware_model="m68ap", board_id=0x00, chip_id=0x8900, display_name="iPhone 2G"
@@ -290,6 +297,9 @@ IRECV_DEVICES = (
     ),
     IRecvDevice(
         product_type="iPhone18,3", hardware_model="v57ap", board_id=0x08, chip_id=0x8150, display_name="iPhone 17"
+    ),
+    IRecvDevice(
+        product_type="iPhone18,5", hardware_model="v159ap", board_id=0x16, chip_id=0x8150, display_name="iPhone 17e"
     ),
     # iPod
     IRecvDevice(
@@ -707,7 +717,7 @@ IRECV_DEVICES = (
         hardware_model="j218ap",
         board_id=0x1E,
         chip_id=0x8020,
-        display_name="iPad Air (3rd gen, Celluar)",
+        display_name="iPad Air (3rd gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad11,6",
@@ -749,7 +759,7 @@ IRECV_DEVICES = (
         hardware_model="j308ap",
         board_id=0x06,
         chip_id=0x8101,
-        display_name="iPad Air (4th gen, Celluar)",
+        display_name="iPad Air (4th gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad13,4",
@@ -819,7 +829,7 @@ IRECV_DEVICES = (
         hardware_model="j408ap",
         board_id=0x12,
         chip_id=0x8103,
-        display_name="iPad Air (5th gen, Celluar)",
+        display_name="iPad Air (5th gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad14,1",
@@ -834,6 +844,202 @@ IRECV_DEVICES = (
         board_id=0x06,
         chip_id=0x8110,
         display_name="iPad mini (6th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,3",
+        hardware_model="j617ap",
+        board_id=0x08,
+        chip_id=0x8112,
+        display_name="iPad Pro 11-inch (4th gen, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,4",
+        hardware_model="j618ap",
+        board_id=0x0A,
+        chip_id=0x8112,
+        display_name="iPad Pro 11-inch (4th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,5",
+        hardware_model="j620ap",
+        board_id=0x0C,
+        chip_id=0x8112,
+        display_name="iPad Pro 12.9-inch (6th gen, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,6",
+        hardware_model="j621ap",
+        board_id=0x0E,
+        chip_id=0x8112,
+        display_name="iPad Pro 12.9-inch (6th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,8",
+        hardware_model="j507ap",
+        board_id=0x10,
+        chip_id=0x8112,
+        display_name="iPad Air 11-inch (M2, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,9",
+        hardware_model="j508ap",
+        board_id=0x12,
+        chip_id=0x8112,
+        display_name="iPad Air 11-inch (M2, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,10",
+        hardware_model="j537ap",
+        board_id=0x14,
+        chip_id=0x8112,
+        display_name="iPad Air 13-inch (M2, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,11",
+        hardware_model="j538ap",
+        board_id=0x16,
+        chip_id=0x8112,
+        display_name="iPad Air 13-inch (M2, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,3",
+        hardware_model="j607ap",
+        board_id=0x08,
+        chip_id=0x8122,
+        display_name="iPad Air 11-inch (M3, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,4",
+        hardware_model="j608ap",
+        board_id=0x0A,
+        chip_id=0x8122,
+        display_name="iPad Air 11-inch (M3, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,5",
+        hardware_model="j637ap",
+        board_id=0x0C,
+        chip_id=0x8122,
+        display_name="iPad Air 13-inch (M3, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,6",
+        hardware_model="j638ap",
+        board_id=0x0E,
+        chip_id=0x8122,
+        display_name="iPad Air 13-inch (M3, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,7",
+        hardware_model="j481ap",
+        board_id=0x10,
+        chip_id=0x8120,
+        display_name="iPad (A16, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,8",
+        hardware_model="j482ap",
+        board_id=0x12,
+        chip_id=0x8120,
+        display_name="iPad (A16, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,1",
+        hardware_model="j410ap",
+        board_id=0x08,
+        chip_id=0x8130,
+        display_name="iPad mini (A17 Pro, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,2",
+        hardware_model="j411ap",
+        board_id=0x0A,
+        chip_id=0x8130,
+        display_name="iPad mini (A17 Pro, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,3",
+        hardware_model="j717ap",
+        board_id=0x08,
+        chip_id=0x8132,
+        display_name="iPad Pro 11-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,4",
+        hardware_model="j718ap",
+        board_id=0x0A,
+        chip_id=0x8132,
+        display_name="iPad Pro 11-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,5",
+        hardware_model="j720ap",
+        board_id=0x0C,
+        chip_id=0x8132,
+        display_name="iPad Pro 13-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,6",
+        hardware_model="j721ap",
+        board_id=0x0E,
+        chip_id=0x8132,
+        display_name="iPad Pro 13-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,8",
+        hardware_model="j707ap",
+        board_id=0x10,
+        chip_id=0x8132,
+        display_name="iPad Air 11-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,9",
+        hardware_model="j708ap",
+        board_id=0x12,
+        chip_id=0x8132,
+        display_name="iPad Air 11-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,10",
+        hardware_model="j737ap",
+        board_id=0x14,
+        chip_id=0x8132,
+        display_name="iPad Air 13-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,11",
+        hardware_model="j738ap",
+        board_id=0x16,
+        chip_id=0x8132,
+        display_name="iPad Air 13-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,1",
+        hardware_model="j817ap",
+        board_id=0x08,
+        chip_id=0x8142,
+        display_name="iPad Pro 11-inch (M5, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,2",
+        hardware_model="j818ap",
+        board_id=0x0A,
+        chip_id=0x8142,
+        display_name="iPad Pro 11-inch (M5, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,3",
+        hardware_model="j820ap",
+        board_id=0x0C,
+        chip_id=0x8142,
+        display_name="iPad Pro 13-inch (M5, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,4",
+        hardware_model="j821ap",
+        board_id=0x0E,
+        chip_id=0x8142,
+        display_name="iPad Pro 13-inch (M5, Cellular)",
     ),
     # Apple TV
     IRecvDevice(
@@ -1499,5 +1705,28 @@ IRECV_DEVICES = (
         board_id=0x22,
         chip_id=0x8030,
         display_name="Studio Display",
+    ),
+    # Apple Vision Pro
+    IRecvDevice(
+        product_type="RealityDevice14,1",
+        hardware_model="n301ap",
+        board_id=0x42,
+        chip_id=0x8112,
+        display_name="Apple Vision Pro",
+    ),
+    IRecvDevice(
+        product_type="RealityDevice17,1",
+        hardware_model="n301aap",
+        board_id=0x42,
+        chip_id=0x8142,
+        display_name="Apple Vision Pro (M5)",
+    ),
+    # Virtual iPhone Research Environment
+    IRecvDevice(
+        product_type="iPhone99,11",
+        hardware_model="vresearch101ap",
+        board_id=0x90,
+        chip_id=0xFE01,
+        display_name="Virtual iPhone (99,11)",
     ),
 )

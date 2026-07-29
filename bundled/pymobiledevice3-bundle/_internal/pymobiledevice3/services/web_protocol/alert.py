@@ -1,5 +1,11 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pymobiledevice3.services.web_protocol.automation_session import AutomationSession
+
+
 class Alert:
-    def __init__(self, session):
+    def __init__(self, session: "AutomationSession"):
         """
         :param pymobiledevice3.services.web_protocol.automation_session.AutomationSession session: Automation session.
         """
@@ -20,7 +26,6 @@ class Alert:
         """
         await self.session.set_user_input_for_current_javascript_prompt(text)
 
-    @property
-    async def text(self) -> str:
+    async def get_text(self) -> str:
         """Gets the text of the Alert."""
         return await self.session.message_of_current_javascript_dialog()

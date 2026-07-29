@@ -1,19 +1,24 @@
 import asyncio
 import dataclasses
 import logging
+import platform
 import sys
 import tempfile
+from collections.abc import Awaitable
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
-from typing import Annotated, Optional, TextIO
+from typing import Annotated, Any, Callable, Optional, TextIO, Union
 
 import typer
 from typer_injector import InjectingTyper
 
 from pymobiledevice3.bonjour import DEFAULT_BONJOUR_TIMEOUT, browse_remotepairing_manual_pairing
 from pymobiledevice3.cli.cli_common import (
+    USBMUX_ENV_VARS,
+    USBMUX_OPTION_HELP,
     RSDServiceProviderDep,
+    async_command,
     print_json,
     prompt_device_list,
     sudo_required,
@@ -24,21 +29,28 @@ from pymobiledevice3.exceptions import NoDeviceConnectedError
 from pymobiledevice3.pair_records import PAIRING_RECORD_EXT, get_remote_pairing_record_filename
 from pymobiledevice3.remote.common import ConnectionType, TunnelProtocol
 from pymobiledevice3.remote.module_imports import MAX_IDLE_TIMEOUT, start_tunnel, verify_tunnel_imports
-from pymobiledevice3.remote.remote_service_discovery import RSD_PORT, RemoteServiceDiscoveryService
+from pymobiledevice3.remote.remote_service_discovery import RSD_PORT
 from pymobiledevice3.remote.tunnel_service import (
+    CoreDeviceTunnelProxy,
+    PairableHostInfo,
     RemotePairingManualPairingService,
+    RemotePairingProtocol,
     get_core_device_tunnel_services,
     get_remote_pairing_tunnel_services,
+    serve_pairable_host,
 )
 from pymobiledevice3.remote.utils import get_rsds
 from pymobiledevice3.tunneld.api import TUNNELD_DEFAULT_ADDRESS
 from pymobiledevice3.tunneld.server import TunneldRunner
+from pymobiledevice3.utils import run_in_loop
 
 logger = logging.getLogger(__name__)
 
+TUNNEL_SERVICE_DISCOVERY_ATTEMPTS = 3
 
-async def browse_rsd(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict]:
-    devices = []
+
+async def browse_rsd(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = []
     for rsd in await get_rsds(timeout):
         assert rsd.peer_info is not None
         devices.append({
@@ -51,8 +63,8 @@ async def browse_rsd(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict]:
     return devices
 
 
-async def browse_remotepairing(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict]:
-    devices = []
+async def browse_remotepairing(timeout: float = DEFAULT_BONJOUR_TIMEOUT) -> list[dict[str, Any]]:
+    devices: list[dict[str, Any]] = []
     for remotepairing in await get_remote_pairing_tunnel_services(timeout):
         devices.append({
             "address": remotepairing.hostname,
@@ -94,6 +106,10 @@ def cli_tunneld(
     usb: Annotated[bool, typer.Option(help="Enable USB monitoring")] = True,
     wifi: Annotated[bool, typer.Option(help="Enable WiFi monitoring")] = True,
     usbmux: Annotated[bool, typer.Option(help="Enable usbmux monitoring")] = True,
+    usbmux_address: Annotated[
+        Optional[str],
+        typer.Option("--usbmux-address", envvar=USBMUX_ENV_VARS, help=USBMUX_OPTION_HELP),
+    ] = None,
     mobdev2: Annotated[bool, typer.Option(help="Enable mobdev2 monitoring")] = True,
 ) -> None:
     """Start Tunneld service for remote tunneling"""
@@ -107,6 +123,7 @@ def cli_tunneld(
         usb_monitor=usb,
         wifi_monitor=wifi,
         usbmux_monitor=usbmux,
+        usbmux_address=usbmux_address,
         mobdev2_monitor=mobdev2,
     )
     if daemonize:
@@ -123,11 +140,12 @@ def cli_tunneld(
 
 
 @cli.command("browse")
-def browse(
+@async_command
+async def browse(
     timeout: Annotated[float, typer.Option(help="Bonjour timeout (in seconds)")] = DEFAULT_BONJOUR_TIMEOUT,
 ) -> None:
     """browse RemoteXPC devices using bonjour"""
-    asyncio.run(cli_browse(timeout), debug=True)
+    await cli_browse(timeout)
 
 
 @cli.command("rsd-info")
@@ -137,7 +155,7 @@ def rsd_info(service_provider: RSDServiceProviderDep) -> None:
 
 
 async def tunnel_task(
-    service,
+    service: Union[RemotePairingProtocol, CoreDeviceTunnelProxy],
     secrets: Optional[TextIO] = None,
     script_mode: bool = False,
     max_idle_timeout: float = MAX_IDLE_TIMEOUT,
@@ -204,11 +222,17 @@ async def start_tunnel_task(
 ) -> None:
     if start_tunnel is None:
         raise NotImplementedError("failed to start the tunnel on your platform")
-    get_tunnel_services = {
+    get_tunnel_services: dict[ConnectionType, Callable[..., Awaitable[list[Any]]]] = {
         connection_type.USB: get_core_device_tunnel_services,
         connection_type.WIFI: get_remote_pairing_tunnel_services,
     }
-    tunnel_services = await get_tunnel_services[connection_type](udid=udid)
+    tunnel_services: list[Any] = []
+    for attempt in range(TUNNEL_SERVICE_DISCOVERY_ATTEMPTS):
+        tunnel_services = await get_tunnel_services[connection_type](udid=udid)
+        if tunnel_services:
+            break
+        if attempt < TUNNEL_SERVICE_DISCOVERY_ATTEMPTS - 1:
+            logger.info("No tunnel services discovered, trying again")
     if not tunnel_services:
         # no devices were found
         raise NoDeviceConnectedError()
@@ -226,7 +250,8 @@ async def start_tunnel_task(
 
 @cli.command("start-tunnel")
 @sudo_required
-def cli_start_tunnel(
+@async_command
+async def cli_start_tunnel(
     connection_type: Annotated[
         ConnectionType,
         typer.Option(
@@ -266,16 +291,13 @@ def cli_start_tunnel(
     if not verify_tunnel_imports():
         return
     with secrets.open("wt") if secrets is not None else nullcontext() as secrets_file:
-        asyncio.run(
-            start_tunnel_task(
-                connection_type,
-                secrets_file,
-                udid,
-                script_mode,
-                max_idle_timeout=max_idle_timeout,
-                protocol=protocol,
-            ),
-            debug=True,
+        await start_tunnel_task(
+            connection_type,
+            secrets_file,
+            udid,
+            script_mode,
+            max_idle_timeout=max_idle_timeout,
+            protocol=protocol,
         )
 
 
@@ -287,15 +309,23 @@ class RemotePairingManualPairingDevice:
     identifier: str
 
 
-async def start_remote_pair_task(device_name: Optional[str]) -> None:
+@cli.command("pair")
+@async_command
+async def cli_pair(
+    name: Annotated[
+        Optional[str],
+        typer.Option(help="Device name for a specific device to look for"),
+    ] = None,
+) -> None:
+    """start remote pairing for devices which allow"""
     if start_tunnel is None:
         raise NotImplementedError("failed to start the tunnel on your platform")
 
     devices: list[RemotePairingManualPairingDevice] = []
     for answer in await browse_remotepairing_manual_pairing():
-        current_device_name = answer.properties[b"name"].decode()
+        current_device_name = answer.properties["name"]
 
-        if device_name is not None and current_device_name != device_name:
+        if name is not None and current_device_name != name:
             continue
 
         for address in answer.addresses:
@@ -304,7 +334,7 @@ async def start_remote_pair_task(device_name: Optional[str]) -> None:
                     ip=address.full_ip,
                     port=answer.port,
                     device_name=current_device_name,
-                    identifier=answer.properties[b"identifier"].decode(),
+                    identifier=answer.properties["identifier"],
                 )
             )
 
@@ -318,31 +348,91 @@ async def start_remote_pair_task(device_name: Optional[str]) -> None:
         await service.connect(autopair=True)
 
 
-@cli.command("pair")
-def cli_pair(
+@cli.command("pair-host")
+@async_command
+async def cli_pair_host(
     name: Annotated[
         Optional[str],
-        typer.Option(help="Device name for a specific device to look for"),
+        typer.Option(help="Name shown on the device (defaults to this machine's hostname)"),
+    ] = None,
+    model: Annotated[
+        str,
+        typer.Option(help="Hardware model identifier shown on the device"),
+    ] = "Mac17,7",
+    port: Annotated[
+        int,
+        typer.Option(help="TCP port to listen on (0 = pick a free port)"),
+    ] = 0,
+    timeout: Annotated[
+        Optional[float],
+        typer.Option(help="Give up after this many seconds if no device starts pairing"),
     ] = None,
 ) -> None:
-    """start remote pairing for devices which allow"""
-    asyncio.run(start_remote_pair_task(name), debug=True)
+    """
+    Advertise as a pairable host and accept a device-initiated pairing (iOS 27+).
+
+    The device does not browse for pairable hosts automatically. On the device, enable
+    Developer Mode and open Settings > Developer > Paired Macs; this host then appears
+    under "Other Devices". Tap it and enter the 6-digit code printed here. The resulting
+    pairing record is reused by `remote start-tunnel` afterwards.
+    """
+    host_info = PairableHostInfo(name=name or platform.node(), model=model)
+
+    def pin_callback(pin: str) -> None:
+        typer.echo(typer.style(f"\n  Enter this code on your device: {pin}\n", bold=True, fg="green"))
+
+    def waiting_callback(elapsed: float) -> None:
+        typer.echo(typer.style(f"  …still waiting ({int(elapsed)}s) — no device has started pairing yet", fg="cyan"))
+
+    typer.echo(
+        typer.style("Advertising as ", fg="yellow")
+        + typer.style(f'"{host_info.name}" ({host_info.model})', bold=True, fg="white")
+        + typer.style(f" identifier={host_info.identifier}", fg="yellow")
+    )
+    # The device does NOT browse for pairable hosts on its own — nothing happens until the
+    # user opens the device-side screen that starts the browse. Spell out the steps.
+    typer.echo(
+        typer.style("On the device, to make this host appear and pair:\n", bold=True, fg="yellow")
+        + "  1. Enable Developer Mode: Settings > Privacy & Security > Developer Mode (reboot if asked).\n"
+        + "  2. Make sure the device is on the same Wi-Fi network as this computer.\n"
+        + '  3. Open Settings > Developer > Paired Macs. This host appears under "Other Devices".\n'
+        + "  4. Tap it, choose Pair, and enter the 6-digit code shown below when prompted.\n"
+        + "  (Repeated failed attempts get throttled by the device — wait a bit if pairing stops responding.)"
+    )
+    typer.echo("Waiting for a device to connect and start pairing (Ctrl-C to stop)...")
+
+    try:
+        result = await serve_pairable_host(
+            host_info, port=port, pin_callback=pin_callback, timeout=timeout, waiting_callback=waiting_callback
+        )
+    except asyncio.TimeoutError:
+        typer.echo(
+            typer.style(
+                f"\nTimed out after {timeout:g}s with no device-initiated pairing. "
+                "Make sure you opened Settings > Developer > Paired Macs on the device (Developer Mode "
+                "must be on) — the device only browses for this host while that screen is open.",
+                fg="red",
+            )
+        )
+        raise typer.Exit(code=1) from None
+
+    typer.echo(typer.style("\nPaired with device:", bold=True, fg="green"))
+    typer.echo(f"  name:  {result.peer_device.name}")
+    typer.echo(f"  model: {result.peer_device.model}")
+    typer.echo(f"  udid:  {result.peer_device.udid}")
+    typer.echo(f"\nPairing record written to {result.record_path}")
 
 
 @cli.command("delete-pair")
-@sudo_required
 def cli_delete_pair(udid: str) -> None:
-    """delete a pairing record"""
+    """Delete a pairing record"""
     pair_record_path = get_home_folder() / f"{get_remote_pairing_record_filename(udid)}.{PAIRING_RECORD_EXT}"
     pair_record_path.unlink()
 
 
-async def cli_service_task(service_provider: RemoteServiceDiscoveryService, service_name: str) -> None:
-    async with service_provider.start_remote_service(service_name) as service:
-        service.shell()
-
-
 @cli.command("service")
 def cli_service(service_provider: RSDServiceProviderDep, service_name: str) -> None:
-    """start an ipython shell for interacting with given service"""
-    asyncio.run(cli_service_task(service_provider, service_name), debug=True)
+    """Start an ipython shell for interacting with given service"""
+    service = service_provider.start_remote_service(service_name)
+    run_in_loop(service.connect())
+    service.shell()

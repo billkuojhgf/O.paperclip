@@ -1,5 +1,6 @@
 import plistlib
-from typing import Optional
+from collections.abc import AsyncIterator
+from typing import Any, Optional
 
 from pymobiledevice3.remote.core_device.core_device_service import CoreDeviceService
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
@@ -23,8 +24,15 @@ class AppServiceService(CoreDeviceService):
         include_hidden_apps: bool = True,
         include_internal_apps: bool = True,
         include_default_apps: bool = True,
-    ) -> list[dict]:
-        """List applications"""
+        require_container_access: bool = False,
+        include_app_group_identifiers: bool = False,
+        include_container_paths: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List applications.
+
+        Note: on iOS 26 the non-streaming listapps feature accepts the request but never
+        replies (and the stuck call wedges dtappserviced). Use ``stream_apps`` there instead.
+        """
         return await self.invoke(
             "com.apple.coredevice.feature.listapps",
             {
@@ -33,6 +41,11 @@ class AppServiceService(CoreDeviceService):
                 "includeHiddenApps": include_hidden_apps,
                 "includeInternalApps": include_internal_apps,
                 "includeDefaultApps": include_default_apps,
+                # Required since iOS 26 (InstalledAppsRequestParams). requireContainerAccess=True
+                # needs the com.apple.private.CoreDevice.obtainContainerAccess entitlement.
+                "requireContainerAccess": require_container_access,
+                "includeAppGroupIdentifiers": include_app_group_identifiers,
+                "includeContainerPaths": include_container_paths,
             },
         )
 
@@ -42,9 +55,9 @@ class AppServiceService(CoreDeviceService):
         arguments: Optional[list[str]] = None,
         kill_existing: bool = True,
         start_suspended: bool = False,
-        environment: Optional[dict] = None,
-        extra_options: Optional[dict] = None,
-    ) -> list[dict]:
+        environment: Optional[dict[str, str]] = None,
+        extra_options: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
         """launch application"""
         return await self.invoke(
             "com.apple.coredevice.feature.launchapplication",
@@ -65,11 +78,49 @@ class AppServiceService(CoreDeviceService):
             },
         )
 
-    async def list_processes(self) -> list[dict]:
+    async def list_processes(self) -> list[dict[str, Any]]:
         """List processes"""
         return (await self.invoke("com.apple.coredevice.feature.listprocesses"))["processTokens"]
 
-    async def list_roots(self) -> dict:
+    async def stream_apps(
+        self,
+        include_app_clips: bool = True,
+        include_removable_apps: bool = True,
+        include_hidden_apps: bool = True,
+        include_internal_apps: bool = True,
+        include_default_apps: bool = True,
+        require_container_access: bool = False,
+        include_app_group_identifiers: bool = False,
+        include_container_paths: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the installed application list, yielding each app as it is pushed.
+
+        Streaming counterpart of ``list_apps``; elements share the same shape.
+        """
+        async for app in self.stream_invoke(
+            "com.apple.coredevice.feature.streamapplist",
+            {
+                "includeAppClips": include_app_clips,
+                "includeRemovableApps": include_removable_apps,
+                "includeHiddenApps": include_hidden_apps,
+                "includeInternalApps": include_internal_apps,
+                "includeDefaultApps": include_default_apps,
+                "requireContainerAccess": require_container_access,
+                "includeAppGroupIdentifiers": include_app_group_identifiers,
+                "includeContainerPaths": include_container_paths,
+            },
+        ):
+            yield app
+
+    async def stream_processes(self) -> AsyncIterator[dict[str, Any]]:
+        """Stream the process list, yielding each process token as it is pushed.
+
+        Streaming counterpart of ``list_processes``; elements share the same shape.
+        """
+        async for process in self.stream_invoke("com.apple.coredevice.feature.streamprocesslist"):
+            yield process
+
+    async def list_roots(self) -> dict[str, Any]:
         """
         List roots.
 
@@ -77,7 +128,7 @@ class AppServiceService(CoreDeviceService):
         """
         return await self.invoke("com.apple.coredevice.feature.listroots", {"rootPoint": {"relative": "/"}})
 
-    async def spawn_executable(self, executable: str, arguments: list[str]) -> dict:
+    async def spawn_executable(self, executable: str, arguments: list[str]) -> dict[str, Any]:
         """
         Spawn given executable.
 
@@ -107,7 +158,7 @@ class AppServiceService(CoreDeviceService):
             },
         )
 
-    async def monitor_process_termination(self, pid: int) -> dict:
+    async def monitor_process_termination(self, pid: int) -> dict[str, Any]:
         """
         Monitor process termination.
 
@@ -124,7 +175,7 @@ class AppServiceService(CoreDeviceService):
         """
         await self.invoke("com.apple.coredevice.feature.uninstallapp", {"bundleIdentifier": bundle_identifier})
 
-    async def send_signal_to_process(self, pid: int, signal: int) -> dict:
+    async def send_signal_to_process(self, pid: int, signal: int) -> dict[str, Any]:
         """
         Send signal to given process by its pid
         """
@@ -138,7 +189,7 @@ class AppServiceService(CoreDeviceService):
 
     async def fetch_icons(
         self, bundle_identifier: str, width: float, height: float, scale: float, allow_placeholder: bool
-    ) -> dict:
+    ) -> dict[str, Any]:
         """
         Fetch given application's icons
         """

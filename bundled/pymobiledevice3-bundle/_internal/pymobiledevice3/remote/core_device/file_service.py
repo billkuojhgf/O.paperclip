@@ -3,8 +3,8 @@ import struct
 import time
 import uuid
 from collections.abc import AsyncGenerator
-from enum import IntEnum
-from typing import Optional
+from enum import Enum, IntEnum
+from typing import Any, Optional
 
 from pymobiledevice3.exceptions import CoreDeviceError
 from pymobiledevice3.remote.core_device.core_device_service import CoreDeviceService
@@ -18,13 +18,18 @@ class Domain(IntEnum):
     TEMPORARY = 3
     SYSTEM_CRASH_LOGS = 5
 
+    @classmethod
+    def from_name(cls, name: "DomainName") -> "Domain":
+        return cls[name.name]
 
-APPLE_DOMAIN_DICT = {
-    "appDataContainer": Domain.APP_DATA_CONTAINER,
-    "appGroupDataContainer": Domain.APP_GROUP_DATA_CONTAINER,
-    "temporary": Domain.TEMPORARY,
-    "systemCrashLogs": Domain.SYSTEM_CRASH_LOGS,
-}
+
+class DomainName(str, Enum):
+    """Human-readable names for `Domain` (member names mirror it); resolve with `Domain.from_name()`."""
+
+    APP_DATA_CONTAINER = "appDataContainer"
+    APP_GROUP_DATA_CONTAINER = "appGroupDataContainer"
+    TEMPORARY = "temporary"
+    SYSTEM_CRASH_LOGS = "systemCrashLogs"
 
 
 class FileServiceService(CoreDeviceService):
@@ -64,7 +69,10 @@ class FileServiceService(CoreDeviceService):
     async def retrieve_file(self, path: str = ".") -> bytes:
         response = await self.send_receive_request({"Cmd": "RetrieveFile", "Path": path, "SessionID": self.session})
         data_service = self.rsd.get_service_port("com.apple.coredevice.fileservice.data")
-        reader, writer = await asyncio.open_connection(self.service.address[0], data_service)
+        # Route through the RSD's dialer (set by the userspace tunnel to relay through its
+        # in-process stack); falls back to the stdlib default for the kernel-tunnel path.
+        open_connection = self.rsd.open_connection or asyncio.open_connection
+        reader, writer = await open_connection(self.service.address[0], data_service)
         writer.write(b"rwb!FILE" + struct.pack(">QQQQ", response["Response"], 0, response["NewFileID"], 0))
         await writer.drain()
         await reader.readexactly(0x24)
@@ -76,8 +84,8 @@ class FileServiceService(CoreDeviceService):
         file_permissions: int = 0o644,
         uid: int = 501,
         gid: int = 501,
-        creation_time: int = time.time(),
-        last_modification_time: int = time.time(),
+        creation_time: float = time.time(),
+        last_modification_time: float = time.time(),
     ) -> None:
         """Request to write an empty file at given path."""
         await self.send_receive_request({
@@ -91,7 +99,7 @@ class FileServiceService(CoreDeviceService):
             "SessionID": self.session,
         })
 
-    async def send_receive_request(self, request: dict) -> dict:
+    async def send_receive_request(self, request: dict[str, Any]) -> dict[str, Any]:
         response = await self.service.send_receive_request(request)
         encoded_error = response.get("EncodedError")
         if encoded_error is not None:

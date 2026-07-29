@@ -1,3 +1,7 @@
+from collections.abc import AsyncGenerator
+from typing import Union
+
+from pymobiledevice3.exceptions import ConnectionTerminatedError
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.lockdown_service import LockdownService
@@ -10,7 +14,10 @@ SYSLOG_LINE_SPLITTER = b"\n\x00"
 
 class SyslogService(LockdownService):
     """
-    View system logs
+    Stream the device's live system log via the ``com.apple.syslog_relay`` service.
+
+    The service name used depends on the lockdown type (legacy ``com.apple.syslog_relay`` for
+    `LockdownClient`, RSD shim otherwise).
     """
 
     SERVICE_NAME = "com.apple.syslog_relay"
@@ -22,14 +29,24 @@ class SyslogService(LockdownService):
         else:
             super().__init__(service_provider, self.RSD_SERVICE_NAME)
 
-    def watch(self):
+    async def watch(self) -> AsyncGenerator[Union[str, bytes], None]:
+        """
+        Stream syslog lines from the device as they are emitted.
+
+        Reads the relay in chunks, splits on the syslog line delimiter, buffers any partial trailing
+        line until the rest arrives, and decodes each complete line. Empty lines are skipped.
+
+        :yields: A single decoded syslog line (without the trailing delimiter), or the raw bytes
+            when the line is not valid UTF-8.
+        :raises ConnectionTerminatedError: If the device closes the connection.
+        """
         buf = b""
         while True:
             # read in chunks till we have at least one syslog line
-            chunk = self.service.recv(CHUNK_SIZE)
+            chunk = await self.service.recv_any(CHUNK_SIZE)
 
             if len(chunk) == 0:
-                raise ConnectionAbortedError()
+                raise ConnectionTerminatedError()
 
             buf += chunk
 

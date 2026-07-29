@@ -1,31 +1,34 @@
-import asyncio
 import contextlib
 import logging
 import plistlib
 import tempfile
 import traceback
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
-from typing import IO, Annotated, Optional
-from zipfile import ZipFile
+from typing import IO, Annotated, Any, Optional, Union, cast
 
-import click
-import IPython
 import requests
 import typer
+from ipsw_parser.ipsw import IPSW
 from pygments import formatters, highlight, lexers
 from typer_injector import Depends, InjectingTyper
 
 from pymobiledevice3 import usbmux
-from pymobiledevice3.cli.cli_common import is_invoked_for_completion, print_json, prompt_selection
+from pymobiledevice3.cli.cli_common import (
+    async_command,
+    cli_loop,
+    is_invoked_for_completion,
+    print_json,
+    prompt_selection,
+)
 from pymobiledevice3.exceptions import ConnectionFailedError, ConnectionFailedToUsbmuxdError, IncorrectModeError
 from pymobiledevice3.irecv import IRecv
-from pymobiledevice3.lockdown import LockdownClient, create_using_usbmux
+from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.restore.device import Device
 from pymobiledevice3.restore.recovery import Behavior, Recovery
 from pymobiledevice3.restore.restore import Restore
 from pymobiledevice3.services.diagnostics import DiagnosticsService
-from pymobiledevice3.utils import file_download
+from pymobiledevice3.utils import file_download, start_ipython_shell
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,7 @@ cli = InjectingTyper(
 )
 
 
-def device_dependency(
+async def _device_dependency_async(
     ecid: Annotated[
         Optional[str],
         typer.Option(
@@ -57,17 +60,22 @@ def device_dependency(
         # prevent lockdown connection establishment when in autocomplete mode
         return None
 
-    logger.debug("searching among connected devices via lockdownd")
-    devices = [dev for dev in usbmux.list_devices() if dev.connection_type == "USB"]
-    if len(devices) > 1:
-        raise click.ClickException("Multiple device detected")
+    # ECID comes in as a CLI string (decimal or 0x-hex) but is matched against the integer
+    # UniqueChipID; parse it once so the comparisons below actually work.
+    ecid_value = int(ecid, 0) if ecid is not None else None
+
     try:
+        logger.debug("searching among connected devices via lockdownd")
+        devices = [dev for dev in await usbmux.list_devices() if dev.connection_type == "USB"]
+        if len(devices) > 1:
+            typer.echo(typer.style("Multiple device detected", fg="red"))
+            raise typer.Exit(code=1)
         for device in devices:
             try:
-                lockdown = create_using_usbmux(serial=device.serial, connection_type="USB")
+                lockdown = await create_using_usbmux(serial=device.serial, connection_type="USB")
             except (ConnectionFailedError, IncorrectModeError):
                 continue
-            if (ecid is None) or (lockdown.ecid == ecid):
+            if (ecid_value is None) or (lockdown.ecid == ecid_value):
                 logger.debug("found device")
                 return Device(lockdown=lockdown)
             else:
@@ -76,7 +84,18 @@ def device_dependency(
         pass
 
     logger.debug("waiting for device to be available in Recovery mode")
-    return Device(irecv=IRecv(ecid=ecid))
+    return Device(irecv=IRecv(ecid=ecid_value))
+
+
+def device_dependency(
+    ecid: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Target device ECID; defaults to the first connected USB device or waits for Recovery/DFU.",
+        ),
+    ] = None,
+) -> Optional[Device]:
+    return cli_loop.run_until_complete(_device_dependency_async(ecid))
 
 
 DeviceDep = Annotated[
@@ -86,16 +105,17 @@ DeviceDep = Annotated[
 
 
 @contextlib.contextmanager
-def tempzip_download_ctx(url: str) -> Iterator[ZipFile]:
+def tempzip_download_ctx(url: str) -> Generator[IPSW, None, None]:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpzip = Path(tmpdir) / url.split("/")[-1]
         file_download(url, tmpzip)
-        yield ZipFile(tmpzip)
+        with ipsw_ctx(tmpzip) as ipsw:
+            yield ipsw
 
 
 @contextlib.contextmanager
-def zipfile_ctx(path: str) -> Iterator[ZipFile]:
-    yield ZipFile(path)
+def ipsw_ctx(path: Union[str, Path]) -> Generator[IPSW, None, None]:
+    yield IPSW.create_from_path(str(path))
 
 
 def ipsw_ctx_dependency(
@@ -108,18 +128,18 @@ def ipsw_ctx_dependency(
             help="Path or URL to an IPSW. If omitted, choose a signed build interactively.",
         ),
     ] = None,
-) -> contextlib.AbstractContextManager[ZipFile]:
+) -> contextlib.AbstractContextManager[IPSW]:
     if ipsw and not ipsw.startswith(("http://", "https://")):
-        return zipfile_ctx(ipsw)
+        return ipsw_ctx(ipsw)
 
     url = ipsw
     if url is None:
-        url = query_ipswme(device.product_type)
+        url = query_ipswme(cli_loop.run_until_complete(device.get_product_type()))
     return tempzip_download_ctx(url)
 
 
 IPSWCtxDep = Annotated[
-    contextlib.AbstractContextManager[ZipFile],
+    contextlib.AbstractContextManager[IPSW],
     Depends(ipsw_ctx_dependency),
 ]
 
@@ -137,8 +157,14 @@ def tss_dependency(
 
 
 TSSDep = Annotated[
-    Optional[dict],
+    Optional[dict[str, Any]],
     Depends(tss_dependency),
+]
+
+
+BehaviorOption = Annotated[
+    Behavior,
+    typer.Option(help="Restore behavior to use when selecting the BuildIdentity."),
 ]
 
 
@@ -151,14 +177,26 @@ def query_ipswme(identifier: str) -> str:
 
 
 async def restore_update_task(
-    device: Device, ipsw: ZipFile, tss: Optional[dict], erase: bool, ignore_fdr: bool
+    device: Device,
+    ipsw: IPSW,
+    tss: Optional[dict[str, Any]],
+    erase: bool,
+    ignore_fdr: bool,
+    enable_tss_batch: bool = False,
 ) -> None:
     behavior = Behavior.Update
     if erase:
         behavior = Behavior.Erase
 
     try:
-        await Restore(ipsw, device, tss=tss, behavior=behavior, ignore_fdr=ignore_fdr).update()
+        await Restore(
+            ipsw,
+            device,
+            tss=tss,
+            behavior=behavior,
+            ignore_fdr=ignore_fdr,
+            enable_tss_batch=enable_tss_batch,
+        ).update()
     except Exception:
         # click may "swallow" several exception types so we try to catch them all here
         traceback.print_exc()
@@ -168,19 +206,23 @@ async def restore_update_task(
 @cli.command("shell")
 def restore_shell(device: DeviceDep) -> None:
     """create an IPython shell for interacting with iBoot"""
-    IPython.embed(
-        header=highlight(SHELL_USAGE, lexers.PythonLexer(), formatters.Terminal256Formatter(style="native")),
+    start_ipython_shell(
+        header=highlight(
+            SHELL_USAGE, cast(Any, lexers).PythonLexer(), cast(Any, formatters).Terminal256Formatter(style="native")
+        ),
         user_ns={
-            "irecv": device,
+            "irecv": device.irecv,
         },
     )
 
 
 @cli.command("enter")
-def restore_enter(device: DeviceDep) -> None:
+@async_command
+async def restore_enter(device: DeviceDep) -> None:
     """enter Recovery mode"""
-    if isinstance(device, LockdownClient):
-        device.enter_recovery()
+    if await device.get_is_lockdown():
+        assert device.lockdown is not None  # get_is_lockdown() guarantees it
+        await device.lockdown.enter_recovery()
 
 
 @cli.command("exit")
@@ -192,47 +234,57 @@ def restore_exit() -> None:
 
 
 @cli.command("restart")
-def restore_restart(device: DeviceDep) -> None:
+@async_command
+async def restore_restart(device: DeviceDep) -> None:
     """restarts device"""
-    if device.is_lockdown:
-        with DiagnosticsService(device.lockdown) as diagnostics:
-            diagnostics.restart()
+    if await device.get_is_lockdown():
+        assert device.lockdown is not None  # get_is_lockdown() guarantees it
+        async with DiagnosticsService(device.lockdown) as diagnostics:
+            await diagnostics.restart()
     else:
+        assert device.irecv is not None  # a Device is constructed with either lockdown or irecv
         device.irecv.reboot()
 
 
 async def restore_tss_task(
-    device: Device, ipsw_ctx: contextlib.AbstractContextManager[ZipFile], out: Optional[IO]
+    device: Device,
+    ipsw_ctx: contextlib.AbstractContextManager[IPSW],
+    out: Optional[IO[bytes]],
+    behavior: Behavior = Behavior.Update,
 ) -> None:
     with ipsw_ctx as ipsw:
-        tss = await Recovery(ipsw, device).fetch_tss_record()
+        tss = await Recovery(ipsw, device, behavior=behavior).fetch_tss_record()
     if out:
         plistlib.dump(tss, out)
     print_json(tss)
 
 
 @cli.command("tss")
-def restore_tss(device: DeviceDep, ipsw_ctx: IPSWCtxDep, out: Optional[Path] = None) -> None:
+@async_command
+async def restore_tss(
+    device: DeviceDep,
+    ipsw_ctx: IPSWCtxDep,
+    out: Optional[Path] = None,
+    behavior: BehaviorOption = Behavior.Update,
+) -> None:
     """query SHSH blobs"""
     with out.open("wb") if out else contextlib.nullcontext() as out_file:
-        asyncio.run(restore_tss_task(device, ipsw_ctx, out_file), debug=True)
+        await restore_tss_task(device, ipsw_ctx, out_file, behavior=behavior)
 
 
-async def restore_ramdisk_task(device: Device, ipsw_ctx: contextlib.AbstractContextManager[ZipFile]) -> None:
+@cli.command("ramdisk")
+@async_command
+async def restore_ramdisk(device: DeviceDep, ipsw_ctx: IPSWCtxDep) -> None:
+    """
+    Boot only the update ramdisk without performing a restore (IPSW path or URL accepted).
+    """
     with ipsw_ctx as ipsw:
         await Recovery(ipsw, device).boot_ramdisk()
 
 
-@cli.command("ramdisk")
-def restore_ramdisk(device: DeviceDep, ipsw_ctx: IPSWCtxDep) -> None:
-    """
-    Boot only the update ramdisk without performing a restore (IPSW path or URL accepted).
-    """
-    asyncio.run(restore_ramdisk_task(device, ipsw_ctx), debug=True)
-
-
 @cli.command("update")
-def restore_update(
+@async_command
+async def restore_update(
     device: DeviceDep,
     ipsw_ctx: IPSWCtxDep,
     tss: TSSDep,
@@ -244,9 +296,29 @@ def restore_update(
         bool,
         typer.Option(help="Connect to the FDR service only (debug mode; no traffic proxying)."),
     ] = False,
+    tss_batch: Annotated[
+        bool,
+        typer.Option(
+            "--tss-batch",
+            help=(
+                "Opt-in: enable the batched TSS prefetch POST (iOS 18+). Sends a single "
+                "HTTP request to gs.apple.com that signs every prefetchable peripheral "
+                "ticket (SE/SE2, Rose, Savage, T200, Centauri, eUICC, Baseband) at once; "
+                "the reactive POSTs during restore are then served from cache. Off by "
+                "default — pass this flag to reduce gs.apple.com round-trips during restore."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """
     Update or restore the device using an IPSW (local path or URL).
     """
     with ipsw_ctx as ipsw:
-        asyncio.run(restore_update_task(device, ipsw, tss, erase, ignore_fdr), debug=True)
+        await restore_update_task(
+            device,
+            ipsw,
+            tss,
+            erase,
+            ignore_fdr,
+            enable_tss_batch=tss_batch,
+        )

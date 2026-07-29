@@ -60,6 +60,62 @@ private struct MockRouteCalculator: RouteCalculating {
 
 struct O_PaperclipTests {
 
+    @Test func usbTunnelPolicyRejectsNetworkRecordsAndUsesLockdown() {
+        #expect(USBMuxConnectionTypePolicy.isUSB("USB"))
+        #expect(!USBMuxConnectionTypePolicy.isUSB("Network"))
+        #expect(!USBMuxConnectionTypePolicy.isUSB(nil))
+
+        #expect(
+            TunnelCommandPolicy.arguments(
+                connectionType: "usb",
+                transport: "tcp",
+                udid: "device-id"
+            ) == ["lockdown", "start-tunnel", "--script-mode", "--udid", "device-id"]
+        )
+    }
+
+    @Test func wifiTunnelPolicyRetainsRequestedTransport() {
+        #expect(
+            TunnelCommandPolicy.arguments(
+                connectionType: "wifi",
+                transport: "quic",
+                udid: nil
+            ) == [
+                "remote", "start-tunnel", "--connection-type", "wifi",
+                "--script-mode", "-p", "quic"
+            ]
+        )
+    }
+
+    @Test func connectionAttemptStateRejectsDuplicateAndStaleCompletion() {
+        var attempts = ConnectionAttemptState()
+        let first = attempts.begin()
+        #expect(first == 1)
+        #expect(attempts.begin() == nil)
+
+        _ = attempts.invalidate()
+        let replacement = attempts.begin()
+        #expect(replacement == 3)
+
+        attempts.finish(first!)
+        #expect(attempts.isCurrent(replacement!))
+        #expect(attempts.isInFlight)
+
+        attempts.finish(replacement!)
+        #expect(!attempts.isInFlight)
+    }
+
+    @Test func privilegedTunnelAttemptDirectoriesAreNeverShared() {
+        let expected = "attempt-12345678-1234-1234-1234-1234567890ab"
+        let identifier = UUID(uuidString: "12345678-1234-1234-1234-1234567890AB")!
+
+        #expect(PrivilegedTunnelAttemptIdentity.directoryName(identifier: identifier) == expected)
+        #expect(
+            PrivilegedTunnelAttemptIdentity.directoryName()
+                != PrivilegedTunnelAttemptIdentity.directoryName()
+        )
+    }
+
     @Test func parsesDirectKMLIntoOverlay() throws {
         let data = """
         <?xml version="1.0" encoding="UTF-8"?>

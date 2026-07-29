@@ -6,11 +6,9 @@ import socket
 import ssl
 import struct
 import time
-import xml
-from enum import Enum
-from typing import Any, Optional, Union
+import xml.parsers.expat
+from typing import Any, Callable, Optional, cast
 
-import IPython
 from pygments import formatters, highlight, lexers
 
 from pymobiledevice3.exceptions import (
@@ -20,31 +18,35 @@ from pymobiledevice3.exceptions import (
     PyMobileDevice3Exception,
 )
 from pymobiledevice3.osu.os_utils import get_os_utils
+from pymobiledevice3.plist_types import PlistDict, PlistSendable, PlistValue
 from pymobiledevice3.usbmux import MuxDevice, select_device
+from pymobiledevice3.utils import start_ipython_shell
 
 DEFAULT_AFTER_IDLE_SEC = 3
 DEFAULT_INTERVAL_SEC = 3
 DEFAULT_MAX_FAILS = 3
 DEFAULT_TIMEOUT = 1
+DEFAULT_SSL_HANDSHAKE_TIMEOUT = 10
+CLOSE_STREAM_WRITER_DEFAULT_TIMEOUT_SECONDS = 1.0
 OSUTIL = get_os_utils()
 SHELL_USAGE = """
 # This shell allows you to communicate directly with every service layer behind the lockdownd daemon.
 
 # For example, you can do the following:
-client.send_plist({"Command": "DoSomething"})
+await client.send_plist({"Command": "DoSomething"})
 
 # and view the reply
-print(client.recv_plist())
+print(await client.recv_plist())
 
 # or just send raw message
 client.send(b"hello")
 
 # and view the result
-print(client.recvall(20))
+print(await client.recvall(20))
 """
 
 
-def build_plist(d: dict, endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> bytes:
+def build_plist(d: PlistSendable, endianity: str = ">", fmt: plistlib.PlistFormat = plistlib.FMT_XML) -> bytes:
     """
     Convert a dictionary to a plist-formatted byte string prefixed with a length field.
 
@@ -53,12 +55,14 @@ def build_plist(d: dict, endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> 
     :param fmt: The plist format (e.g., plistlib.FMT_XML).
     :return: The plist-formatted byte string.
     """
-    payload = plistlib.dumps(d, fmt=fmt)
+    # ``d`` is already constrained to plist-serialisable data; plistlib.dumps' stub types its
+    # parameter more narrowly than our covariant PlistSendable, so widen at this boundary only.
+    payload = plistlib.dumps(cast(Any, d), fmt=fmt)
     message = struct.pack(endianity + "L", len(payload))
     return message + payload
 
 
-def parse_plist(payload: bytes) -> dict:
+def parse_plist(payload: bytes) -> PlistValue:
     """
     Parse a plist-formatted byte string into a dictionary.
 
@@ -79,10 +83,24 @@ def parse_plist(payload: bytes) -> dict:
         raise PyMobileDevice3Exception(f"parse_plist invalid data: {payload[:100].hex()}") from e
 
 
+async def close_stream_writer(
+    writer: asyncio.StreamWriter, timeout: float = CLOSE_STREAM_WRITER_DEFAULT_TIMEOUT_SECONDS
+) -> None:
+    """Close a stream writer gracefully, aborting its transport if its close hangs"""
+    with contextlib.suppress(Exception):
+        writer.close()
+    with contextlib.suppress(Exception):
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                writer.transport.abort()
+
+
 class ServiceConnection:
     """wrapper for tcp-relay connections"""
 
-    def __init__(self, sock: socket.socket, mux_device: MuxDevice = None):
+    def __init__(self, sock: socket.socket, mux_device: Optional[MuxDevice] = None) -> None:
         """
         Initialize a ServiceConnection object.
 
@@ -90,23 +108,37 @@ class ServiceConnection:
         :param mux_device: The MuxDevice associated with the connection (optional).
         """
         self.logger = logging.getLogger(__name__)
-        self.socket = sock
+        self.socket: Optional[socket.socket] = sock
         self._offset = 0
 
         # usbmux connections contain additional information associated with the current connection
         self.mux_device = mux_device
 
-        self.reader = None  # type: Optional[asyncio.StreamReader]
-        self.writer = None  # type: Optional[asyncio.StreamWriter]
+        # Async stream reader and writer used for stream mode.
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
 
         # SSL/TLS version to be used for connecting to device
         # TLS v1.2 is supported since iOS 5
         self.min_ssl_proto = ssl.TLSVersion.TLSv1_2
         self.max_ssl_proto = ssl.TLSVersion.TLSv1_3
+        sock.setblocking(False)
+
+        # Shared Future used by _ensure_started() to avoid duplicate start() calls when
+        # multiple coroutines race to use a not-yet-started connection simultaneously.
+        self._start_future: Optional[asyncio.Future[None]] = None
+
+        # Held across the full send→recv pair in send_recv_plist() so that concurrent
+        # callers (e.g. LockdownClient shared by many tasks) are serialised automatically.
+        self._transaction_lock = asyncio.Lock()
 
     @staticmethod
-    def create_using_tcp(
-        hostname: str, port: int, keep_alive: bool = True, create_connection_timeout: int = DEFAULT_TIMEOUT
+    async def create_using_tcp(
+        hostname: str,
+        port: int,
+        keep_alive: bool = True,
+        create_connection_timeout: int = DEFAULT_TIMEOUT,
+        open_connection: Optional[Callable[..., Any]] = None,
     ) -> "ServiceConnection":
         """
         Create a ServiceConnection using a TCP connection.
@@ -115,35 +147,45 @@ class ServiceConnection:
         :param port: The port to connect to.
         :param keep_alive: Whether to enable TCP keep-alive.
         :param create_connection_timeout: The timeout for creating the connection.
+        :param open_connection: Optional ``asyncio.open_connection``-compatible dialer. Defaults to
+            ``asyncio.open_connection``; the userspace tunnel injects one that relays device-bound
+            connections through its in-process stack (avoiding a global monkeypatch).
         :return: A ServiceConnection object.
         """
-        sock = socket.create_connection((hostname, port), timeout=create_connection_timeout)
-        sock.settimeout(None)
+        open_connection = open_connection or asyncio.open_connection
+        reader, writer = await asyncio.wait_for(open_connection(hostname, port), timeout=create_connection_timeout)
+        sock = writer.get_extra_info("socket")
+        if sock is None:
+            await close_stream_writer(writer)
+            raise ConnectionError(f"failed to get socket from connection to {hostname}:{port}")
         if keep_alive:
             OSUTIL.set_keepalive(sock)
-        return ServiceConnection(sock)
+        conn = ServiceConnection(sock)
+        conn.reader = reader
+        conn.writer = writer
+        return conn
 
     @staticmethod
-    def create_using_usbmux(
+    async def create_using_usbmux(
         udid: Optional[str], port: int, connection_type: Optional[str] = None, usbmux_address: Optional[str] = None
     ) -> "ServiceConnection":
         """
-        Create a ServiceConnection using a USBMux connection.
+        Create a ServiceConnection through usbmuxd.
 
-        :param udid: The UDID of the target device.
-        :param port: The port to connect to.
-        :param connection_type: The type of connection to use.
-        :param usbmux_address: The address of the usbmuxd socket.
-        :return: A ServiceConnection object.
-        :raises DeviceNotFoundError: If the device with the specified UDID is not found.
-        :raises NoDeviceConnectedError: If no device is connected.
+        :param udid: Target device UDID (or None for first available matching device).
+        :param port: Device-side service port to connect to.
+        :param connection_type: Optional transport filter (e.g. ``USB``/``Network``).
+        :param usbmux_address: Optional override for the usbmuxd socket address.
+        :return: A ServiceConnection bound to the selected device/port.
+        :raises DeviceNotFoundError: If the requested UDID is not found.
+        :raises NoDeviceConnectedError: If no matching devices are connected.
         """
-        target_device = select_device(udid, connection_type=connection_type, usbmux_address=usbmux_address)
+        target_device = await select_device(udid, connection_type=connection_type, usbmux_address=usbmux_address)
         if target_device is None:
             if udid:
                 raise DeviceNotFoundError(udid)
             raise NoDeviceConnectedError()
-        sock = target_device.connect(port, usbmux_address=usbmux_address)
+        sock = await target_device.connect(port, usbmux_address=usbmux_address)
         return ServiceConnection(sock, mux_device=target_device)
 
     def setblocking(self, blocking: bool) -> None:
@@ -152,125 +194,178 @@ class ServiceConnection:
 
         :param blocking: If True, set the socket to blocking mode; otherwise, set it to non-blocking mode.
         """
+        if self.socket is None:
+            raise ConnectionTerminatedError()
         self.socket.setblocking(blocking)
 
-    def close(self) -> None:
-        """Close the connection."""
-        self.socket.close()
+    async def _ensure_started(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self.reader is None or self.writer is None:
+            if self._start_future is not None:
+                await self._start_future
+            else:
+                fut = asyncio.get_running_loop().create_future()
+                self._start_future = fut
+                try:
+                    await self.start()
+                    fut.set_result(None)
+                except BaseException as e:
+                    self._start_future = None  # allow retry on next call
+                    if isinstance(e, asyncio.CancelledError):
+                        fut.cancel()
+                    else:
+                        fut.set_exception(e)
+                        fut.exception()  # prevent "Future exception was never retrieved" warning
+                    raise
+        if self.reader is None or self.writer is None:
+            raise ConnectionTerminatedError()
+        return self.reader, self.writer
 
-    async def aio_close(self) -> None:
+    async def aclose(self) -> None:
         """Asynchronously close the connection."""
-        if self.writer is None:
-            return
-        self.writer.close()
-        with contextlib.suppress(ssl.SSLError):
-            await self.writer.wait_closed()
-        self.writer = None
-        self.reader = None
+        await self.close()
 
-    def recv(self, length: int = 4096) -> bytes:
+    async def close(self) -> None:
+        """Asynchronously close the connection."""
+        try:
+            if self.writer is not None:
+                await close_stream_writer(self.writer)
+            if self.socket is not None and self.socket.fileno() != -1:
+                with contextlib.suppress(Exception):
+                    self.socket.close()
+        finally:
+            self.socket = None
+            self.writer = None
+            self.reader = None
+            self._start_future = None
+
+    def recv_sync(self, length: int = 4096) -> bytes:
         """
         Receive data from the socket.
 
         :param length: The maximum amount of data to receive.
         :return: The received data.
         """
+        if self.socket is None:
+            raise ConnectionTerminatedError()
         try:
             return self.socket.recv(length)
         except (ssl.SSLError, BrokenPipeError) as e:
-            raise ConnectionAbortedError() from e
+            raise ConnectionTerminatedError() from e
 
-    def sendall(self, data: bytes) -> None:
+    async def recv_any(self, length: int = 4096) -> bytes:
+        """
+        Asynchronously receive up to ``length`` bytes from the socket/stream.
+        """
+        reader, _ = await self._ensure_started()
+        return await reader.read(length)
+
+    def sendall_sync(self, data: bytes) -> None:
         """
         Send data to the socket.
 
         :param data: The data to send.
         :raises ConnectionTerminatedError: If the connection is terminated abruptly.
         """
+        if self.socket is None:
+            raise ConnectionTerminatedError()
         try:
             self.socket.sendall(data)
         except ssl.SSLEOFError as e:
             raise ConnectionTerminatedError from e
 
-    def send_recv_plist(self, data: Union[dict, list], endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> Any:
+    async def send_recv_prefixed(self, data: bytes, endianity: str = ">") -> bytes:
         """
-        Send a plist to the socket and receive a plist response.
+        Atomically send raw bytes and receive a length-prefixed response, under the
+        transaction lock.
 
-        :param data: The dictionary to send as a plist.
-        :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
-        :param fmt: The plist format (e.g., plistlib.FMT_XML).
-        :return: The received plist as a dictionary.
+        This is the lowest-level concurrent-safe send→recv primitive. Higher-level
+        methods such as :meth:`send_recv_plist` are built on top of it.
+
+        :param data: Raw bytes to send (already serialised by the caller).
+        :param endianity: The byte order for the length prefix.
+        :return: The raw response bytes (may be empty).
         """
-        self.send_plist(data, endianity=endianity, fmt=fmt)
-        return self.recv_plist(endianity=endianity)
+        async with self._transaction_lock:
+            await self.sendall(data)
+            return await self.recv_prefixed(endianity=endianity)
 
-    async def aio_send_recv_plist(self, data: dict, endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> Any:
+    async def send_recv_plist(
+        self, data: PlistSendable, endianity: str = ">", fmt: plistlib.PlistFormat = plistlib.FMT_XML
+    ) -> PlistDict:
         """
         Asynchronously send a plist to the socket and receive a plist response.
 
+        This method is safe to call concurrently from multiple coroutines on the same
+        connection: a per-connection lock serialises each send→recv pair atomically so
+        that responses are always matched to their request.
+
         :param data: The dictionary to send as a plist.
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :param fmt: The plist format (e.g., plistlib.FMT_XML).
         :return: The received plist as a dictionary.
         """
-        await self.aio_send_plist(data, endianity=endianity, fmt=fmt)
-        return await self.aio_recv_plist(endianity=endianity)
+        # Every request/response service behind lockdownd answers with a dictionary-rooted plist.
+        return cast(PlistDict, parse_plist(await self.send_recv_prefixed(build_plist(data, endianity, fmt), endianity)))
 
-    def recvall(self, size: int) -> bytes:
+    def recvall_sync(self, size: int) -> bytes:
         """
         Receive all data of a specified size from the socket.
 
         :param size: The amount of data to receive.
         :return: The received data.
-        :raises ConnectionAbortedError: If the connection is aborted.
+        :raises ConnectionTerminatedError: If the connection is aborted.
         """
         data = b""
         while len(data) < size:
-            chunk = self.recv(size - len(data))
-            if chunk is None or len(chunk) == 0:
-                raise ConnectionAbortedError()
+            chunk = self.recv_sync(size - len(data))
+            if len(chunk) == 0:
+                raise ConnectionTerminatedError()
             data += chunk
         return data
 
-    def recv_prefixed(self, endianity: str = ">") -> bytes:
+    def recv_prefixed_sync(self, endianity: str = ">") -> bytes:
         """
         Receive a data block prefixed with a length field.
 
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :return: The received data block.
         """
-        size = self.recvall(4)
+        size = self.recvall_sync(4)
         if not size or len(size) != 4:
             return b""
         size = struct.unpack(endianity + "L", size)[0]
         while True:
             try:
-                return self.recvall(size)
+                return self.recvall_sync(size)
             except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
                 # Allow ssl to do stuff
                 time.sleep(0)
 
-    async def aio_recvall(self, size: int) -> bytes:
+    async def recvall(self, size: int) -> bytes:
         """
         Asynchronously receive data of a specified size from the socket.
 
         :param size: The amount of data to receive.
         :return: The received data.
         """
-        return await self.reader.readexactly(size)
+        reader, _ = await self._ensure_started()
+        try:
+            return await reader.readexactly(size)
+        except asyncio.IncompleteReadError as e:
+            raise ConnectionTerminatedError() from e
 
-    async def aio_recv_prefixed(self, endianity: str = ">") -> bytes:
+    async def recv_prefixed(self, endianity: str = ">") -> bytes:
         """
         Asynchronously receive a data block prefixed with a length field.
 
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :return: The received data block.
         """
-        size = await self.aio_recvall(4)
+        size = await self.recvall(4)
         size = struct.unpack(endianity + "L", size)[0]
-        return await self.aio_recvall(size)
+        return await self.recvall(size)
 
-    def send_prefixed(self, data: bytes) -> None:
+    async def send_prefixed(self, data: bytes) -> None:
         """
         Send a data block prefixed with a length field.
 
@@ -280,46 +375,46 @@ class ServiceConnection:
             data = data.encode()
         hdr = struct.pack(">L", len(data))
         msg = b"".join([hdr, data])
-        return self.sendall(msg)
+        await self.sendall(msg)
 
-    def recv_plist(self, endianity: str = ">") -> Union[dict, list]:
+    def recv_plist_sync(self, endianity: str = ">") -> PlistDict:
         """
         Receive a plist from the socket and parse it into a native type.
 
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :return: The received plist as a native type.
         """
-        return parse_plist(self.recv_prefixed(endianity=endianity))
+        # Dictionary-rooted for every request/response service; DeviceLink callers that expect a
+        # list-rooted message narrow the result themselves.
+        return cast(PlistDict, parse_plist(self.recv_prefixed_sync(endianity=endianity)))
 
-    async def aio_recv_plist(self, endianity: str = ">") -> dict:
+    async def recv_plist(self, endianity: str = ">") -> PlistDict:
         """
         Asynchronously receive a plist from the socket and parse it into a native type.
 
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :return: The received plist as a native type.
         """
-        return parse_plist(await self.aio_recv_prefixed(endianity))
+        # Dictionary-rooted for every request/response service; DeviceLink callers that expect a
+        # list-rooted message narrow the result themselves.
+        return cast(PlistDict, parse_plist(await self.recv_prefixed(endianity)))
 
-    def send_plist(self, d: Union[dict, list], endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> None:
-        """
-        Send a native type as a plist to the socket.
-
-        :param d: The native type to send.
-        :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
-        :param fmt: The plist format (e.g., plistlib.FMT_XML).
-        """
-        return self.sendall(build_plist(d, endianity, fmt))
-
-    async def aio_sendall(self, payload: bytes) -> None:
+    async def sendall(self, payload: bytes) -> None:
         """
         Asynchronously send data to the socket.
 
         :param payload: The data to send.
         """
-        self.writer.write(payload)
-        await self.writer.drain()
+        _, writer = await self._ensure_started()
+        try:
+            writer.write(payload)
+            await writer.drain()
+        except ssl.SSLEOFError as e:
+            raise ConnectionTerminatedError from e
 
-    async def aio_send_plist(self, d: Union[dict, list], endianity: str = ">", fmt: Enum = plistlib.FMT_XML) -> None:
+    async def send_plist(
+        self, d: PlistSendable, endianity: str = ">", fmt: plistlib.PlistFormat = plistlib.FMT_XML
+    ) -> None:
         """
         Asynchronously send a dictionary as a plist to the socket.
 
@@ -327,7 +422,7 @@ class ServiceConnection:
         :param endianity: The byte order ('>' for big-endian, '<' for little-endian).
         :param fmt: The plist format (e.g., plistlib.FMT_XML).
         """
-        await self.aio_sendall(build_plist(d, endianity, fmt))
+        await self.sendall(build_plist(d, endianity, fmt))
 
     def create_ssl_context(self, certfile: str, keyfile: Optional[str] = None) -> ssl.SSLContext:
         """
@@ -350,37 +445,97 @@ class ServiceConnection:
         context.load_cert_chain(certfile, keyfile)
         return context
 
-    def ssl_start(self, certfile: str, keyfile: Optional[str] = None) -> None:
+    def ssl_start_sync(self, certfile: str, keyfile: Optional[str] = None) -> None:
         """
         Start an SSL connection.
 
         :param certfile: The path to the certificate file.
         :param keyfile: The path to the key file (optional).
         """
+        if self.socket is None:
+            raise ConnectionTerminatedError()
         try:
+            self.socket.settimeout(DEFAULT_SSL_HANDSHAKE_TIMEOUT)
             self.socket = self.create_ssl_context(certfile, keyfile=keyfile).wrap_socket(self.socket)
+            self.socket.settimeout(None)
         except OSError as e:
-            raise ConnectionAbortedError() from e
+            # No timeout reset here: on handshake failure wrap_socket() has already detached
+            # (and closed) the underlying socket, so touching it raises EBADF/WinError 10038,
+            # masking the original error.
+            raise ConnectionTerminatedError() from e
 
-    async def aio_ssl_start(self, certfile: str, keyfile: Optional[str] = None) -> None:
+    async def ssl_start(self, certfile: str, keyfile: Optional[str] = None) -> None:
         """
         Asynchronously start an SSL connection.
 
         :param certfile: The path to the certificate file.
         :param keyfile: The path to the key file (optional).
         """
-        self.reader, self.writer = await asyncio.open_connection(
-            sock=self.socket, ssl=self.create_ssl_context(certfile, keyfile=keyfile), server_hostname=""
-        )
+        ssl_context = self.create_ssl_context(certfile, keyfile=keyfile)
+        try:
+            if self.reader is None:
+                # Socket not yet bound to the event loop — create SSL-aware streams directly.
+                self.reader, self.writer = await asyncio.open_connection(
+                    sock=self.socket,
+                    ssl=ssl_context,
+                    server_hostname="",
+                    ssl_handshake_timeout=DEFAULT_SSL_HANDSHAKE_TIMEOUT,
+                )
+            else:
+                # Socket already registered with the event loop — upgrade in-place.
+                # Python 3.11+ provides StreamWriter.start_tls(); older versions
+                # need loop.start_tls() and a new StreamWriter bound to the TLS transport.
+                _, writer = await self._ensure_started()
+                if hasattr(writer, "start_tls"):
+                    await asyncio.wait_for(
+                        writer.start_tls(  # type: ignore[attr-defined]
+                            sslcontext=ssl_context,
+                            server_hostname="",
+                            ssl_handshake_timeout=DEFAULT_SSL_HANDSHAKE_TIMEOUT,
+                        ),
+                        timeout=DEFAULT_SSL_HANDSHAKE_TIMEOUT,
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    protocol = cast(Any, writer)._protocol
+                    tls_transport = await asyncio.wait_for(
+                        loop.start_tls(
+                            writer.transport,
+                            protocol,
+                            ssl_context,
+                            server_side=False,
+                            server_hostname="",
+                            ssl_handshake_timeout=DEFAULT_SSL_HANDSHAKE_TIMEOUT,
+                        ),
+                        timeout=DEFAULT_SSL_HANDSHAKE_TIMEOUT,
+                    )
+                    if tls_transport is None:
+                        raise ConnectionTerminatedError()
+                    self.writer = asyncio.StreamWriter(tls_transport, protocol, self.reader, loop)
+        except OSError as e:
+            raise ConnectionTerminatedError() from e
 
-    async def aio_start(self) -> None:
-        """Asynchronously start a connection."""
+    async def start(self) -> None:
+        """Asynchronously initialize stream reader/writer for the socket."""
+        if self.reader is not None and self.writer is not None:
+            return
+        if self.socket is None:
+            raise ConnectionTerminatedError()
         self.reader, self.writer = await asyncio.open_connection(sock=self.socket)
+
+    async def __aenter__(self) -> "ServiceConnection":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.close()
 
     def shell(self) -> None:
         """Start an interactive shell."""
-        IPython.embed(
-            header=highlight(SHELL_USAGE, lexers.PythonLexer(), formatters.Terminal256Formatter(style="native")),
+        start_ipython_shell(
+            header=highlight(
+                SHELL_USAGE, cast(Any, lexers).PythonLexer(), formatters.Terminal256Formatter(style="native")
+            ),
             user_ns={
                 "client": self,
             },
@@ -393,7 +548,7 @@ class ServiceConnection:
         :param size: The amount of data to read.
         :return: The read data.
         """
-        result = self.recvall(size)
+        result = self.recvall_sync(size)
         self._offset += size
         return result
 
@@ -403,7 +558,7 @@ class ServiceConnection:
 
         :param data: The data to write.
         """
-        self.sendall(data)
+        self.sendall_sync(data)
         self._offset += len(data)
 
     def tell(self) -> int:

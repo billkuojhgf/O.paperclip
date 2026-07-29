@@ -1,14 +1,17 @@
+import asyncio
 import logging
 import posixpath
 import re
 import time
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Awaitable, Iterator
 from json import JSONDecodeError
-from typing import Callable, ClassVar, Optional
+from types import TracebackType
+from typing import Any, Callable, ClassVar, Optional, Union, cast
 
-from pycrashreport.crash_report import get_crash_report_from_buf
+from pycrashreport.crash_report import CrashReportBase, get_crash_report_from_buf
+from xonsh import cli_utils as _xonsh_cli_utils
 from xonsh.built_ins import XSH
-from xonsh.cli_utils import Annotated, Arg
+from xonsh.cli_utils import Annotated
 
 from pymobiledevice3.exceptions import (
     AfcException,
@@ -19,8 +22,17 @@ from pymobiledevice3.exceptions import (
 from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.afc import AfcService, AfcShell, path_completer
+from pymobiledevice3.services.lockdown_service import LockdownService
 from pymobiledevice3.services.notification_proxy import NotificationProxyService
 from pymobiledevice3.services.os_trace import OsTraceService
+
+# xonsh's cli_utils has no py.typed, so Arg's signature is partially unknown; adapt it to a
+# typed callable once here instead of at every Annotated[...] use site.
+Arg = cast(Callable[..., Any], cast(Any, _xonsh_cli_utils).Arg)
+
+# xonsh declares Arg(completer=...) as returning Iterator[str], but any iterable works at
+# runtime; adapt the list-returning completer's declared type once here instead of per call site.
+_path_arg_completer = cast(Callable[..., Iterator[str]], path_completer)
 
 SYSDIAGNOSE_PROCESS_NAMES = ("sysdiagnose", "sysdiagnosed")
 SYSDIAGNOSE_DIR = "DiagnosticLogs/sysdiagnose"
@@ -31,6 +43,15 @@ IOS17_SYSDIAGNOSE_DELAY = 3
 
 
 class CrashReportsManager:
+    """
+    Manage crash reports stored on a device.
+
+    Wraps the ``com.apple.crashreportcopymobile`` AFC service (for listing, reading, pulling and
+    erasing reports) and the ``com.apple.crashreportmover`` service (for flushing pending reports).
+    Must be used as an async context manager (``async with``); the synchronous context manager
+    protocol is intentionally disabled.
+    """
+
     COPY_MOBILE_NAME = "com.apple.crashreportcopymobile"
     RSD_COPY_MOBILE_NAME = "com.apple.crashreportcopymobile.shim.remote"
 
@@ -54,38 +75,140 @@ class CrashReportsManager:
         self.afc = AfcService(lockdown, service_name=self.copy_mobile_service_name)
 
     def __enter__(self):
+        raise RuntimeError("Use async context manager: `async with ...`")
+
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ):
+        raise RuntimeError("Use async context manager: `async with ...`")
 
-    def close(self) -> None:
-        self.afc.close()
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ):
+        await self.aclose()
 
-    def clear(self) -> None:
+    async def aclose(self) -> None:
+        """Close the underlying AFC connection."""
+        await self.afc.aclose()
+
+    async def clear(self, path: str = "/") -> None:
         """
-        Clear all crash reports.
+        Delete all crash reports under a path.
+
+        Lists the immediate children of ``path`` and removes each recursively. A
+        ``com.apple.appstored`` entry that the device may recreate immediately after deletion is
+        tolerated; any other item that could not be deleted is treated as an error.
+
+        :param path: Path under the crash reports directory to clear. Defaults to '/'.
+        :raises AfcException: If any item other than ``com.apple.appstored`` could not be deleted.
         """
-        undeleted_items = []
-        for filename in self.ls("/"):
-            undeleted_items.extend(self.afc.rm(filename, force=True))
+        undeleted_items: list[str] = []
+        for filename in await self.ls(path, depth=1):
+            undeleted_items.extend(await self.afc.rm(filename, force=True))
 
         for item in undeleted_items:
             # special case of file that sometimes created automatically right after delete,
             # and then we can't delete the folder because it's not empty
             if item != self.APPSTORED_PATH:
-                raise AfcException(f"failed to clear crash reports directory, undeleted items: {undeleted_items}", None)
+                # AfcException mis-annotates `status` as str; it accepts AfcError/None at runtime
+                raise AfcException(
+                    f"failed to clear crash reports under {path!r}, undeleted items: {undeleted_items}",
+                    None,
+                )
 
-    def ls(self, path: str = "/", depth: int = 1) -> list[str]:
+    async def ls(self, path: str = "/", depth: int = 1) -> list[str]:
         """
         List file and folder in the crash report's directory.
         :param path: Path to list, relative to the crash report's directory.
         :param depth: Listing depth, -1 to list infinite.
         :return: List of files listed.
         """
-        return list(self.afc.dirlist(path, depth))[1:]  # skip the root path '/'
+        result: list[str] = []
+        async for item in self.afc.dirlist(path, depth):
+            result.append(item)
+        return result[1:]  # skip the root path '/'
 
-    def pull(
+    async def parse(self, path: str = "/") -> CrashReportBase:
+        """
+        Parse a crash report file and return the parsed crash report object.
+
+        :param path: Path to a crash report file.
+        :return: Parsed crash report object.
+        """
+        contents = await self.afc.get_file_contents(path)
+        return get_crash_report_from_buf(contents.decode(), filename=path)
+
+    async def parse_latest(
+        self,
+        path: str = "/",
+        match: Optional[list[str]] = None,
+        match_insensitive: Optional[list[str]] = None,
+        count: int = 1,
+    ) -> list[CrashReportBase]:
+        """
+        Parse latest top-level crash report(s) under a path, optionally filtered by basename regex patterns.
+
+        Scans the top level of the given path, filters regular files by basename,
+        and returns matches sorted by last modification time (newest first).
+
+        :param path: Path whose top-level entries should be considered. Defaults to '/'
+        :param match: Case-sensitive regex patterns over report basename.
+        :param match_insensitive: Case-insensitive regex patterns over report basename.
+        :param count: Maximum number of latest matching reports to parse.
+        :return: Parsed crash report objects ordered from newest to oldest.
+                 Result length is between 1 and count.
+        :raises ValueError: If count < 1 or if no reports match the filters.
+
+        All provided patterns must match.
+        """
+
+        def get_match_arguments_description():
+            return ", ".join(
+                f"{name}={value!r}"
+                for name, value in (("match", match_patterns), ("match_insensitive", match_insensitive_patterns))
+                if value
+            )
+
+        if count < 1:
+            raise ValueError("count must be >= 1")
+
+        match_patterns = match or []
+        match_insensitive_patterns = match_insensitive or []
+
+        patterns = [re.compile(pattern) for pattern in match_patterns]
+        patterns.extend(re.compile(pattern, re.IGNORECASE) for pattern in match_insensitive_patterns)
+
+        matching_entries_by_mtime = sorted(
+            [
+                (stat["st_mtime"].timestamp(), entry)
+                async for entry in self.afc.dirlist(path, depth=1)
+                if entry != path
+                and (stat := await self.afc.stat(entry)).get("st_ifmt") == "S_IFREG"
+                and (not patterns or all(pattern.search(posixpath.basename(entry)) for pattern in patterns))
+            ],
+            reverse=True,
+        )
+
+        if len(matching_entries_by_mtime) == 0:
+            match_arguments_description = get_match_arguments_description()
+            raise ValueError(
+                f"No reports found ({match_arguments_description})"
+                if match_arguments_description
+                else "No reports found"
+            )
+
+        return [await self.parse(report_path) for _, report_path in matching_entries_by_mtime[:count]]
+
+    async def pull(
         self, out: str, entry: str = "/", erase: bool = False, match: Optional[str] = None, progress_bar: bool = True
     ) -> None:
         """
@@ -97,27 +220,43 @@ class CrashReportsManager:
         :param progress_bar: Whether to show a progress bar when pulling large files.
         """
 
-        def log(src: str, dst: str) -> None:
+        async def _callback(src: str, dst: str) -> None:
             self.logger.info(f"{src} --> {dst}")
-            if erase and not self.afc.isdir(src):
-                self.afc.rm_single(src, force=True)
+            if erase:
+                await self.afc.rm_single(src, force=True)
 
-        match = None if match is None else re.compile(match)
-        self.afc.pull(entry, out, match, callback=log, progress_bar=progress_bar, ignore_errors=True)
+        match_pattern = None if match is None else re.compile(match)
+        await self.afc.pull(
+            entry, out, match_pattern, callback=_callback, progress_bar=progress_bar, ignore_errors=True
+        )
 
-    def flush(self) -> None:
-        """Trigger com.apple.crashreportmover to flush all products into CrashReports directory"""
+    async def flush(self) -> None:
+        """
+        Flush pending crash products into the CrashReports directory.
+
+        Connects to the ``com.apple.crashreportmover`` service, which moves any pending reports into
+        the CrashReports directory and acknowledges with a ``ping`` once done.
+        """
         ack = b"ping\x00"
-        assert ack == self.lockdown.start_lockdown_service(self.crash_mover_service_name).recvall(len(ack))
+        service = await self.lockdown.start_lockdown_service(self.crash_mover_service_name)
+        assert ack == await service.recvall(len(ack))
 
-    def watch(self, name: Optional[str] = None, raw: bool = False) -> Generator[str, None, None]:
+    async def watch(
+        self, name: Optional[str] = None, raw: bool = False
+    ) -> AsyncGenerator[Union[str, CrashReportBase], None]:
         """
-        Monitor creation of new crash reports for a given process name.
+        Continuously monitor the syslog and yield each newly created crash report.
 
-        Return value can either be the raw crash string, or parsed result containing a more human-friendly
-        representation for the crash.
+        Watches the device syslog for ``osanalyticshelper`` "Saved type" messages, reads the
+        referenced ``.ips`` or ``.panic`` file (retrying until it becomes readable) and yields it.
+
+        :param name: If provided, only reports whose parsed process name equals this value are
+            yielded; otherwise every new report is yielded.
+        :param raw: When ``True``, yield the raw report text; when ``False``, yield the parsed
+            crash report object.
+        :returns: Async generator yielding either raw report strings or parsed crash report objects.
         """
-        for syslog_entry in OsTraceService(lockdown=self.lockdown).syslog():
+        async for syslog_entry in OsTraceService(lockdown=self.lockdown).syslog():
             if (
                 (posixpath.basename(syslog_entry.filename) != "osanalyticshelper")
                 or (posixpath.basename(syslog_entry.image_name) != "OSAnalytics")
@@ -134,7 +273,8 @@ class CrashReportsManager:
 
             while True:
                 try:
-                    crash_report_raw = self.afc.get_file_contents(filename).decode()
+                    contents = await self.afc.get_file_contents(filename)
+                    crash_report_raw = contents.decode()
                     crash_report = get_crash_report_from_buf(crash_report_raw, filename=filename)
                     break
                 except (AfcFileNotFoundError, JSONDecodeError):
@@ -147,7 +287,7 @@ class CrashReportsManager:
                 else:
                     yield crash_report
 
-    def get_new_sysdiagnose(
+    async def get_new_sysdiagnose(
         self,
         out: str,
         erase: bool = True,
@@ -167,50 +307,50 @@ class CrashReportsManager:
         end_time = None
         if timeout is not None:
             end_time = start_time + timeout
-        sysdiagnose_filename = self._get_new_sysdiagnose_filename(end_time)
+        sysdiagnose_filename = await self._get_new_sysdiagnose_filename(end_time)
 
         if callback is not None:
             callback(time.monotonic() - start_time)
 
         self.logger.info("sysdiagnose tarball creation has been started")
-        self._wait_for_sysdiagnose_to_finish(timeout)
+        await self._wait_for_sysdiagnose_to_finish(timeout)
 
         if callback is not None:
             callback(time.monotonic() - start_time)
 
-        self.pull(out, entry=sysdiagnose_filename, erase=erase)
+        await self.pull(out, entry=sysdiagnose_filename, erase=erase)
 
         if callback is not None:
             callback(time.monotonic() - start_time)
 
-    def _wait_for_sysdiagnose_to_finish(self, end_time: Optional[float] = None) -> None:
-        with NotificationProxyService(self.lockdown, timeout=end_time) as service:
+    async def _wait_for_sysdiagnose_to_finish(self, end_time: Optional[float] = None) -> None:
+        async with NotificationProxyService(self.lockdown, timeout=end_time) as service:
             stop_notification = "com.apple.sysdiagnose.sysdiagnoseStopped"
-            service.notify_register_dispatch(stop_notification)
+            await service.notify_register_dispatch(stop_notification)
             try:
-                for event in service.receive_notification():
+                async for event in service.receive_notification():
                     if event["Name"] != stop_notification:
                         continue
                     self.logger.debug(f"Received {event}")
-                    time.sleep(IOS17_SYSDIAGNOSE_DELAY)
+                    await asyncio.sleep(IOS17_SYSDIAGNOSE_DELAY)
                     break
             except NotificationTimeoutError as e:
                 raise SysdiagnoseTimeoutError("Timeout waiting for sysdiagnose completion") from e
 
-    def _get_new_sysdiagnose_filename(self, end_time: Optional[float] = None) -> str:
+    async def _get_new_sysdiagnose_filename(self, end_time: Optional[float] = None) -> str:
         sysdiagnose_filename = None
-        excluded_temp_files = []
+        excluded_temp_files: list[str] = []
 
         while sysdiagnose_filename is None:
             try:
-                for filename in self.afc.listdir(SYSDIAGNOSE_DIR):
+                for filename in await self.afc.listdir(SYSDIAGNOSE_DIR):
                     # search for an IN_PROGRESS archive
                     if filename not in excluded_temp_files and "IN_PROGRESS_" in filename:
                         for ext in self.IN_PROGRESS_SYSDIAGNOSE_EXTENSIONS:
                             if filename.endswith(ext):
                                 delta = (
-                                    self.lockdown.date
-                                    - self.afc.stat(posixpath.join(SYSDIAGNOSE_DIR, filename))["st_mtime"]
+                                    await self.lockdown.get_date()
+                                    - (await self.afc.stat(posixpath.join(SYSDIAGNOSE_DIR, filename)))["st_mtime"]
                                 )
                                 # Ignores IN_PROGRESS sysdiagnose files older than the defined time to live
                                 if delta.total_seconds() < SYSDIAGNOSE_IN_PROGRESS_MAX_TTL_SECS:
@@ -227,6 +367,10 @@ class CrashReportsManager:
 
             if self._check_timeout(end_time):
                 raise SysdiagnoseTimeoutError("Timeout finding in-progress sysdiagnose filename")
+            await asyncio.sleep(0.1)
+
+        # unreachable in practice (the loop only exits via return/raise); satisfies the declared return type
+        return sysdiagnose_filename
 
     def _check_timeout(self, end_time: Optional[float] = None) -> bool:
         return end_time is not None and time.monotonic() > end_time
@@ -234,18 +378,56 @@ class CrashReportsManager:
 
 class CrashReportsShell(AfcShell):
     @classmethod
-    def create(cls, service_provider: LockdownServiceProvider, **kwargs):
+    def create(
+        cls,
+        service_provider: LockdownServiceProvider,
+        service_name: Optional[str] = None,
+        service: Optional[LockdownService] = None,
+        auto_cd: Optional[str] = "/",
+    ):
         manager = CrashReportsManager(service_provider)
-        XSH.ctx["_manager"] = manager
+        cast(Any, XSH).ctx["_manager"] = manager
         super(CrashReportsShell, CrashReportsShell).create(service_provider, service=manager.afc)
 
     def _setup_shell_commands(self):
         super()._setup_shell_commands()
         self._register_arg_parse_alias("parse", self._do_parse)
+        self._register_arg_parse_alias("parse-latest", self._do_parse_latest)
         self._register_arg_parse_alias("clear", self._do_clear)
 
-    def _do_parse(self, filename: Annotated[str, Arg(completer=path_completer)]) -> None:
-        print(get_crash_report_from_buf(self.afc.get_file_contents(filename).decode(), filename=filename))
+    def _run_manager(self, awaitable: Awaitable[Any]):
+        return self.afc._runner.run(awaitable)
 
-    def _do_clear(self) -> None:
-        XSH.ctx["_manager"].clear()
+    def _do_parse(self, filename: Annotated[str, Arg(completer=_path_arg_completer)]) -> None:
+        """
+        Parse and print a crash report by filename.
+
+        :param filename: Path to the crash report file
+        """
+        print(self._run_manager(cast(CrashReportsManager, cast(Any, XSH).ctx["_manager"]).parse(filename)))
+
+    def _do_parse_latest(
+        self,
+        path: Annotated[str, Arg(nargs="?", completer=_path_arg_completer)] = "/",
+        match: Annotated[Optional[list[str]], Arg("--match", "-m", action="append")] = None,
+        match_insensitive: Annotated[
+            Optional[list[str]],
+            Arg("--match-insensitive", "-mi", action="append"),
+        ] = None,
+        count: Annotated[int, Arg("--count", "-n")] = 1,
+    ) -> None:
+        """Parse latest top-level crash report(s) under a path, ordered by newest first"""
+        latest_reports = self._run_manager(
+            cast(CrashReportsManager, cast(Any, XSH).ctx["_manager"]).parse_latest(
+                path=path,
+                match=match or [],
+                match_insensitive=match_insensitive or [],
+                count=count,
+            )
+        )
+        for report in latest_reports:
+            print(report)
+
+    def _do_clear(self, path: Annotated[str, Arg(nargs="?", completer=_path_arg_completer)] = "/") -> None:
+        """Clear crash reports from the device under a path."""
+        self._run_manager(cast(CrashReportsManager, cast(Any, XSH).ctx["_manager"]).clear(path))

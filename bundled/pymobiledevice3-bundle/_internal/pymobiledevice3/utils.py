@@ -1,15 +1,19 @@
 import asyncio
+import sys
 import traceback
+from collections.abc import Coroutine
 from functools import wraps
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Optional, Union, cast, overload
 
+import IPython
 import requests
 from construct import Int8ul, Int16ul, Int32ul, Int64ul, Select
 from tqdm import tqdm
+from traitlets.config import Config
 
 
-def plist_access_path(d, path: tuple, type_=None, required=False):
+def plist_access_path(d: Any, path: tuple[Any, ...], type_: Optional[type] = None, required: bool = False):
     for component in path:
         d = d.get(component)
         if d is None:
@@ -33,16 +37,39 @@ def bytes_to_uint(b: bytes):
     return Select(u64=Int64ul, u32=Int32ul, u16=Int16ul, u8=Int8ul).parse(b)
 
 
-def try_decode(s: bytes):
+def current_task_name(default: str = "?") -> str:
+    """Name of the running asyncio task, for log messages. ``asyncio.current_task()`` is typed
+    Optional (it is ``None`` outside a running task), so this returns ``default`` in that case."""
+    task = asyncio.current_task()
+    return task.get_name() if task is not None else default
+
+
+@overload
+def try_decode(s: bytes) -> Union[str, bytes]: ...
+
+
+@overload
+def try_decode(s: bytes, *, errors: str) -> str: ...
+
+
+def try_decode(s: bytes, *, errors: Optional[str] = None) -> Union[str, bytes]:
+    """Decode UTF-8 bytes to str, falling back to the raw bytes on failure.
+
+    :param errors: when given (e.g. ``"replace"``), the caller asserts the input is text: decode with
+        that error policy and always return ``str`` (no bytes fallback). Omit it for the default
+        best-effort behaviour that returns the raw bytes when decoding fails.
+    """
+    if errors is not None:
+        return s.decode("utf8", errors=errors)
     try:
         return s.decode("utf8")
     except UnicodeDecodeError:
         return s
 
 
-def asyncio_print_traceback(f: Callable):
+def asyncio_print_traceback(f: Callable[..., Any]):
     @wraps(f)
-    async def wrapper(*args, **kwargs):
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await f(*args, **kwargs)
         except (Exception, RuntimeError) as e:
@@ -53,19 +80,39 @@ def asyncio_print_traceback(f: Callable):
     return wrapper
 
 
+_ASYNCIO_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
 def get_asyncio_loop() -> asyncio.AbstractEventLoop:
-    try:
-        loop = asyncio.get_running_loop()
-        if loop.is_closed():
-            raise RuntimeError("The existing loop is closed.")
-    except RuntimeError:
-        # This happens when there is no current event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop
+    global _ASYNCIO_LOOP
+    if _ASYNCIO_LOOP is None or _ASYNCIO_LOOP.is_closed():
+        if sys.platform == "win32":
+            # The proactor loop breaks blocking-socket operations performed while the socket
+            # is attached to a stream transport (its pre-posted overlapped recv consumes the
+            # bytes), e.g. the strip-ssl handshake in DTX services. The selector policy set in
+            # __main__ cannot cover this loop since it is created at import time, before that
+            # policy is applied. See https://github.com/doronz88/pymobiledevice3/issues/1217.
+            _ASYNCIO_LOOP = asyncio.SelectorEventLoop()
+        else:
+            _ASYNCIO_LOOP = asyncio.new_event_loop()
+    return _ASYNCIO_LOOP
 
 
-def file_download(url: str, outfile: Path, chunk_size=1024) -> None:
+def run_in_loop(coro: Coroutine[Any, Any, Any]):
+    return get_asyncio_loop().run_until_complete(coro)
+
+
+def start_ipython_shell(*, user_ns: Optional[dict[str, Any]] = None, header: Optional[str] = None) -> None:
+    # Keep IPython autoawait on the same loop used by CLI async wrappers.
+    config = Config()
+    config.InteractiveShell.loop_runner = run_in_loop
+    if header is not None:
+        print(header)
+    # IPython exposes start_ipython lazily via module-level __getattr__, which pyright cannot see.
+    cast(Any, IPython).start_ipython(argv=[], config=config, user_ns=user_ns or {})
+
+
+def file_download(url: str, outfile: Path, chunk_size: int = 1024) -> None:
     resp = requests.get(url, stream=True)
     total = int(resp.headers.get("content-length", 0))
     with (
