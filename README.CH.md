@@ -56,6 +56,10 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 
 ### 步驟一：連線裝置
 
+最多同時連線三台不同裝置。「開始連線／新增連線」只探索當次可用裝置並逐台連線；一台成功即可啟動 GPS，不會等待湊滿三台。新增不重建已連線裝置，各台可單獨中斷，也可全部中斷。已連線裝置同步位置／路線；重啟 App 後連線欄位清空，不恢復舊 UDID 或手動 RSD。UDID 欄位顯示本次連線身分，探索結果不會受上次殘留值限制。
+
+開發驗收需先安裝 Xcode 與 iOS 27.0 Simulator runtime，再執行 `python3 O.PaperclipTests/SimulatorEvidence/prepare.py`（其他 runtime 可透過 `PAPERCLIP_SIMULATOR_RUNTIME` 指定）。此命令建立三個暫時 Simulator、以 Core Location 觀察程式執行完整測試，結束後刪除測試裝置。GUI 測試暫用 ASCII 鍵盤配置並恢復原輸入法。模擬通訊端點不代表已驗證實體手機 USB／Wi-Fi 配對或 tunnel。
+
 **USB 連線（預設）：**
 1. 用 USB 線連接 iPhone / iPad
 2. 開啟 O.Paperclip

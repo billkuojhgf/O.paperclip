@@ -8,6 +8,11 @@ struct DeviceStatusSectionView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("裝置狀態").font(.subheadline).fontWeight(.semibold).foregroundColor(ModernTheme.label)
+            if let group = vm.deviceManager as? DeviceGroup {
+                ForEach(Array(group.devices.enumerated()), id: \.offset) { index, device in
+                    DeviceSlotView(device: device, number: index + 1) { group.disconnectDevice(at: index) }
+                }
+            }
 
             HStack {
                 DeviceConnectionIndicator(state: vm.deviceManager.connectionState)
@@ -15,14 +20,18 @@ struct DeviceStatusSectionView: View {
                     .font(.subheadline)
                     .foregroundColor((vm.deviceManager.isConnected || vm.deviceManager.isConnecting) ? .primary : .secondary)
                 Spacer()
-                Button(action: {
-                    vm.deviceManager.isConnected ? vm.deviceManager.disconnect() : vm.deviceManager.connectDevice()
-                }) {
-                    Text(vm.deviceManager.isConnecting ? "連線中…" : (vm.deviceManager.isConnected ? "中斷連線" : "開始連線"))
+                if let group = vm.deviceManager as? DeviceGroup {
+                    Button(group.isConnecting ? "連線中…" : (group.isConnected ? "新增連線" : "開始連線")) { group.connectDevice() }
+                        .disabled(group.isConnecting || group.devices.allSatisfy { $0.isConnected })
+                    if group.isConnected || group.isConnecting {
+                        Button("全部中斷") { group.disconnect() }
+                    }
+                } else {
+                    Button(vm.deviceManager.isConnected ? "中斷連線" : "開始連線") {
+                        vm.deviceManager.isConnected ? vm.deviceManager.disconnect() : vm.deviceManager.connectDevice()
+                    }
+                    .disabled(vm.deviceManager.isConnecting)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(vm.deviceManager.isConnecting)
             }
             .padding(10)
             .background(ModernTheme.panelRaised)
@@ -88,4 +97,32 @@ struct DeviceStatusSectionView: View {
         .cornerRadius(6)
     }
 
+}
+
+private struct DeviceSlotView: View {
+    @ObservedObject var device: DeviceManager
+    let number: Int
+    let disconnect: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("裝置 \(number)")
+                DeviceConnectionIndicator(state: device.connectionState)
+                Spacer()
+                if device.isConnected || device.isConnecting {
+                    Button("中斷", action: disconnect)
+                        .accessibilityLabel("中斷裝置 \(number)")
+                }
+            }
+            TextField("裝置 UDID", text: $device.tunnelUDID)
+                .disabled(device.isConnected || device.isConnecting)
+            Text(device.isWirelessMode ? "Wi‑Fi" : "USB").font(.caption)
+            Text(device.deviceName).font(.caption)
+            if let error = device.lastError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+        }
+        .padding(8)
+    }
 }

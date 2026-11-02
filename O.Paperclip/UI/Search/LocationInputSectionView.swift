@@ -6,6 +6,7 @@ struct LocationInputSectionView: View {
     let currentRegion: MKCoordinateRegion?
 
     var body: some View {
+        let _ = vm.dependencyVersion
         VStack(alignment: .leading, spacing: 8) {
             Text("位置輸入").font(.subheadline).fontWeight(.semibold).foregroundColor(ModernTheme.label)
 

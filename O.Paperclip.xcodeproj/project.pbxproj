@@ -585,6 +585,7 @@
 		CA9AF87A2F5539E400AC05E8 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+                "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = O.PaperclipUITests/QAIntegration.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 452M9LC53D;
@@ -611,6 +612,7 @@
 		CA9AF87B2F5539E400AC05E8 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+                "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = O.PaperclipUITests/QAIntegration.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 452M9LC53D;

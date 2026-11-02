@@ -93,7 +93,11 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
 
     @Published private(set) var lastUnexpectedTermination: UnexpectedTerminationRecord?
 
-    let logsDirectoryURL = DiagnosticsPaths.logsDirectoryURL
+    let logsDirectoryURL: URL
+    private let installsProcessHandlers: Bool
+    private var activeSessionURL: URL { logsDirectoryURL.appendingPathComponent("active-session.json") }
+    private var incidentsURL: URL { logsDirectoryURL.appendingPathComponent("incidents.jsonl") }
+    private var lifecycleLogURL: URL { logsDirectoryURL.appendingPathComponent("app-lifecycle.jsonl") }
 
     private var currentSession = ActiveSessionMarker(
         sessionID: UUID().uuidString,
@@ -103,18 +107,25 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
     private var didSetup = false
     private var terminationObserver: NSObjectProtocol?
 
-    private init() {}
+    init(logsDirectoryURL: URL = DiagnosticsPaths.logsDirectoryURL, installsProcessHandlers: Bool = true) {
+        self.logsDirectoryURL = logsDirectoryURL
+        self.installsProcessHandlers = installsProcessHandlers
+        try? FileManager.default.createDirectory(at: logsDirectoryURL, withIntermediateDirectories: true)
+    }
 
     func setupIfNeeded() {
         guard !didSetup else { return }
         didSetup = true
 
-        CrashSignalMonitor.installIfNeeded()
-        installExceptionHandler()
+        if installsProcessHandlers {
+            CrashSignalMonitor.installIfNeeded()
+            installExceptionHandler()
+        }
         detectPreviousUnexpectedTermination()
         persistActiveSession()
         appendLifecycleEvent(kind: "launch", metadata: ["sessionID": currentSession.sessionID])
 
+        guard installsProcessHandlers else { return }
         terminationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
@@ -135,7 +146,7 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
 
     func markCleanShutdown(reason: String) {
         appendLifecycleEvent(kind: "shutdown", metadata: ["reason": reason])
-        try? FileManager.default.removeItem(at: DiagnosticsPaths.activeSessionURL)
+        try? FileManager.default.removeItem(at: activeSessionURL)
     }
 
     func openLogsDirectory() {
@@ -144,7 +155,7 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
 
     private func detectPreviousUnexpectedTermination() {
         guard
-            let data = try? Data(contentsOf: DiagnosticsPaths.activeSessionURL),
+            let data = try? Data(contentsOf: activeSessionURL),
             let previous = try? JSONDecoder().decode(ActiveSessionMarker.self, from: data)
         else {
             return
@@ -157,12 +168,12 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
             reason: "偵測到上一個 session 沒有正常結束，可能是閒置時 crash 或被系統強制終止。"
         )
         lastUnexpectedTermination = record
-        appendJSONLine(record, to: DiagnosticsPaths.incidentsURL)
+        appendJSONLine(record, to: incidentsURL)
     }
 
     private func persistActiveSession() {
         guard let data = try? JSONEncoder().encode(currentSession) else { return }
-        try? data.write(to: DiagnosticsPaths.activeSessionURL, options: .atomic)
+        try? data.write(to: activeSessionURL, options: .atomic)
     }
 
     private func appendLifecycleEvent(kind: String, metadata: [String: String]) {
@@ -179,7 +190,7 @@ final class AppDiagnostics: ObservableObject, DiagnosticsProviding {
         else {
             return
         }
-        appendLine(line, to: DiagnosticsPaths.lifecycleLogURL)
+        appendLine(line, to: lifecycleLogURL)
     }
 
     private func appendJSONLine<T: Encodable>(_ value: T, to url: URL) {

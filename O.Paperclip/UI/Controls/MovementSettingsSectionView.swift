@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreLocation
 
 struct MovementSettingsSectionView: View {
     @Bindable var vm: AppViewModel
@@ -52,6 +53,23 @@ struct MovementSettingsSectionView: View {
 
             if vm.operationMode == .multiPoint {
                 multiPointWaypointControls
+                ForEach(Array(vm.waypoints.enumerated()), id: \.offset) { index, coordinate in
+                    HStack {
+                        Text("P\(index + 1): \(coordinate.latitude, specifier: "%.4f"), \(coordinate.longitude, specifier: "%.4f")")
+                            .font(.caption)
+                        Spacer()
+                        Button { vm.moveWaypoint(from: index, to: index - 1) } label: {
+                            Image(systemName: "arrow.up")
+                        }
+                        .accessibilityLabel("將 P\(index + 1) 上移")
+                        .disabled(index == 0 || vm.appState != .selectingA)
+                        Button { vm.moveWaypoint(from: index, to: index + 1) } label: {
+                            Image(systemName: "arrow.down")
+                        }
+                        .accessibilityLabel("將 P\(index + 1) 下移")
+                        .disabled(index == vm.waypoints.count - 1 || vm.appState != .selectingA)
+                    }
+                }
                 Toggle("閉圈（最後連回 P1）", isOn: $vm.isClosedLoop)
                     .tint(ModernTheme.accent)
                     .disabled(vm.appState != .selectingA && vm.appState != .readyToMove)
@@ -67,7 +85,7 @@ struct MovementSettingsSectionView: View {
                 .foregroundColor(.secondary)
             Spacer()
             Button("移除最後點") {
-                if !vm.waypoints.isEmpty { vm.waypoints.removeLast() }
+                vm.removeLastWaypoint()
             }
             .buttonStyle(.bordered)
             .controlSize(.small)

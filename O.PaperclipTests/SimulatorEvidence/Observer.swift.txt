@@ -1,0 +1,55 @@
+import UIKit
+import CoreLocation
+
+@main
+final class Observer: UIResponder, UIApplicationDelegate {
+    func application(_ application: UIApplication, configurationForConnecting session: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "定位驗證", sessionRole: session.role)
+        configuration.delegateClass = LocationScene.self
+        return configuration
+    }
+}
+
+final class LocationScene: UIResponder, UIWindowSceneDelegate, CLLocationManagerDelegate {
+    var window: UIWindow?
+    let manager = CLLocationManager()
+    var sampleTimer: Timer?
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+        guard let scene = scene as? UIWindowScene else { return }
+        let window = UIWindow(windowScene: scene)
+        let controller = UIViewController()
+        let label = UILabel(frame: window.bounds)
+        label.text = "O.Paperclip 定位驗證"
+        label.textAlignment = .center
+        controller.view.addSubview(label)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        self.window = window
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        manager.requestWhenInUseAuthorization()
+        manager.startUpdatingLocation()
+        sampleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let location = self.manager.location else { return }
+            self.locationManager(self.manager, didUpdateLocations: [location])
+        }
+    }
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("locations.jsonl")
+        for location in locations {
+            let row: [String: Any] = ["latitude": location.coordinate.latitude, "longitude": location.coordinate.longitude, "timestamp": location.timestamp.timeIntervalSince1970, "received": Date().timeIntervalSince1970]
+            guard var data = try? JSONSerialization.data(withJSONObject: row) else { continue }
+            data.append(10)
+            if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
+            do {
+                let file = try FileHandle(forWritingTo: url)
+                try file.seekToEnd()
+                try file.write(contentsOf: data)
+                try file.close()
+            } catch { NSLog("定位紀錄失敗：%@", error.localizedDescription) }
+        }
+    }
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        NSLog("定位驗證失敗：%@", error.localizedDescription)
+    }
+}
