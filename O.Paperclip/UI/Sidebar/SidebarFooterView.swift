@@ -22,6 +22,12 @@ struct SidebarFooterView: View {
                 .controlSize(isCompactSidebar ? .regular : .large)
             }
 
+            if vm.hasActiveRouteSnapshot {
+                Button("清除裝置定位與目前路線", role: .destructive, action: vm.resetActiveSession)
+                    .buttonStyle(.bordered)
+                    .controlSize(isCompactSidebar ? .regular : .large)
+            }
+
             Divider().opacity(0.4)
             HStack(spacing: 10) {
                 Image("operation_paperclip_icon")

@@ -1,6 +1,26 @@
 import MapKit
 import SwiftUI
 
+enum PersistedMapRegionStore {
+    static func load(defaults: UserDefaults = .standard) -> MKCoordinateRegion {
+        let latitude = defaults.object(forKey: "map.center.lat") as? Double ?? AppConstants.Map.defaultLatitude
+        let longitude = defaults.object(forKey: "map.center.lon") as? Double ?? AppConstants.Map.defaultLongitude
+        let candidate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        let center: CLLocationCoordinate2D
+        if CLLocationCoordinate2DIsValid(candidate), latitude.isFinite, longitude.isFinite {
+            center = candidate
+        } else {
+            center = CLLocationCoordinate2D(latitude: AppConstants.Map.defaultLatitude, longitude: AppConstants.Map.defaultLongitude)
+        }
+        func span(_ key: String) -> Double {
+            let value = defaults.object(forKey: key) as? Double ?? AppConstants.Map.defaultSpanDelta
+            guard value.isFinite else { return AppConstants.Map.defaultSpanDelta }
+            return min(max(value, AppConstants.Map.minimumSpanDelta), AppConstants.Map.maximumSpanDelta)
+        }
+        return MKCoordinateRegion(center: center, span: MKCoordinateSpan(latitudeDelta: span("map.span.lat"), longitudeDelta: span("map.span.lon")))
+    }
+}
+
 public struct PurePointRenderEngine {
     static func renderState(
         for entries: [VisiblePurePoint],
@@ -40,15 +60,16 @@ public struct PurePointRenderEngine {
     static func contains(_ coordinate: CLLocationCoordinate2D, in region: MKCoordinateRegion, paddingFactor: Double = 0) -> Bool {
         guard CLLocationCoordinate2DIsValid(coordinate), coordinate.latitude.isFinite, coordinate.longitude.isFinite else { return false }
         let latPadding = region.span.latitudeDelta * paddingFactor
-        let lonPadding = region.span.longitudeDelta * paddingFactor
         let minLat = region.center.latitude - (region.span.latitudeDelta / 2) - latPadding
         let maxLat = region.center.latitude + (region.span.latitudeDelta / 2) + latPadding
-        let minLon = region.center.longitude - (region.span.longitudeDelta / 2) - lonPadding
-        let maxLon = region.center.longitude + (region.span.longitudeDelta * 0.5) + lonPadding
-        return coordinate.latitude >= minLat && coordinate.latitude <= maxLat && coordinate.longitude >= minLon && coordinate.longitude <= maxLon
+        let halfLongitude = region.span.longitudeDelta * (0.5 + paddingFactor)
+        let longitudeDistance = abs((coordinate.longitude - region.center.longitude).truncatingRemainder(dividingBy: 360))
+        let wrappedDistance = min(longitudeDistance, 360 - longitudeDistance)
+        return coordinate.latitude >= minLat && coordinate.latitude <= maxLat && wrappedDistance <= halfLongitude
     }
 
     static func cappedEntries(_ entries: [VisiblePurePoint], limit: Int, region: MKCoordinateRegion) -> [VisiblePurePoint] {
+        guard limit > 0 else { return [] }
         guard entries.count > limit else { return entries }
         let latSpan = max(region.span.latitudeDelta, AppConstants.Map.minimumSpanDelta)
         let lonSpan = max(region.span.longitudeDelta, AppConstants.Map.minimumSpanDelta)

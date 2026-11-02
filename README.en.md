@@ -57,6 +57,10 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 
 ### Step 1: Connect Your Device
 
+Up to three distinct devices share GPS position, route, connection mode, and start/stop actions. Start/Add performs one discovery and connects devices sequentially; one connected device is ready for GPS. Adding does not rebuild existing connections. Disconnect one slot or all slots. Restart clears session identifiers/manual RSD fields; stale identities are not retried.
+
+Run full automated acceptance with `python3 O.PaperclipTests/SimulatorEvidence/prepare.py` after installing Xcode and an iOS 27.0 Simulator runtime (`PAPERCLIP_SIMULATOR_RUNTIME` selects another installed runtime). The harness creates and cleans up three Simulators; GUI tests temporarily select and restore the keyboard layout. Its transport fixtures do not prove physical USB/Wi-Fi pairing or tunnel compatibility.
+
 **USB connection (default):**
 1. Connect your iPhone / iPad with a USB cable
 2. Open O.Paperclip

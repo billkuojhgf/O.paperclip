@@ -1,6 +1,12 @@
 import SwiftUI
 import MapKit
 
+// The imported models contain only immutable strings, numbers, and arrays of those values.
+// Keep their transfer scoped here rather than claiming Sendable for unrelated UI model APIs.
+private struct PurePointImportBatch: @unchecked Sendable {
+    let overlays: [PurePointOverlay]
+}
+
 extension ContentView {
     static func makeOverlayStates(for overlays: [PurePointOverlay]) -> [String: PurePointOverlayUIState] {
         Dictionary(uniqueKeysWithValues: overlays.map { overlay in
@@ -22,14 +28,7 @@ extension ContentView {
     }
 
     func visiblePoints(for overlay: PurePointOverlay) -> [ShuangbeiPurePoint] {
-        let state = overlayState(for: overlay)
-        guard state.isEnabled else { return [] }
-        return overlay.points.filter {
-            state.selectedCategoryIDs.contains($0.categoryID)
-                && CLLocationCoordinate2DIsValid($0.coordinate)
-                && $0.latitude.isFinite
-                && $0.longitude.isFinite
-        }
+        overlayState(for: overlay).visiblePoints(in: overlay)
     }
 
     func bindingForOverlayEnabled(_ overlay: PurePointOverlay) -> Binding<Bool> {
@@ -38,9 +37,6 @@ extension ContentView {
             set: { newValue in
                 var state = overlayState(for: overlay)
                 state.isEnabled = newValue
-                if state.selectedCategoryIDs.isEmpty {
-                    state.selectedCategoryIDs = Set(overlay.categories.map(\.id))
-                }
                 state.isFilterExpanded = newValue ? true : state.isFilterExpanded
                 purePointOverlayStates[overlay.id] = state
             }
@@ -105,14 +101,9 @@ extension ContentView {
         var nextStates: [String: PurePointOverlayUIState] = [:]
         for overlay in purePointOverlays {
             let fallback = PurePointOverlayUIState(overlay: overlay, isEnabled: !overlay.isBuiltIn)
-            let existing = purePointOverlayStates[overlay.id] ?? fallback
-            let validCategoryIDs = Set(overlay.categories.map(\.id))
-            let selected = existing.selectedCategoryIDs.intersection(validCategoryIDs)
-            nextStates[overlay.id] = PurePointOverlayUIState(
-                isEnabled: existing.isEnabled,
-                isFilterExpanded: existing.isFilterExpanded,
-                selectedCategoryIDs: selected.isEmpty ? validCategoryIDs : selected
-            )
+            var existing = purePointOverlayStates[overlay.id] ?? fallback
+            existing.reconcile(with: overlay)
+            nextStates[overlay.id] = existing
         }
         purePointOverlayStates = nextStates
     }
@@ -130,7 +121,7 @@ extension ContentView {
     }
 
     func beginImportedPurePointOverlaySession(with urls: [URL]) {
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty, !isPersistingPurePointImport else { return }
         resetPurePointImportSession()
         purePointImportError = nil
         pendingImportedOverlaySourceURLs = urls
@@ -139,60 +130,90 @@ extension ContentView {
 
     func prepareImportedPurePointOverlays(from urls: [URL]) {
         guard !urls.isEmpty else { return }
-        do {
-            let overlays = try ImportedPurePointOverlayStore.previewOverlays(
-                from: urls,
-                approvedRemoteURLs: approvedPurePointRemoteURLs
-            )
-            purePointImportError = nil
-            pendingPurePointRemoteApprovalURLs = []
-            isShowingPurePointRemoteApprovalSheet = false
-            pendingImportedOverlays = overlays
-            pendingImportedOverlayTitles = Dictionary(
-                uniqueKeysWithValues: overlays.map { ($0.id, $0.title) }
-            )
-            isShowingImportedOverlayNamingSheet = true
-        } catch let error as PurePointImportError {
-            switch error {
-            case .remoteLinkRequiresApproval(let remoteURLs):
+        let generation = UUID()
+        purePointImportGeneration = generation
+        let approvedURLs = approvedPurePointRemoteURLs
+        isPreparingPurePointImport = true
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    PurePointImportBatch(overlays: try ImportedPurePointOverlayStore.previewOverlays(
+                        from: urls,
+                        approvedRemoteURLs: approvedURLs
+                    ))
+                }
+            }.value
+            guard purePointImportGeneration == generation else { return }
+            isPreparingPurePointImport = false
+            do {
+                let overlays = try result.get().overlays
                 purePointImportError = nil
-                pendingPurePointRemoteApprovalURLs = remoteURLs
-                isShowingImportedOverlayNamingSheet = false
-                isShowingPurePointRemoteApprovalSheet = true
-            default:
+                pendingPurePointRemoteApprovalURLs = []
+                isShowingPurePointRemoteApprovalSheet = false
+                pendingImportedOverlays = overlays
+                pendingImportedOverlayTitles = Dictionary(
+                    uniqueKeysWithValues: overlays.map { ($0.id, $0.title) }
+                )
+                isShowingImportedOverlayNamingSheet = true
+            } catch let error as PurePointImportError {
+                switch error {
+                case .remoteLinkRequiresApproval(let remoteURLs):
+                    purePointImportError = nil
+                    pendingPurePointRemoteApprovalURLs = remoteURLs
+                    isShowingImportedOverlayNamingSheet = false
+                    isShowingPurePointRemoteApprovalSheet = true
+                default:
+                    resetPurePointImportSession()
+                    purePointImportError = error.localizedDescription
+                }
+            } catch {
                 resetPurePointImportSession()
                 purePointImportError = error.localizedDescription
             }
-        } catch {
-            resetPurePointImportSession()
-            purePointImportError = error.localizedDescription
         }
     }
 
     func finalizeImportedPurePointOverlays() {
-        do {
-            let renamedOverlays = pendingImportedOverlays.map { overlay in
-                overlay.renamed(to: pendingImportedOverlayTitles[overlay.id] ?? overlay.title)
-            }
-            let persistedOverlays = try ImportedPurePointOverlayStore.persistImportedOverlays(
-                renamedOverlays,
-                approvedRemoteURLs: approvedPurePointRemoteURLs
-            )
-            commitImportedPurePointOverlays(persistedOverlays)
-            purePointImportError = nil
-            resetPurePointImportSession()
-        } catch let error as PurePointImportError {
-            switch error {
-            case .remoteLinkRequiresApproval(let remoteURLs):
+        guard !isPreparingPurePointImport, !pendingImportedOverlays.isEmpty else { return }
+        let generation = UUID()
+        purePointImportGeneration = generation
+        let batch = PurePointImportBatch(overlays: pendingImportedOverlays.map { overlay in
+            overlay.renamed(to: pendingImportedOverlayTitles[overlay.id] ?? overlay.title)
+        })
+        let approvedURLs = approvedPurePointRemoteURLs
+        isPreparingPurePointImport = true
+        isPersistingPurePointImport = true
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result {
+                    PurePointImportBatch(overlays: try ImportedPurePointOverlayStore.persistImportedOverlays(
+                        batch.overlays,
+                        approvedRemoteURLs: approvedURLs
+                    ))
+                }
+            }.value
+            guard purePointImportGeneration == generation else { return }
+            isPersistingPurePointImport = false
+            isPreparingPurePointImport = false
+            do {
+                commitImportedPurePointOverlays(try result.get().overlays)
                 purePointImportError = nil
-                pendingPurePointRemoteApprovalURLs = remoteURLs
-                isShowingImportedOverlayNamingSheet = false
-                isShowingPurePointRemoteApprovalSheet = true
-            default:
+                resetPurePointImportSession()
+            } catch let error as PurePointImportError {
+                switch error {
+                case .remoteLinkRequiresApproval(let remoteURLs):
+                    purePointImportError = nil
+                    pendingPurePointRemoteApprovalURLs = remoteURLs
+                    isShowingImportedOverlayNamingSheet = false
+                    isShowingPurePointRemoteApprovalSheet = true
+                default:
+                    isShowingImportedOverlayNamingSheet = true
+                    purePointImportError = error.localizedDescription
+                }
+            } catch {
+                isShowingImportedOverlayNamingSheet = true
                 purePointImportError = error.localizedDescription
             }
-        } catch {
-            purePointImportError = error.localizedDescription
         }
     }
 
@@ -213,6 +234,9 @@ extension ContentView {
     }
 
     func resetPurePointImportSession() {
+        guard !isPersistingPurePointImport else { return }
+        purePointImportGeneration = UUID()
+        isPreparingPurePointImport = false
         pendingImportedOverlays = []
         pendingImportedOverlayTitles = [:]
         pendingImportedOverlaySourceURLs = []
@@ -236,7 +260,8 @@ extension ContentView {
                 overlaysByPath[path] = overlay
             }
         }
-        purePointOverlays = overlaysByPath.values.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        purePointOverlays = purePointOverlays.filter(\.isBuiltIn)
+            + overlaysByPath.values.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
         syncOverlayStates()
         persistImportedOverlaySettings()
     }
@@ -256,6 +281,15 @@ extension ContentView {
             onCancel: cancelImportedPurePointOverlays,
             onImport: finalizeImportedPurePointOverlays
         )
+        .disabled(isPersistingPurePointImport)
+        .interactiveDismissDisabled(isPersistingPurePointImport)
+        .overlay {
+            if isPersistingPurePointImport {
+                ProgressView("正在儲存 KML⋯")
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
     }
 
     @ViewBuilder

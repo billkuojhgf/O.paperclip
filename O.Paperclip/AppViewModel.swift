@@ -43,7 +43,9 @@ final class AppViewModel {
 
     // MARK: - Draft workflow
     var appState: AppState = .selectingA
-    var operationMode: OperationMode = .routeAB
+    var operationMode: OperationMode = .routeAB {
+        didSet { if oldValue != operationMode { routeGeneration += 1 } }
+    }
     var pendingModeSwitch: OperationMode?
 
     var pointA: CLLocationCoordinate2D?
@@ -72,12 +74,41 @@ final class AppViewModel {
     var isShowingRouteReplacementConfirmation: Bool = false
 
     // MARK: - Settings
-    var speed: Double = AppConstants.Simulation.defaultSpeed
-    var isEndlessLoop: Bool = false
-    var isClosedLoop: Bool = false
+    var speed: Double = AppConstants.Simulation.defaultSpeed {
+        didSet {
+            let bounded = speed.isFinite
+                ? min(max(speed, AppConstants.Simulation.speedStep), maximumSpeed)
+                : oldValue
+            if speed != bounded { speed = bounded }
+        }
+    }
+    var isEndlessLoop: Bool = false {
+        didSet {
+            if isEndlessLoop && operationMode == .multiPoint && isClosedLoop { isEndlessLoop = false }
+        }
+    }
+    var isClosedLoop: Bool = false {
+        didSet {
+            guard oldValue != isClosedLoop else { return }
+            if isClosedLoop { isEndlessLoop = false }
+            if operationMode == .multiPoint {
+                routeGeneration += 1
+                clearDraftGeometry()
+                appState = .selectingA
+            }
+        }
+    }
 
     // MARK: - Location input
-    var placeKeyword: String = ""
+    var placeKeyword: String = "" {
+        didSet {
+            searchGeneration += 1
+            if placeKeyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                placeResults = []
+                locationSearchService.clearSuggestions()
+            }
+        }
+    }
     var placeResults: [MKMapItem] = []
     var coordinateInputText: String = ""
     var locationInputError: String?
@@ -92,6 +123,9 @@ final class AppViewModel {
     private(set) var lastSentPosition: CLLocationCoordinate2D?
     private(set) var lastSentAt: Date?
     var dependencyVersion: Int = 0
+    private var routeGeneration = 0
+    private var searchGeneration = 0
+    private var simulationGeneration = 0
 
     let maximumSpeed = AppConstants.Simulation.maximumSpeed
 
@@ -279,6 +313,8 @@ final class AppViewModel {
     // MARK: - Map interaction
 
     func handleMapTap(at coordinate: CLLocationCoordinate2D) {
+        guard coordinate.latitude.isFinite, coordinate.longitude.isFinite,
+              CLLocationCoordinate2DIsValid(coordinate) else { return }
         if operationMode == .multiPoint {
             guard appState == .selectingA else { return }
             waypoints.append(coordinate)
@@ -294,11 +330,13 @@ final class AppViewModel {
     }
 
     func insertPoint(_ coordinate: CLLocationCoordinate2D) {
-        guard CLLocationCoordinate2DIsValid(coordinate) else {
+        guard coordinate.latitude.isFinite, coordinate.longitude.isFinite,
+              CLLocationCoordinate2DIsValid(coordinate) else {
             locationInputError = "座標格式錯誤"
             return
         }
         locationInputError = nil
+        searchGeneration += 1
         placeResults = []
         locationSearchService.clearSuggestions()
         requestCameraPosition?(.region(
@@ -339,7 +377,7 @@ final class AppViewModel {
         let raw = coordinateInputText
             .replacingOccurrences(of: "，", with: ",")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = raw.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: true)
+        let parts = raw.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2 else {
             locationInputError = "格式錯誤，請輸入「緯度,經度」"
             return
@@ -353,34 +391,44 @@ final class AppViewModel {
         insertPoint(CLLocationCoordinate2D(latitude: lat, longitude: lon))
     }
 
-    func searchPlaces(currentRegion: MKCoordinateRegion?) {
+    @discardableResult
+    func searchPlaces(currentRegion: MKCoordinateRegion?) -> Task<Void, Never>? {
+        searchGeneration += 1
+        let generation = searchGeneration
         let q = placeKeyword.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else {
             placeResults = []
             locationSearchService.clearSuggestions()
-            return
+            return nil
         }
-        Task {
+        return Task {
             do {
                 let results = try await locationSearchService.search(for: q, region: currentRegion)
+                guard generation == searchGeneration else { return }
                 placeResults = results
                 locationInputError = results.isEmpty ? "找不到符合的地點" : nil
             } catch {
+                guard generation == searchGeneration else { return }
                 placeResults = []
                 locationInputError = "搜尋失敗，請重試"
             }
         }
     }
 
-    func searchPlaces(using completion: MKLocalSearchCompletion, currentRegion: MKCoordinateRegion?) {
+    @discardableResult
+    func searchPlaces(using completion: MKLocalSearchCompletion, currentRegion: MKCoordinateRegion?) -> Task<Void, Never> {
         placeKeyword = completion.title
+        searchGeneration += 1
+        let generation = searchGeneration
         locationSearchService.clearSuggestions()
-        Task {
+        return Task {
             do {
                 let results = try await locationSearchService.search(for: completion, region: currentRegion)
+                guard generation == searchGeneration else { return }
                 placeResults = results
                 locationInputError = results.isEmpty ? "找不到符合的地點" : nil
             } catch {
+                guard generation == searchGeneration else { return }
                 placeResults = []
                 locationInputError = "搜尋失敗，請重試"
             }
@@ -399,7 +447,7 @@ final class AppViewModel {
 
     func confirmRouteReplacement() {
         isShowingRouteReplacementConfirmation = false
-        guard deviceManager.isConnected else { return }
+        guard deviceManager.isConnected, hasReadyDraft else { return }
         stopSimulation(keepPinned: false)
         activateDraftForActiveSession()
         startSimulation()
@@ -420,6 +468,29 @@ final class AppViewModel {
         clearActiveSnapshot(clearPosition: true)
     }
 
+    func resetActiveSession() {
+        stopSimulation(keepPinned: false)
+        clearSimulatedLocationAsync()
+        clearActiveSnapshot(clearPosition: true)
+    }
+
+    func setSpeedText(_ text: String) {
+        guard let value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)), value.isFinite else { return }
+        speed = value
+    }
+
+    func removeLastWaypoint() {
+        guard operationMode == .multiPoint, appState == .selectingA, !waypoints.isEmpty else { return }
+        waypoints.removeLast()
+    }
+
+    func moveWaypoint(from source: Int, to destination: Int) {
+        guard operationMode == .multiPoint, appState == .selectingA,
+              waypoints.indices.contains(source), waypoints.indices.contains(destination), source != destination else { return }
+        let coordinate = waypoints.remove(at: source)
+        waypoints.insert(coordinate, at: destination)
+    }
+
     private func handleDraftMainAction() {
         if operationMode == .multiPoint && appState == .selectingA {
             calculateMultiPointRoute()
@@ -432,6 +503,7 @@ final class AppViewModel {
         case .routeSelection:
             extractRoutePoints()
         case .readyToMove:
+            guard hasReadyDraft else { return }
             guard deviceManager.isConnected else { return }
             if hasActiveRouteSnapshot {
                 isShowingRouteReplacementConfirmation = true
@@ -532,6 +604,9 @@ final class AppViewModel {
 
     func calculateRoutes() {
         guard operationMode == .routeAB, let a = pointA, let b = pointB else { return }
+        routeGeneration += 1
+        let generation = routeGeneration
+        appState = .calculatingRoute
         clearDraftGeometry()
         locationInputError = nil
         let request = MKDirections.Request()
@@ -544,7 +619,8 @@ final class AppViewModel {
             let routesBox = UnsafeSendableBox(response?.routes)
             let errorBox = UnsafeSendableBox(error)
             MainActor.assumeIsolated {
-                if let routes = routesBox.value {
+                guard generation == self.routeGeneration, self.operationMode == .routeAB else { return }
+                if let routes = routesBox.value, !routes.isEmpty {
                     self.routes = routes
                     self.customRoutePolyline = nil
                     self.selectedRouteIndex = 0
@@ -584,6 +660,8 @@ final class AppViewModel {
 
     func calculateMultiPointRoute() {
         guard operationMode == .multiPoint, waypoints.count >= 2 else { return }
+        routeGeneration += 1
+        let generation = routeGeneration
         appState = .calculatingRoute
         routes = []
         selectedRouteIndex = 0
@@ -600,6 +678,7 @@ final class AppViewModel {
         let accumulator = MultiPointRouteAccumulator()
 
         func buildSegment(_ index: Int) {
+            guard generation == self.routeGeneration, self.operationMode == .multiPoint else { return }
             if index >= routeWaypoints.count - 1 {
                 let normalized = self.normalizeRoutePoints(accumulator.combinedPoints)
                 guard normalized.count > 1 else {
@@ -630,6 +709,7 @@ final class AppViewModel {
                 let errorBox = UnsafeSendableBox(error)
                 MainActor.assumeIsolated {
                     guard let self else { return }
+                    guard generation == self.routeGeneration, self.operationMode == .multiPoint else { return }
                     guard let route = routeBox.value else {
                         self.clearDraftGeometry()
                         self.locationInputError = self.multiPointFailureMessage(
@@ -642,6 +722,7 @@ final class AppViewModel {
                     accumulator.totalDistance += route.distance
                     let pointCount = route.polyline.pointCount
                     guard pointCount > 1 else {
+                        self.clearDraftGeometry()
                         self.locationInputError = "某一段路線點不足，請調整選點"
                         self.appState = .selectingA
                         return
@@ -650,6 +731,7 @@ final class AppViewModel {
                     route.polyline.getCoordinates(&coords, range: NSRange(location: 0, length: pointCount))
                     let valid = self.normalizeRoutePoints(coords)
                     guard valid.count > 1 else {
+                        self.clearDraftGeometry()
                         self.locationInputError = "某一段路線資料異常，請調整選點"
                         self.appState = .selectingA
                         return
@@ -670,6 +752,9 @@ final class AppViewModel {
     // MARK: - Simulation
 
     func startSimulation() {
+        guard deviceManager.isConnected, !isActiveSimulationRunning else { return }
+        simulationGeneration += 1
+        let generation = simulationGeneration
         stopPinnedLocationKeepAlive()
         isActiveSimulationRunning = true
         shouldResumeActiveAfterReconnect = false
@@ -695,6 +780,21 @@ final class AppViewModel {
             startStreamingAndSend(initial)
         }
 
+
+        let timerInterval = AppConstants.Simulation.timerInterval
+        let timer = Timer(timeInterval: timerInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isActiveSimulationRunning,
+                      generation == self.simulationGeneration else { return }
+                self.advanceSimulation(by: timerInterval)
+            }
+        }
+        moveTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    func advanceSimulation(by interval: TimeInterval) {
+        guard isActiveSimulationRunning, interval.isFinite, interval > 0 else { return }
         let loopMode: RouteMotionEngine.LoopMode
         if activeOperationMode == .multiPoint && activeIsClosedLoop {
             loopMode = .circular
@@ -703,44 +803,22 @@ final class AppViewModel {
         } else {
             loopMode = .singlePass
         }
-
-        let timerInterval = AppConstants.Simulation.timerInterval
-        let timer = Timer(timeInterval: timerInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let speedMetersPerSecond = self.speed * (1000.0 / 3600.0)
-                self.traveledDistance += speedMetersPerSecond * timerInterval
-
-                guard let targetDistance = RouteMotionEngine.targetDistance(
-                    traveledDistance: self.traveledDistance,
-                    routeDistance: self.totalRouteDistance,
-                    loopMode: loopMode
-                ) else {
-                    self.stopSimulation(keepPinned: true)
-                    self.currentPosition = self.currentRoutePoints.last
-                    if let last = self.currentPosition {
-                        self.sendCoordinateAsync(last)
-                    }
-                    return
-                }
-
-                if let newPos = RouteMotionEngine.coordinate(
-                    at: targetDistance,
-                    in: self.currentRoutePoints,
-                    distances: self.cumulativeRouteDistances
-                ) {
-                    self.currentPosition = newPos
-                    if self.shouldSendCoordinateUpdate(newPos) {
-                        self.sendCoordinateAsync(newPos)
-                    }
-                }
-            }
+        traveledDistance += speed * (1000.0 / 3600.0) * interval
+        guard let target = RouteMotionEngine.targetDistance(
+            traveledDistance: traveledDistance, routeDistance: totalRouteDistance, loopMode: loopMode
+        ) else {
+            currentPosition = currentRoutePoints.last
+            stopSimulation(keepPinned: true)
+            return
         }
-        moveTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        if let coordinate = RouteMotionEngine.coordinate(at: target, in: currentRoutePoints, distances: cumulativeRouteDistances) {
+            currentPosition = coordinate
+            if shouldSendCoordinateUpdate(coordinate) { sendCoordinateAsync(coordinate) }
+        }
     }
 
     func stopSimulation(keepPinned: Bool = true) {
+        simulationGeneration += 1
         moveTimer?.invalidate()
         moveTimer = nil
         isActiveSimulationRunning = false
@@ -780,7 +858,9 @@ final class AppViewModel {
     }
 
     private func clearSimulatedLocationAsync() {
+        let generation = simulationGeneration
         Task {
+            guard generation == simulationGeneration else { return }
             try? await deviceManager.clearSimulatedLocationAsync()
         }
     }
@@ -788,10 +868,8 @@ final class AppViewModel {
     private func sendCoordinateAsync(_ coordinate: CLLocationCoordinate2D, updateLastSent: Bool = true) {
         deviceManager.sendLocationToDevice(latitude: coordinate.latitude, longitude: coordinate.longitude)
         if updateLastSent {
-            Task { @MainActor in
-                self.lastSentPosition = coordinate
-                self.lastSentAt = Date()
-            }
+            lastSentPosition = coordinate
+            lastSentAt = Date()
         }
     }
 
@@ -829,6 +907,7 @@ final class AppViewModel {
 
     func startIfReadyAndConnected() {
         guard deviceManager.isConnected else { return }
+        guard !isActiveSimulationRunning else { return }
 
         if hasActiveRouteSnapshot {
             if shouldResumeActiveAfterReconnect {
@@ -847,11 +926,14 @@ final class AppViewModel {
     }
 
     func handleDeviceDisconnected() {
+        guard !deviceManager.isConnected else { return }
         shouldResumeActiveAfterReconnect = isActiveSimulationRunning
         stopSimulation(keepPinned: false)
     }
 
     private func clearDraftWorkflow() {
+        routeGeneration += 1
+        isShowingRouteReplacementConfirmation = false
         appState = .selectingA
         pointA = nil
         pointB = nil
@@ -1040,8 +1122,8 @@ final class AppViewModel {
     // MARK: - Cleanup
 
     func cleanup() {
-        stopPinnedLocationKeepAlive()
-        moveTimer?.invalidate()
-        moveTimer = nil
+        routeGeneration += 1
+        searchGeneration += 1
+        stopSimulation(keepPinned: false)
     }
 }

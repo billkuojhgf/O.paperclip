@@ -6,12 +6,6 @@ import AppKit
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
 
-    private enum PersistedMapKeys {
-        static let centerLat = "map.center.lat"
-        static let centerLon = "map.center.lon"
-        static let spanLat = "map.span.lat"
-        static let spanLon = "map.span.lon"
-    }
 
     @StateObject var diagnostics = AppDiagnostics.shared
     @State var vm: AppViewModel
@@ -28,6 +22,9 @@ struct ContentView: View {
     @State var approvedPurePointRemoteURLs: Set<URL> = []
     @State var isShowingImportedOverlayNamingSheet: Bool = false
     @State var isShowingPurePointRemoteApprovalSheet: Bool = false
+    @State var purePointImportGeneration = UUID()
+    @State var isPreparingPurePointImport = false
+    @State var isPersistingPurePointImport = false
     @State var visibleMapRegion: MKCoordinateRegion
     let routeColors: [Color] = [.yellow, .orange, .mint, .pink]
     private let purePointViewportActivationCount = AppConstants.PurePoint.viewportActivationCount
@@ -36,38 +33,13 @@ struct ContentView: View {
     private let purePointWideSpanThreshold = AppConstants.PurePoint.wideSpanThreshold
 
     init() {
-        let defaults = UserDefaults.standard
-        let lat = defaults.object(forKey: PersistedMapKeys.centerLat) as? Double ?? AppConstants.Map.defaultLatitude
-        let lon = defaults.object(forKey: PersistedMapKeys.centerLon) as? Double ?? AppConstants.Map.defaultLongitude
-        let spanLat = defaults.object(forKey: PersistedMapKeys.spanLat) as? Double ?? 0.05
-        let spanLon = defaults.object(forKey: PersistedMapKeys.spanLon) as? Double ?? 0.05
-        let centerCandidate = CLLocationCoordinate2D(latitude: lat, longitude: lon)
-        let center: CLLocationCoordinate2D
-        if CLLocationCoordinate2DIsValid(centerCandidate),
-           centerCandidate.latitude.isFinite,
-           centerCandidate.longitude.isFinite {
-            center = centerCandidate
-        } else {
-            center = CLLocationCoordinate2D(
-                latitude: AppConstants.Map.defaultLatitude,
-                longitude: AppConstants.Map.defaultLongitude
-            )
-        }
-        let minSpan = AppConstants.Map.minimumSpanDelta
-        let maxSpan = AppConstants.Map.maximumSpanDelta
-        let region = MKCoordinateRegion(
-            center: center,
-            span: MKCoordinateSpan(
-                latitudeDelta: min(max(spanLat, minSpan), maxSpan),
-                longitudeDelta: min(max(spanLon, minSpan), maxSpan)
-            )
-        )
+        let region = PersistedMapRegionStore.load()
         _cameraPosition = State(initialValue: .region(region))
         _visibleMapRegion = State(initialValue: region)
         let initialOverlays = PurePointOverlayRepository.initialOverlays()
         _purePointOverlays = State(initialValue: initialOverlays)
         _purePointOverlayStates = State(initialValue: Self.makeOverlayStates(for: initialOverlays))
-        let deviceManager = DeviceManager()
+        let deviceManager = DeviceGroup()
         let locationSearchService = LocationSearchService()
         _vm = State(initialValue: AppViewModel(deviceManager: deviceManager, locationSearchService: locationSearchService))
     }
@@ -150,6 +122,7 @@ struct ContentView: View {
             routeReplacementSheet
         }
         .onDisappear {
+            resetPurePointImportSession()
             vm.cleanup()
         }
         .onAppear {
@@ -161,6 +134,20 @@ struct ContentView: View {
         ZStack {
             windowBackground
             splitViewContent
+        }
+        .overlay(alignment: .bottom) {
+            if isPreparingPurePointImport && !isPersistingPurePointImport {
+                HStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("正在處理 KML 匯入⋯")
+                    Button("取消匯入", action: cancelImportedPurePointOverlays)
+                        .buttonStyle(.bordered)
+                }
+                .padding(12)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding()
+            }
         }
     }
 
@@ -277,6 +264,7 @@ struct ContentView: View {
                     .environment(\.locale, Locale(identifier: "zh_TW"))
                     .onMapCameraChange(frequency: .onEnd) { context in
                         visibleMapRegion = vm.normalizeMapRegion(context.region)
+                        vm.persistMapRegion(from: .region(visibleMapRegion))
                     }
                     .simultaneousGesture(
                         SpatialTapGesture()

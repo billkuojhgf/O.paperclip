@@ -7,15 +7,20 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
     @Published private(set) var completions: [MKLocalSearchCompletion] = []
     @Published private(set) var completerError: String?
 
-    private let completer = MKLocalSearchCompleter()
+    private var completer = MKLocalSearchCompleter()
+    private let performSearch: (MKLocalSearch.Request) async throws -> [MKMapItem]
 
-    override init() {
+    init(performSearch: @escaping (MKLocalSearch.Request) async throws -> [MKMapItem] = {
+        try await MKLocalSearch(request: $0).start().mapItems
+    }) {
+        self.performSearch = performSearch
         super.init()
         completer.delegate = self
         completer.resultTypes = [.address, .pointOfInterest, .query]
     }
 
     func updateQuery(_ query: String, region: MKCoordinateRegion?) {
+        clearSuggestions()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             completions = []
@@ -32,16 +37,23 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
 
     func clearSuggestions() {
         completions = []
+        completer.cancel()
+        completer.delegate = nil
+        completer = MKLocalSearchCompleter()
+        completer.delegate = self
+        completer.resultTypes = [.address, .pointOfInterest, .query]
         completerError = nil
         completer.queryFragment = ""
     }
 
     func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
+        guard completer === self.completer, !completer.queryFragment.isEmpty else { return }
         completions = Array(completer.results.prefix(AppConstants.Search.maxCompletionResults))
         completerError = nil
     }
 
     func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
+        guard completer === self.completer, !completer.queryFragment.isEmpty else { return }
         completions = []
         completerError = error.localizedDescription
     }
@@ -55,8 +67,7 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
         if let region {
             request.region = region
         }
-        let response = try await MKLocalSearch(request: request).start()
-        return ranked(response.mapItems, query: trimmed, region: region)
+        return ranked(try await performSearch(request), query: trimmed, region: region)
     }
 
     func search(for completion: MKLocalSearchCompletion, region: MKCoordinateRegion?) async throws -> [MKMapItem] {
@@ -64,8 +75,7 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
         if let region {
             request.region = region
         }
-        let response = try await MKLocalSearch(request: request).start()
-        return ranked(response.mapItems, query: completion.title, region: region)
+        return ranked(try await performSearch(request), query: completion.title, region: region)
     }
 
     private func ranked(_ items: [MKMapItem], query: String, region: MKCoordinateRegion?) -> [MKMapItem] {
@@ -78,7 +88,7 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
             partialResult[dedupeKey(for: item)] = item
         }.values
 
-        return deduped.sorted { lhs, rhs in
+        return Array(deduped.sorted { lhs, rhs in
             let lhsRank = rankingScore(for: lhs, query: normalizedQuery)
             let rhsRank = rankingScore(for: rhs, query: normalizedQuery)
             if lhsRank != rhsRank { return lhsRank < rhsRank }
@@ -88,7 +98,7 @@ final class LocationSearchService: NSObject, ObservableObject, MKLocalSearchComp
             if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
 
             return (lhs.name ?? "").localizedStandardCompare(rhs.name ?? "") == .orderedAscending
-        }
+        }.prefix(8))
     }
 
     private func rankingScore(for item: MKMapItem, query: String) -> Int {

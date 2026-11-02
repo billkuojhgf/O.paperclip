@@ -1,11 +1,19 @@
 import Foundation
 
 final class MockDVTLocationStream: DVTStreaming {
-    var isRunning: Bool = false
+    private let lock = NSLock()
+    private var running = false
+    var isRunning: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return running }
+        set { lock.lock(); defer { lock.unlock() }; running = newValue }
+    }
     var sentCoordinates: [(latitude: Double, longitude: Double)] = []
     var shouldThrowOnSend = false
     var startCallCount = 0
-    var stopCallCount = 0
+    private var stops = 0
+    var stopCallCount: Int {
+        lock.lock(); defer { lock.unlock() }; return stops
+    }
     var clearCallCount = 0
     var lastHost: String?
     var lastPort: String?
@@ -37,7 +45,9 @@ final class MockDVTLocationStream: DVTStreaming {
     }
 
     func stop() {
-        stopCallCount += 1
-        isRunning = false
+        lock.lock()
+        defer { lock.unlock() }
+        stops += 1
+        running = false
     }
 }

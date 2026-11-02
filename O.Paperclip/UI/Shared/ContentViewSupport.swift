@@ -1,4 +1,5 @@
 import SwiftUI
+import MapKit
 
 struct ModernTheme {
     static let accent = Color(red: 0.85, green: 0.55, blue: 0.35)
@@ -35,6 +36,19 @@ struct PurePointOverlayUIState {
         self.isEnabled = isEnabled
         self.isFilterExpanded = true
         self.selectedCategoryIDs = Set(overlay.categories.map(\.id))
+    }
+
+    func visiblePoints(in overlay: PurePointOverlay) -> [ShuangbeiPurePoint] {
+        guard isEnabled else { return [] }
+        return overlay.points.filter {
+            selectedCategoryIDs.contains($0.categoryID)
+                && CLLocationCoordinate2DIsValid($0.coordinate)
+                && $0.latitude.isFinite && $0.longitude.isFinite
+        }
+    }
+
+    mutating func reconcile(with overlay: PurePointOverlay) {
+        selectedCategoryIDs.formIntersection(Set(overlay.categories.map(\.id)))
     }
 }
 

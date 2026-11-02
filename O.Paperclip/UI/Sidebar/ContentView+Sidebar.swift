@@ -193,6 +193,9 @@ extension ContentView {
         VStack(alignment: .leading, spacing: isCompactSidebar ? 12 : 20) {
             operationModePicker
             deviceStatusSection(isCompactSidebar: isCompactSidebar)
+            if let record = diagnostics.lastUnexpectedTermination {
+                UnexpectedTerminationSectionView(diagnostics: diagnostics, unexpectedTermination: record)
+            }
             pinnedCoordinateSection
             StatusViewSection(vm: vm, routeColors: routeColors)
             locationInputSection
@@ -237,11 +240,7 @@ extension ContentView {
     var speedTextBinding: Binding<String> {
         Binding(
             get: { String(format: "%.1f", vm.speed) },
-            set: { newValue in
-                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let parsed = Double(trimmed) else { return }
-                vm.speed = min(max(parsed, AppConstants.Simulation.speedStep), vm.maximumSpeed)
-            }
+            set: { vm.setSpeedText($0) }
         )
     }
 
