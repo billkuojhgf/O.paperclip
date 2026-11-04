@@ -13,6 +13,8 @@ import XCTest
 final class O_PaperclipUITests: XCTestCase {
     private var app: XCUIApplication!
     private var importedTestTitles: [String] = []
+    private var importedGPXTitles: [String] = []
+    private var savedTestTitles: [String] = []
     private var temporaryDirectories: [URL] = []
     private var originalInputSource: TISInputSource?
 
@@ -48,6 +50,12 @@ final class O_PaperclipUITests: XCTestCase {
                 if app.staticTexts[title].exists { removeOverlay(named: title) }
             }
         }
+        for title in importedGPXTitles where app.staticTexts[title].exists {
+            rightPanelButton("移除", below: title).click()
+        }
+        for title in savedTestTitles where app.staticTexts[title].exists {
+            rightPanelButton("刪除", below: title).click()
+        }
         app.terminate()
         for directory in temporaryDirectories {
             try FileManager.default.removeItem(at: directory)
@@ -64,6 +72,113 @@ final class O_PaperclipUITests: XCTestCase {
             app.menuItems["New Window"].click()
         }
         XCTAssertTrue(window.waitForExistence(timeout: 5), "Application must present a real window")
+        if app.buttons["顯示右側欄"].exists { app.buttons["顯示右側欄"].click() }
+    }
+
+    func testRightPanelGPXImportSaveRelaunchAndApplyPreservesRoute() throws {
+        let token = UUID().uuidString
+        let routeTitle = "XCUI-GPX-\(token)"
+        let savedTitle = "XCUI-saved-\(token)"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(token)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        temporaryDirectories.append(directory)
+        let file = directory.appendingPathComponent("route.gpx")
+        try """
+        <gpx version="1.1"><trk><name>\(routeTitle)</name><trkseg>
+        <trkpt lat="25.033" lon="121.5654"/><trkpt lat="25.034" lon="121.5664"/>
+        <trkpt lat="25.035" lon="121.5674"/></trkseg></trk></gpx>
+        """.write(to: file, atomically: true, encoding: .utf8)
+        importedGPXTitles = [routeTitle]
+        savedTestTitles = [savedTitle]
+        launchAppWindow()
+        openImport(file, buttonLabel: "匯入 GPX", namingTitle: "設定固定路線名稱")
+        app.sheets.buttons["匯入"].click()
+        XCTAssertTrue(app.sheets.firstMatch.waitForNonExistence(timeout: 5))
+        rightPanelButton("使用", below: routeTitle).click()
+        assertText("多點數量：3")
+        assertText("P3: 25.0350, 121.5674")
+        let closedLoop = app.checkBoxes["閉圈（最後連回 P1）"]
+        reveal(closedLoop)
+        closedLoop.click()
+        XCTAssertEqual((closedLoop.value as? NSNumber)?.boolValue, true)
+        assertText("準備就緒")
+        reveal(app.buttons["儲存這個迴路"])
+        XCTAssertTrue(app.buttons["儲存這個迴路"].isEnabled)
+        reveal(closedLoop)
+        closedLoop.click()
+        XCTAssertEqual((closedLoop.value as? NSNumber)?.boolValue, false)
+        assertText("準備就緒")
+        let save = app.buttons["儲存這條線路"]
+        reveal(save)
+        save.click()
+        let name = app.sheets.textFields["名稱"]
+        replaceText(in: name, with: savedTitle)
+        app.sheets.buttons["儲存這條線路"].click()
+        XCTAssertTrue(app.sheets.firstMatch.waitForNonExistence(timeout: 5))
+        app.terminate()
+        launchAppWindow()
+        rightPanelButton("移除", below: routeTitle).click()
+        XCTAssertTrue(app.staticTexts[routeTitle].waitForNonExistence(timeout: 5))
+        rightPanelButton("套用", below: savedTitle).click()
+        assertText("多點數量：3")
+        assertText("P1: 25.0330, 121.5654")
+        assertText("P3: 25.0350, 121.5674")
+        XCTAssertEqual(app.textFields.matching(NSPredicate(format: "placeholderValue == %@", "裝置 UDID")).count, 3)
+        rightPanelButton("刪除", below: savedTitle).click()
+        XCTAssertTrue(app.staticTexts[savedTitle].waitForNonExistence(timeout: 5))
+    }
+
+    private func rightPanelButton(_ label: String, below title: String) -> XCUIElement {
+        let heading = app.staticTexts[title]
+        reveal(heading)
+        let button = app.buttons.matching(identifier: label).allElementsBoundByIndex
+            .filter { $0.frame.minY > heading.frame.minY && $0.frame.minX >= heading.frame.minX - 15 }
+            .min { $0.frame.minY < $1.frame.minY }
+        XCTAssertNotNil(button, "\(title) 的 \(label) 按鈕必須存在")
+        let result = button ?? app.buttons[label]
+        reveal(result)
+        return result
+    }
+
+    func testRightPanelRemainsAccessibleWithThreeDeviceSlotsAcrossModes() throws {
+        launchAppWindow()
+        if app.buttons["顯示右側欄"].exists { app.buttons["顯示右側欄"].click() }
+        let title = app.staticTexts["匯入與收藏"]
+        XCTAssertTrue(title.waitForExistence(timeout: 5), "多裝置版本仍須呈現右側匯入與收藏欄")
+        for mode in ["A-B", "定點", "多點"] {
+            selectMode(mode)
+            let map = app.maps.firstMatch
+            XCTAssertTrue(map.waitForExistence(timeout: 5))
+            XCTAssertEqual(app.textFields.matching(NSPredicate(format: "placeholderValue == %@", "裝置 UDID")).count, 3)
+            XCTAssertGreaterThan(map.frame.width, 200, "地圖不能被兩側欄擠掉")
+            XCTAssertGreaterThanOrEqual(title.frame.minX, map.frame.maxX - 1, "收藏欄必須在地圖右側，而非埋在左側捲動區")
+            for label in ["匯入 KML", "匯入 GPX"] {
+                let button = app.buttons[label]
+                XCTAssertTrue(button.isHittable, "\(label) 必須直接可操作")
+                XCTAssertGreaterThanOrEqual(button.frame.minX, map.frame.maxX - 1)
+                XCTAssertLessThanOrEqual(button.frame.maxX, app.windows.firstMatch.frame.maxX)
+            }
+        }
+        for label in ["匯入 KML", "匯入 GPX"] {
+            app.buttons[label].click()
+            let panel = app.sheets["open-panel"]
+            XCTAssertTrue(panel.waitForExistence(timeout: 5))
+            panel.buttons["CancelButton"].click()
+            XCTAssertTrue(panel.waitForNonExistence(timeout: 5))
+        }
+        app.buttons["隱藏右側欄"].click()
+        XCTAssertTrue(title.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["顯示右側欄"].isHittable)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.buttons["顯示右側欄"].waitForExistence(timeout: 5))
+        XCTAssertFalse(title.exists, "使用者收合狀態須保留，並提供重新展開入口")
+        app.buttons["顯示右側欄"].click()
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "Three-device layout with right import and favorites panel"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     // LOC-05 / LOC-07: compare the actual Return and button event paths.
@@ -268,7 +383,9 @@ final class O_PaperclipUITests: XCTestCase {
 
     private func reveal(_ element: XCUIElement) {
         XCTAssertTrue(element.waitForExistence(timeout: 5))
-        let scrollView = app.scrollViews.firstMatch
+        let rightPanel = app.scrollViews["rightPanelScrollView"]
+        let scrollView = rightPanel.exists && element.frame.midX >= rightPanel.frame.minX
+            ? rightPanel : app.scrollViews.firstMatch
         func isVisible() -> Bool {
             guard element.isHittable else { return false }
             // XCUI reports clipped SwiftUI children as hittable; their coordinates can
@@ -289,17 +406,18 @@ final class O_PaperclipUITests: XCTestCase {
     }
 
     private func openKML(_ file: URL) {
-        let importButton = app.buttons["匯入 KML"]
+        openImport(file, buttonLabel: "匯入 KML", namingTitle: "設定純點圖層名稱")
+    }
+
+    private func openImport(_ file: URL, buttonLabel: String, namingTitle: String) {
+        let importButton = app.buttons[buttonLabel]
         reveal(importButton)
         importButton.click()
         let openPanel = app.sheets["open-panel"]
         XCTAssertTrue(openPanel.waitForExistence(timeout: 5))
-        let columnView = openPanel.descendants(matching: .browser)["ColumnView"]
-        XCTAssertTrue(columnView.waitForExistence(timeout: 5))
-        // Focus the native XPC panel before sending its Go to Folder shortcut.
-        columnView.click()
+        // 原生面板可記住圖像、列表或欄位檢視；不依賴其中一種檢視的子元素。
         selectASCIIKeyboard()
-        columnView.typeKey("g", modifierFlags: [.command, .shift])
+        openPanel.typeKey("g", modifierFlags: [.command, .shift])
         let pathSheet = openPanel.sheets.firstMatch
         let pathField = pathSheet.textFields.firstMatch
         XCTAssertTrue(pathField.waitForExistence(timeout: 5), "Native Go to Folder sheet must be accessible")
@@ -310,7 +428,7 @@ final class O_PaperclipUITests: XCTestCase {
         let readyToOpen = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: openButton)
         XCTAssertEqual(XCTWaiter.wait(for: [readyToOpen], timeout: 5), .completed)
         openButton.click()
-        XCTAssertTrue(app.sheets.staticTexts["設定純點圖層名稱"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.sheets.staticTexts[namingTitle].waitForExistence(timeout: 5))
     }
 
     private func assertOverlayPointCount(_ count: Int, named title: String) {

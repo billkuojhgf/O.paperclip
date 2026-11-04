@@ -123,9 +123,18 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 
 支援匯入 KML 格式的地理資料，在地圖上顯示自訂標記：
 
-1. 側邊欄點「匯入 KML」
+1. 右側「匯入與收藏」欄點「匯入 KML」
 2. 選擇 `.kml` 檔案
 3. 圖層會顯示在地圖上，可依分類篩選
+
+### 匯入與收藏
+
+- 右側欄同時提供 KML、GPX 與本機收藏，不會因三台裝置欄位而移到左側。右上角可收合；收合後以地圖右側按鈕重新展開，重啟保留顯示狀態。
+- 點「匯入 GPX」或拖入 `.gpx`，命名後點「使用」；原始軌跡直接成為就緒的多點草稿，不重新規劃道路。
+- 匯入路線就緒後切換「閉圈」，直接補上末點回起點的直線線段，並重算圖線與累積距離；取消閉圈還原原始軌跡，不重新呼叫道路規劃。
+- 完成定點或路線後可命名儲存，並在右側套用、定位、改名、刪除及排序；相容原上游 v1.2.1 的既有收藏／GPX 資料。套用草稿不會中斷既有裝置連線。
+
+修復來源：多裝置版本以 v1.04 基底整合，遺漏原上游 [v1.2.1](https://github.com/agocia/O.Paperclip/tree/dc10107c3b474d90c19b6a1c48e0d2c2f3e84a45) 的右側欄功能；此處選擇性恢復該功能，保留 `DeviceGroup`。回歸測試位於 `ImportedAndSavedLocationTests.swift` 與 `O_PaperclipUITests.swift`，覆蓋 GPX／收藏持久化、三裝置連線保留、實際右欄位置與收合重啟；不同視窗寬度另以實際 Release App 縮放驗證。
 
 ---
 

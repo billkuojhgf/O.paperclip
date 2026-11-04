@@ -137,6 +137,7 @@ extension ContentView {
     }
 
     func handleOperationModeChange() {
+        guard !vm.consumeProgrammaticModeResetSuppression() else { return }
         vm.switchModePreservingPinnedLocation()
     }
 
@@ -199,7 +200,6 @@ extension ContentView {
             pinnedCoordinateSection
             StatusViewSection(vm: vm, routeColors: routeColors)
             locationInputSection
-            purePointControlsSection(isCompactSidebar: isCompactSidebar)
             Divider()
             movementSettingsSection
         }
@@ -221,14 +221,16 @@ extension ContentView {
     func purePointControlsSection(isCompactSidebar: Bool) -> some View {
         PurePointControlsSectionView(
             overlayCount: purePointOverlays.count,
-            importError: purePointImportError,
+            importError: purePointDropError ?? purePointImportError,
             renderNotice: purePointRenderNotice,
             hasVisiblePoints: !visiblePurePoints.isEmpty,
             onImport: {
                 resetPurePointImportSession()
                 purePointImportError = nil
+                purePointDropError = nil
                 isImportingPurePointKML = true
             },
+            onDropURLs: handlePurePointDrop,
             onFocusAll: focusAllPurePoints
         ) {
             ForEach(purePointOverlays) { overlay in
@@ -287,4 +289,199 @@ extension ContentView {
         .padding(24)
         .frame(width: 420)
     }
+
+    func focusImportedGPXRoute(_ route: ImportedGPXRoute) {
+        guard !route.points.isEmpty else { return }
+        cameraPosition = .region(vm.mapRegion(fitting: route.points))
+    }
+
+    var rightSidebarPane: some View {
+        RightSidebarView(
+            sortMode: $savedLocationSortMode,
+            canCreateSavedItem: vm.canSaveCurrentSelection,
+            onToggleVisibility: { isRightSidebarVisible = false },
+            onCreateSavedItem: { vm.prepareSaveCurrentSelection() },
+            noticeText: purePointRenderNotice,
+            errorText: vm.savedLocationError
+        ) {
+            VStack(alignment: .leading, spacing: 16) {
+                purePointControlsSection(isCompactSidebar: false)
+                ImportedGPXRouteSectionView(
+                    vm: vm,
+                    importError: gpxDropError ?? vm.gpxImportError,
+                    onImport: {
+                        vm.resetImportedGPXRouteSession()
+                        gpxDropError = nil
+                        vm.gpxImportError = nil
+                        isImportingGPXRoute = true
+                    },
+                    onDropURLs: handleGPXDrop,
+                    onUse: { route in
+                        vm.useImportedGPXRoute(route)
+                    },
+                    onFocus: { route in
+                        focusImportedGPXRoute(route)
+                    },
+                    onRemove: { route in
+                        vm.removeImportedGPXRoute(route)
+                    }
+                )
+            }
+        } savedContent: {
+            SavedLocationSectionView(
+                preview: vm.currentSavableItemPreview,
+                items: sortedSavedLocations,
+                sortMode: savedLocationSortMode,
+                onSavePreview: { vm.prepareSaveCurrentSelection() },
+                onApply: { item in
+                    vm.applySavedLocation(item)
+                },
+                onFocus: { item in
+                    focusSavedLocation(item)
+                },
+                onRename: { item in
+                    vm.beginRenamingSavedLocation(item)
+                },
+                onDelete: { item in
+                    vm.removeSavedLocation(item)
+                }
+            )
+        }
+    }
+
+    var sortedSavedLocations: [SavedLocationItem] {
+        switch savedLocationSortMode {
+        case .createdAt:
+            return vm.savedLocations.sorted { $0.createdAt > $1.createdAt }
+        case .region:
+            return vm.savedLocations.sorted {
+                if $0.regionGroup.sortOrder != $1.regionGroup.sortOrder {
+                    return $0.regionGroup.sortOrder < $1.regionGroup.sortOrder
+                }
+                return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
+        case .kind:
+            return vm.savedLocations.sorted {
+                if $0.kind.sortOrder != $1.kind.sortOrder {
+                    return $0.kind.sortOrder < $1.kind.sortOrder
+                }
+                return $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
+        }
+    }
+
+    func focusSavedLocation(_ item: SavedLocationItem) {
+        guard !item.coordinates.isEmpty else { return }
+        cameraPosition = .region(vm.mapRegion(fitting: item.coordinates))
+    }
+
+    func handlePurePointDrop(_ urls: [URL]) -> Bool {
+        guard let validURLs = validatedDroppedFiles(
+            urls,
+            allowedExtension: "kml",
+            errorMessage: "這裡只能匯入 KML 檔案"
+        ) else {
+            return false
+        }
+
+        purePointDropError = nil
+        purePointImportError = nil
+        beginImportedPurePointOverlaySession(with: validURLs)
+        return true
+    }
+
+    func handleGPXDrop(_ urls: [URL]) -> Bool {
+        guard let validURLs = validatedDroppedFiles(
+            urls,
+            allowedExtension: "gpx",
+            errorMessage: "這裡只能匯入 GPX 檔案"
+        ) else {
+            return false
+        }
+
+        gpxDropError = nil
+        vm.gpxImportError = nil
+        vm.prepareImportedGPXRoutes(from: validURLs)
+        return true
+    }
+
+    private func validatedDroppedFiles(
+        _ urls: [URL],
+        allowedExtension: String,
+        errorMessage: String
+    ) -> [URL]? {
+        let localURLs = urls
+            .filter(\.isFileURL)
+            .map(\.standardizedFileURL)
+
+        let allValid = !localURLs.isEmpty && localURLs.allSatisfy {
+            $0.pathExtension.lowercased() == allowedExtension
+        }
+
+        guard allValid else {
+            if allowedExtension == "kml" {
+                purePointDropError = errorMessage
+            } else {
+                gpxDropError = errorMessage
+            }
+            return nil
+        }
+
+        return localURLs
+    }
+
+    var saveCurrentLocationSheet: some View {
+        let preview = vm.pendingSavedLocationPreview ?? vm.currentSavableItemPreview
+        return SavedLocationNamingSheet(
+            title: "儲存\(preview.kindDisplayName)",
+            subtitle: "正在儲存：\(preview.sourceLabel)的\(preview.kindDisplayName)。\(preview.summaryText)",
+            confirmTitle: preview.actionTitle,
+            errorText: vm.savedLocationError,
+            name: Binding(
+                get: { vm.pendingSavedLocationTitle },
+                set: { vm.pendingSavedLocationTitle = $0 }
+            ),
+            onCancel: { vm.cancelSaveCurrentSelection() },
+            onConfirm: { vm.confirmSaveCurrentSelection() }
+        )
+    }
+
+    func renameSavedLocationSheet(_ item: SavedLocationItem) -> some View {
+        SavedLocationNamingSheet(
+            title: "重新命名",
+            subtitle: "更新「\(item.title)」的顯示名稱。",
+            confirmTitle: "儲存名稱",
+            errorText: vm.savedLocationError,
+            name: Binding(
+                get: { vm.pendingSavedLocationTitle },
+                set: { vm.pendingSavedLocationTitle = $0 }
+            ),
+            onCancel: { vm.cancelRenameSavedLocation() },
+            onConfirm: { vm.confirmRenameSavedLocation() }
+        )
+    }
+
+    var importedGPXRouteNamingSheet: some View {
+        ImportedGPXRouteNamingSheet(
+            routes: vm.pendingImportedGPXRoutes,
+            titles: Binding(
+                get: { vm.pendingImportedGPXRouteTitles },
+                set: { vm.pendingImportedGPXRouteTitles = $0 }
+            ),
+            onCancel: vm.cancelImportedGPXRoutes,
+            onImport: vm.finalizeImportedGPXRoutes
+        )
+    }
+
+    func handleGPXRouteImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            gpxDropError = nil
+            vm.prepareImportedGPXRoutes(from: urls)
+        case .failure(let error):
+            vm.resetImportedGPXRouteSession()
+            vm.gpxImportError = error.localizedDescription
+        }
+    }
+
 }
