@@ -12,6 +12,13 @@
 
 ## 執行證據（持續更新，非結案）
 
+### main 整合測試版（2026-11-05）
+
+- 合入右欄版本 `4c94110` 後，補齊收藏測試的新版 worker process fixture，保留收藏操作不得中斷三裝置連線的斷言。
+- 具名整合 gate 51 項通過、0 失敗、0 跳過：DeviceWorker、ConnectionCRUD、DeviceGroup 非 Simulator 案例、Workflow、ImportedAndSavedLocation、CrossFeature。證據 `~/Downloads/paperclip-nonroot-integration-fixed.xcresult`。
+- 初次 gate 失敗包含收藏 fixture 漏遷移，以及未準備三台 Simulator 的環境前提；不將該次失敗隱藏，也不宣稱本次 51 項是完整 suite 或真機驗收。完整 UI／Simulator 及實體連線由後續驗收補齊。
+- 使用者要求另存測試 App，不覆蓋 `/Applications/O.Paperclip.app`，不自動 push。
+
 ### 非 root 遷移分支地圖修正（2026-11-05）
 
 - `LiveMapQAUITests.testImportedOverlayToggleCategoryFocusAndRestoredAnnotationPositions` 完整通過，未刪除開關／分類／平移／縮放／重啟後兩點位置斷言；證據 `/tmp/paperclip-map-final-regression.xcresult`，exit 0。

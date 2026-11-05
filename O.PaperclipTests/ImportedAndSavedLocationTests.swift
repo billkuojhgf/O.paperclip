@@ -97,7 +97,7 @@ struct ImportedAndSavedLocationTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let endpoint = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("SimulatorEvidence/device_endpoint.py")
         let devices = (0..<3).map { index in
-            let device = DeviceManager(settingsKey: "saved-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", endpoint.path, root.path])
+            let device = DeviceManager(settingsKey: "saved-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", endpoint.path, root.path], dvtStream: DVTLocationStream(command: ["/usr/bin/python3", endpoint.path, root.path, "worker"]))
             device.tunnelUDID = "phone-\(index)"
             return device
         }
