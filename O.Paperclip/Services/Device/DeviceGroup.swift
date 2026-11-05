@@ -77,6 +77,15 @@ final class DeviceGroup: ObservableObject, DeviceControlling {
                 if self.generation == current { self.connecting = false; self.connectionTask = nil }
             }
             do {
+                if !self.devices[0].isConnected && (!self.manualRsdHost.isEmpty || !self.manualRsdPort.isEmpty) {
+                    try await self.devices[0].connectDeviceAsync()
+                    try Task.checkCancellation()
+                    guard self.generation == current else { return }
+                    if self.streaming { self.devices[0].startContinuousLocationStream() }
+                    if let coordinate = self.lastCoordinate {
+                        try await self.devices[0].sendLocationToDeviceAsync(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                    }
+                }
                 let identifiers = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
                     self.devices[0].discoverDeviceIdentifiers { continuation.resume(with: $0) }
                 }
@@ -86,11 +95,12 @@ final class DeviceGroup: ObservableObject, DeviceControlling {
                 var seen = occupied
                 let candidates = identifiers.filter { !$0.isEmpty && seen.insert($0).inserted }
                 let slots = self.devices.filter { !$0.isConnected }
+                guard !slots.isEmpty else { self.operationError = "最多只能連線三台裝置。"; return }
                 guard !candidates.isEmpty else {
+                    if self.devices[0].activeConnectionLabel == "手動 RSD" { return }
                     self.operationError = self.isConnected ? "沒有新的可連線裝置。" : "未找到可連線的裝置。"
                     return
                 }
-                guard !slots.isEmpty else { self.operationError = "最多只能連線三台裝置。"; return }
                 for (device, identifier) in zip(slots, candidates) {
                     try Task.checkCancellation()
                     guard self.generation == current else { return }

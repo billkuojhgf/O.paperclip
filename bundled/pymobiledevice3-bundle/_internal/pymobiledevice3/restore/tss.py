@@ -3,6 +3,7 @@ import logging
 import plistlib
 import typing
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from uuid import uuid4
 
 import asn1
@@ -12,6 +13,39 @@ from pymobiledevice3.exceptions import PyMobileDevice3Exception, TSSError
 from pymobiledevice3.restore.img4 import COMPONENT_FOURCC
 from pymobiledevice3.utils import bytes_to_uint, plist_access_path
 
+# Use the following `defaults write` to easily sniff Apple Configurator:
+#
+# ```shell
+# defaults write com.apple.configurator.ui AuthInstallSigningServerURL http://gs.apple.com:80
+# defaults write com.apple.configurator.xpc.DeviceService AuthInstallSigningServerURL http://gs.apple.com:80
+# defaults write com.apple.AMPDevicesAgent AuthInstallSigningServerURL http://gs.apple.com:80
+# ```
+#
+# CoreDevice (Xcode / `devicectl`) does not use `AuthInstallSigningServerURL`. Its equivalent knob
+# is `ddiSigningServer`, alongside `mountCryptexDDI(... signingServerURL: ...)` in
+# CoreDevice.framework:
+#
+# ```shell
+# defaults write com.apple.CoreDevice.CoreDeviceService ddiSigningServer http://gs.apple.com:80
+# ```
+#
+# That redirect does not help in practice, though: CoreDevice caches the personalization ticket, so
+# repeated DDI installs make no TSS request at all (verified with tcpdump -- zero packets to
+# gs.apple.com while `devicectl` reinstalled the cryptex). No user-readable on-disk ticket cache was
+# found to invalidate, and neither nonce-roll routine actually rolls a domain, so the cache cannot
+# be forced to miss either. MITM is no better: gs.apple.com is pinned, and mitmproxy only gets
+# "Server TLS handshake failed / self-signed certificate in certificate chain".
+#
+# Read the request out of the unified log instead. `CoreDeviceService` logs the whole dictionary it
+# is about to sign, verbatim, under `com.apple.libcryptex:scrivener` -- run a DDI install and then:
+#
+# ```shell
+# log show --last 5m --info --debug --predicate 'process == "CoreDeviceService"' \
+#     | awk '/tss request = \{/,/^\}/'
+# ```
+#
+# This is how `TSSRequest.add_cryptex1_tags` was derived; the device side is equally chatty, so
+# streaming its syslog filtered to the `cryptex` subsystem explains rejections a key at a time.
 TSS_CONTROLLER_ACTION_URL = "http://gs.apple.com/TSS/controller?action=2"
 
 TSS_CLIENT_VERSION_STRING = "libauthinstall-1104.0.9"
@@ -19,7 +53,19 @@ TSS_CLIENT_VERSION_STRING = "libauthinstall-1104.0.9"
 logger = logging.getLogger(__name__)
 
 
-def get_with_or_without_comma(obj: dict, k: str, default=None):
+def cryptex1_udid(chip_instance: dict[str, typing.Any]) -> bytes:
+    """Build the ``Cryptex1,UDID`` identifying the device in a Cryptex1 TSS request.
+
+    It is the 16-byte concatenation of the chip ID and the ECID, both big-endian, and ends up in
+    the signed ticket verbatim as the ``UDID`` property.
+
+    :param chip_instance: the device's AppleImage4 chip instance, as returned by
+        `CryptexdService.read_personalization_identifiers`.
+    """
+    return chip_instance["img4_chip_chip"].to_bytes(8, "big") + chip_instance["img4_chip_ecid"].to_bytes(8, "big")
+
+
+def get_with_or_without_comma(obj: dict[str, typing.Any], k: str, default: typing.Any = None) -> typing.Any:
     val = obj.get(k, obj.get(k.replace(",", "")))
     if val is None and default is not None:
         val = default
@@ -27,7 +73,7 @@ def get_with_or_without_comma(obj: dict, k: str, default=None):
 
 
 def is_fw_payload(info: dict[str, typing.Any]) -> bool:
-    return (
+    return bool(
         info.get("IsFirmwarePayload")
         or info.get("IsSecondaryFirmwarePayload")
         or info.get("IsFUDFirmware")
@@ -38,13 +84,13 @@ def is_fw_payload(info: dict[str, typing.Any]) -> bool:
     )
 
 
-class TSSResponse(dict):
+class TSSResponse(dict[str, typing.Any]):
     @property
     def ap_img4_ticket(self):
         ticket = self.get("ApImg4Ticket")
 
         if ticket is None:
-            raise PyMobileDevice3Exception("TSS response doesn't contain a ApImg4Ticket")
+            raise PyMobileDevice3Exception("The TSS response does not contain an ApImg4Ticket.")
 
         return ticket
 
@@ -69,7 +115,9 @@ class TSSRequest:
         }
 
     @staticmethod
-    def apply_restore_request_rules(tss_entry: dict, parameters: dict, rules: list) -> dict:
+    def apply_restore_request_rules(
+        tss_entry: dict[str, typing.Any], parameters: dict[str, typing.Any], rules: list[dict[str, typing.Any]]
+    ) -> dict[str, typing.Any]:
         for rule in rules:
             conditions_fulfilled = True
             conditions = rule["Conditions"]
@@ -106,13 +154,56 @@ class TSSRequest:
                     tss_entry[key] = value
         return tss_entry
 
-    def add_tags(self, parameters: dict):
+    def _copy_uint_values(self, parameters: dict[str, typing.Any], keys: typing.Iterable[str]) -> None:
+        """Copy each of ``keys`` from the device's parameters, as an int when the device sent bytes."""
+        for key in keys:
+            value = get_with_or_without_comma(parameters, key)
+            self._request[key] = bytes_to_uint(value) if isinstance(value, bytes) else value
+
+    def _copy_bool_values(self, parameters: dict[str, typing.Any], keys: typing.Iterable[str]) -> None:
+        """Copy each of ``keys`` from the device's parameters (a byte-encoded flag) as a bool."""
+        for key in keys:
+            self._request[key] = bytes_to_uint(get_with_or_without_comma(parameters, key)) == 1
+
+    def _add_manifest_entries(self, parameters: dict[str, typing.Any], prefix: str) -> None:
+        """Add the build identity's ``prefix`` components to the request, with their RestoreRequestRules
+        applied; a Trusted component gets an empty Digest when it has none."""
+        for comp_name, node in parameters["Manifest"].items():
+            if not comp_name.startswith(prefix):
+                continue
+            manifest_entry = dict(node)
+            rules = manifest_entry["Info"].get("RestoreRequestRules")
+            if rules is not None:
+                self.apply_restore_request_rules(manifest_entry, parameters, rules)
+            if manifest_entry.get("Trusted", False) and manifest_entry.get("Digest") is None:
+                logger.debug(f"No Digest data, using empty value for entry {comp_name}")
+                manifest_entry["Digest"] = b""
+            manifest_entry.pop("Info")
+            self._request[comp_name] = manifest_entry
+
+    def add_tags(self, parameters: dict[str, typing.Any]):
         for key, value in parameters.items():
             if isinstance(value, str) and value.startswith("0x"):
                 value = int(value, 16)
             self._request[key] = value
 
-    def add_common_tags(self, parameters: dict, overrides=None):
+    def setdefault_tags(self, parameters: dict[str, typing.Any]) -> list[str]:
+        """Add the entries whose key is not in the request yet; returns the keys that were added."""
+        added: list[str] = []
+        for key, value in parameters.items():
+            if key in self._request:
+                continue
+            self._request[key] = value
+            added.append(key)
+        return added
+
+    def tags(self) -> dict[str, typing.Any]:
+        """A copy of the request as it would be posted."""
+        return dict(self._request)
+
+    def add_common_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         keys = ("ApECID", "UniqueBuildID", "ApChipID", "ApBoardID", "ApSecurityDomain")
         for k in keys:
             if k in parameters:
@@ -120,7 +211,9 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_ap_recovery_tags(self, parameters: dict, overrides=None):
+    def add_ap_recovery_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         skip_keys = (
             "BasebandFirmware",
             "SE,UpdatePayload",
@@ -194,7 +287,9 @@ class TSSRequest:
         if overrides:
             self._request.update(overrides)
 
-    def add_timer_tags(self, parameters: dict, overrides=None):
+    def add_timer_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         manifest = parameters["Manifest"]
 
         # add tags indicating we want to get the Timer ticket
@@ -226,10 +321,10 @@ class TSSRequest:
         )
 
         for key in keys_to_copy_bool:
-            value = parameters.get(key)
+            value = typing.cast(bytes, parameters.get(key))
             self._request[key] = bytes_to_uint(value) == 1
 
-        nonce = parameters.get(parameters, f"Timer,Nonce,{tag}")
+        nonce = parameters.get(f"Timer,Nonce,{tag}")
 
         if nonce is not None:
             self._request[f"Timer,Nonce,{tag}"] = nonce
@@ -262,7 +357,7 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_local_policy_tags(self, parameters: dict):
+    def add_local_policy_tags(self, parameters: dict[str, typing.Any]):
         self._request["@ApImg4Ticket"] = True
 
         keys_to_copy = (
@@ -287,7 +382,21 @@ class TSSRequest:
                     v = int(v, 16)
                 self._request[k] = v
 
-    def add_vinyl_tags(self, parameters: dict, overrides=None):
+    def add_vinyl_prefetch_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
+        # Prefetch shim for Vinyl/eUICC: PreflightInfo nests the Gold/Main nonces under
+        # eUICC,Gold / eUICC,Main, but add_vinyl_tags reads them from the flat
+        # EUICCGoldNonce / EUICCMainNonce params (the recovery.py AP-batch path sets these).
+        for nested, flat in (("eUICC,Gold", "EUICCGoldNonce"), ("eUICC,Main", "EUICCMainNonce")):
+            node = parameters.get(nested)
+            if isinstance(node, dict) and typing.cast(dict[str, typing.Any], node).get("Nonce") is not None:
+                parameters.setdefault(flat, typing.cast(dict[str, typing.Any], node)["Nonce"])
+        self.add_vinyl_tags(parameters, overrides)
+
+    def add_vinyl_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         self._request["@BBTicket"] = True
         self._request["@eUICC,Ticket"] = True
 
@@ -301,12 +410,16 @@ class TSSRequest:
                 self._request[k] = parameters[k]
 
         if self._request.get("eUICC,Gold") is None:
-            n = plist_access_path(parameters, ("Manifest", "eUICC,Gold"))
+            n = typing.cast(
+                typing.Optional[dict[str, typing.Any]], plist_access_path(parameters, ("Manifest", "eUICC,Gold"))
+            )
             if n:
                 self._request["eUICC,Gold"] = {"Digest": n["Digest"]}
 
         if self._request.get("eUICC,Main") is None:
-            n = plist_access_path(parameters, ("Manifest", "eUICC,Main"))
+            n = typing.cast(
+                typing.Optional[dict[str, typing.Any]], plist_access_path(parameters, ("Manifest", "eUICC,Main"))
+            )
             if n:
                 self._request["eUICC,Main"] = {"Digest": n["Digest"]}
 
@@ -327,7 +440,57 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_ap_tags(self, parameters: dict, overrides=None):
+    def add_cryptex1_tags(
+        self,
+        build_identity: dict[str, typing.Any],
+        chip_instance: dict[str, typing.Any],
+        nonce: bytes,
+    ) -> None:
+        """Build a Cryptex1 personalization request (``@Cryptex1,Ticket``).
+
+        Cryptex1 tickets are a different shape from the AP tickets `add_ap_tags` produces, which is
+        why that method skips every ``Cryptex1,*`` key. The device is identified by
+        ``Cryptex1,UDID`` alone — none of the ``Ap*`` tags an AP request carries appear here — and
+        each personalized component contributes nothing but its ``Digest``. The generic DMG is
+        declared ``Personalize: False`` in the build manifest and is left out entirely.
+
+        The exact shape was taken from Xcode: ``CoreDeviceService`` logs the dictionary it is about
+        to sign under the ``com.apple.libcryptex:scrivener`` subsystem, so a DDI install can be
+        observed with::
+
+            log show --last 5m --info --debug --predicate 'process == "CoreDeviceService"'
+
+        :param build_identity: the build identity whose ``Info.Variant`` names a cryptex, i.e. the
+            one carrying ``Cryptex1,*`` manifest entries.
+        :param chip_instance: the device's AppleImage4 chip instance, as returned by
+            `CryptexdService.read_personalization_identifiers`.
+        :param nonce: the cryptex nonce for the identity's ``Cryptex1,NonceDomain``.
+        """
+        self._request.update({
+            "@Cryptex1,Ticket": True,
+            "Cryptex1,ChipID": int(str(build_identity["Cryptex1,ChipID"]), 0),
+            "Cryptex1,Type": build_identity["Cryptex1,Type"],
+            "Cryptex1,SubType": build_identity["Cryptex1,SubType"],
+            "Cryptex1,ProductClass": int(str(build_identity["Cryptex1,ProductClass"]), 0),
+            "Cryptex1,UseProductClass": build_identity["Cryptex1,UseProductClass"],
+            "Cryptex1,NonceDomain": build_identity["Cryptex1,NonceDomain"],
+            "Cryptex1,Version": build_identity["Cryptex1,Version"],
+            "Cryptex1,PreauthorizationVersion": build_identity["Cryptex1,PreauthorizationVersion"],
+            "Cryptex1,Nonce": nonce,
+            "Cryptex1,ProductionMode": bool(chip_instance["img4_chip_cpro"]),
+            "Cryptex1,UDID": cryptex1_udid(chip_instance),
+            "Cryptex1,UniqueTagList": b"",
+        })
+
+        for key, manifest_entry in build_identity["Manifest"].items():
+            if not key.startswith("Cryptex1,"):
+                continue
+            if not manifest_entry.get("Info", {}).get("Personalize", False):
+                logger.debug(f"skipping {key} as it is not personalized")
+                continue
+            self._request[key] = {"Digest": manifest_entry["Digest"]}
+
+    def add_ap_tags(self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None):
         """loop over components from build manifest"""
 
         manifest_node = parameters["Manifest"]
@@ -385,12 +548,12 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_ap_img3_tags(self, parameters: dict):
+    def add_ap_img3_tags(self, parameters: dict[str, typing.Any]):
         if "ApNonce" in parameters:
             self._request["ApNonce"] = parameters["ApNonce"]
         self._request["@APTicket"] = True
 
-    def add_ap_img4_tags(self, parameters):
+    def add_ap_img4_tags(self, parameters: dict[str, typing.Any]):
         keys_to_copy = (
             "ApNonce",
             "ApProductionMode",
@@ -437,7 +600,40 @@ class TSSRequest:
             # Workaround: We have only seen Ap,SikaFuse together with UID_MODE
             self._request["Ap,SikaFuse"] = 0
 
-    def add_se_tags(self, parameters: dict, overrides=None):
+    def add_se2_tags(self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None):
+        # Modern Secure Enclave personalization (A19 / iOS 27+). The device generates an
+        # @SE2,Ticket request (response key "SE2,Ticket"), NOT the legacy @SE,Ticket of
+        # add_se_tags. Confirmed by a ramrod capture on iPhone 18,4: the
+        # DeviceGeneratedRequest carries the SE,ChipID/ID/Nonce/RootKeyIdentifier device
+        # fields plus the SE,RapRTKitOS / SE,RapSwBinDsp (Digest) and SE,UpdatePayload
+        # (Production/Development hash) manifest components.
+        manifest = parameters["Manifest"]
+
+        self._request["@BBTicket"] = True
+        self._request["@SE2,Ticket"] = True
+
+        for key in ("SE,ChipID", "SE,ID", "SE,Nonce", "SE,RootKeyIdentifier"):
+            value = get_with_or_without_comma(parameters, key)
+            if value is not None:
+                self._request[key] = value
+
+        is_dev = bool(parameters.get("SE,IsDev", parameters.get("SEIsDev", False)))
+
+        for comp in ("SE,RapRTKitOS", "SE,RapSwBinDsp"):
+            node = manifest.get(comp)
+            if node is not None and "Digest" in node:
+                self._request[comp] = {"Digest": node["Digest"]}
+
+        payload = manifest.get("SE,UpdatePayload")
+        if payload is not None:
+            hash_key = "DevelopmentUpdatePayloadHash" if is_dev else "ProductionUpdatePayloadHash"
+            if hash_key in payload:
+                self._request["SE,UpdatePayload"] = {hash_key: payload[hash_key]}
+
+        if overrides is not None:
+            self._request.update(overrides)
+
+    def add_se_tags(self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None):
         manifest = parameters["Manifest"]
 
         # add tags indicating we want to get the SE,Ticket
@@ -502,7 +698,12 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_savage_tags(self, parameters: dict, overrides=None, component_name=None):
+    def add_savage_tags(
+        self,
+        parameters: dict[str, typing.Any],
+        overrides: typing.Optional[dict[str, typing.Any]] = None,
+        component_name: typing.Optional[str] = None,
+    ):
         manifest = parameters["Manifest"]
 
         # add tags indicating we want to get the Savage,Ticket
@@ -554,7 +755,9 @@ class TSSRequest:
 
         return comp_name
 
-    def add_yonkers_tags(self, parameters: dict, overrides=None):
+    def add_yonkers_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         manifest = parameters["Manifest"]
 
         # add tags indicating we want to get the Yonkers,Ticket
@@ -585,15 +788,18 @@ class TSSRequest:
         result_comp_name = None
 
         for comp_name, node in manifest.items():
-            if not comp_name.startswith("Yonkers,"):
+            # Only Yonkers,SysTopPatch* is eligible: other Yonkers,* entries (e.g. the
+            # Yonkers,SepObject added in iOS 27) carry neither EPRO nor FabRevision, so
+            # they'd pass the filters below and shadow the correct component.
+            if not comp_name.startswith("Yonkers,SysTopPatch"):
                 continue
 
             target_node = 1
             sub_node = node.get("EPRO")
-            if sub_node:
+            if sub_node is not None:
                 target_node &= sub_node if isprod else not sub_node
             sub_node = node.get("FabRevision")
-            if sub_node:
+            if sub_node is not None:
                 target_node &= sub_node == fabrevision
 
             if target_node:
@@ -601,8 +807,10 @@ class TSSRequest:
                 result_comp_name = comp_name
                 break
 
-        if comp_node is None:
-            raise PyMobileDevice3Exception(f"No Yonkers node for {isprod}/{fabrevision}")
+        if comp_node is None or result_comp_name is None:
+            raise PyMobileDevice3Exception(
+                f"The build manifest has no Yonkers firmware for this device (production: {isprod}, fab revision: {fabrevision})."
+            )
 
         # add Yonkers,SysTopPatch
         comp_dict = dict(comp_node)
@@ -614,7 +822,9 @@ class TSSRequest:
 
         return result_comp_name
 
-    def add_baseband_tags(self, parameters: dict, overrides=None):
+    def add_baseband_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         self._request["@BBTicket"] = True
 
         keys_to_copy = (
@@ -656,9 +866,9 @@ class TSSRequest:
         if overrides:
             self._request.update(overrides)
 
-    def add_rose_tags(self, parameters: dict, overrides: typing.Optional[dict] = None):
-        manifest = parameters["Manifest"]
-
+    def add_rose_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         # add tags indicating we want to get the Rap,Ticket
         self._request["@BBTicket"] = True
         self._request["@Rap,Ticket"] = True
@@ -670,67 +880,128 @@ class TSSRequest:
             "Rap,SecurityDomain",
         )
 
-        for key in keys_to_copy_uint:
-            value = get_with_or_without_comma(parameters, key)
-
-            if isinstance(value, bytes):
-                self._request[key] = bytes_to_uint(value)
-            else:
-                self._request[key] = value
+        self._copy_uint_values(parameters, keys_to_copy_uint)
 
         keys_to_copy_bool = (
             "Rap,ProductionMode",
             "Rap,SecurityMode",
         )
 
-        for key in keys_to_copy_bool:
-            value = get_with_or_without_comma(parameters, key)
-            self._request[key] = bytes_to_uint(value) == 1
+        self._copy_bool_values(parameters, keys_to_copy_bool)
 
         nonce = get_with_or_without_comma(parameters, "Rap,Nonce")
         if nonce is not None:
             self._request["Rap,Nonce"] = nonce
 
-        digest = get_with_or_without_comma(parameters, "Rap,FdrRootCaDigest")
-        if digest is not None:
-            self._request["Rap,FdrRootCaDigest"] = digest
+        # restored always sends this one, empty when the device has no FDR root CA digest
+        # (ramrod capture, iPhone18,4 / iOS 27.0); PreflightInfo does not expose it.
+        self._request["Rap,FdrRootCaDigest"] = get_with_or_without_comma(parameters, "Rap,FdrRootCaDigest") or b""
 
-        for comp_name, node in manifest.items():
-            if not comp_name.startswith("Rap,"):
-                continue
-
-            manifest_entry = dict(node)
-
-            # handle RestoreRequestRules
-            rules = manifest_entry["Info"].get("RestoreRequestRules")
-            if rules is not None:
-                self.apply_restore_request_rules(manifest_entry, parameters, rules)
-
-            # Make sure we have a Digest key for Trusted items even if empty
-            trusted = manifest_entry.get("Trusted", False)
-
-            if trusted:
-                digest = manifest_entry.get("Digest")
-                if digest is None:
-                    logger.debug(f"No Digest data, using empty value for entry {comp_name}")
-                    manifest_entry["Digest"] = b""
-
-            manifest_entry.pop("Info")
-
-            # finally add entry to request
-            self._request[comp_name] = manifest_entry
+        self._add_manifest_entries(parameters, "Rap,")
 
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_veridian_tags(self, parameters: dict, overrides: typing.Optional[dict] = None):
-        manifest = parameters["Manifest"]
+    def add_centauri_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
+        # Centauri (the converged Wi-Fi/BT/UWB coprocessor) is personalized exactly like
+        # Rose/Rap: same Wireless1,* field set and the same @Wireless1,Ticket flag. Confirmed
+        # by reversing libCentauriUpdater.dylib (response key "Wireless1,Ticket") and
+        # libauthinstall.dylib (request flag "@Wireless1,Ticket", Wireless1,FdrRootCaDigest).
+        # add tags indicating we want to get the Wireless1,Ticket
+        self._request["@BBTicket"] = True
+        self._request["@Wireless1,Ticket"] = True
 
+        keys_to_copy_uint = (
+            "Wireless1,BoardID",
+            "Wireless1,ChipID",
+            "Wireless1,ECID",
+            "Wireless1,SecurityDomain",
+        )
+
+        self._copy_uint_values(parameters, keys_to_copy_uint)
+
+        keys_to_copy_bool = (
+            "Wireless1,ProductionMode",
+            "Wireless1,SecurityMode",
+        )
+
+        self._copy_bool_values(parameters, keys_to_copy_bool)
+
+        nonce = get_with_or_without_comma(parameters, "Wireless1,Nonce")
+        if nonce is not None:
+            self._request["Wireless1,Nonce"] = nonce
+
+        # restored always includes these two even though PreflightInfo doesn't expose them
+        # (ramrod capture: Wireless1,FdrRootCaDigest = b'', Wireless1,UID_MODE = False).
+        self._request["Wireless1,FdrRootCaDigest"] = (
+            get_with_or_without_comma(parameters, "Wireless1,FdrRootCaDigest") or b""
+        )
+        self._request["Wireless1,UID_MODE"] = bool(get_with_or_without_comma(parameters, "Wireless1,UID_MODE") or False)
+        # ... and the build's UniqueBuildID (same capture).
+        unique_build_id = parameters.get("UniqueBuildID")
+        if unique_build_id is not None:
+            self._request["UniqueBuildID"] = unique_build_id
+
+        self._add_manifest_entries(parameters, "Wireless1,")
+
+        if overrides is not None:
+            self._request.update(overrides)
+
+    def add_cellular_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
+        # A19 baseband personalization: device-generated @Cellular1,Ticket (response key
+        # "Cellular1,Ticket"), structured like Rose/Centauri over the Cellular1,* field set
+        # (ramrod capture on iPhone 18,4). The Bb*ManifestKeyHash fields come from the
+        # baseband firmware-preflight info when available.
+        self._request["@BBTicket"] = True
+        self._request["@Cellular1,Ticket"] = True
+
+        for key in ("Cellular1,BoardID", "Cellular1,ChipID", "Cellular1,ECID", "Cellular1,SecurityDomain"):
+            value = get_with_or_without_comma(parameters, key)
+            if isinstance(value, bytes):
+                self._request[key] = bytes_to_uint(value)
+            elif value is not None:
+                self._request[key] = value
+
+        for key in ("Cellular1,ProductionMode", "Cellular1,SecurityMode", "Cellular1,UID_MODE"):
+            value = get_with_or_without_comma(parameters, key)
+            if value is not None:
+                self._request[key] = bytes_to_uint(value) == 1
+
+        nonce = get_with_or_without_comma(parameters, "Cellular1,Nonce")
+        if nonce is not None:
+            self._request["Cellular1,Nonce"] = nonce
+
+        # The key hashes are the build identity's bare Bb* entries; restored sends them under the
+        # Cellular1 prefix, with an empty FDR security key hash when there is none (ramrod capture).
+        for key in ("BbActivationManifestKeyHash", "BbProvisioningManifestKeyHash", "BbFDRSecurityKeyHash"):
+            value = parameters.get(f"Cellular1,{key}", parameters.get(key))
+            if value is None and key == "BbFDRSecurityKeyHash":
+                value = b""
+            if value is not None:
+                self._request[f"Cellular1,{key}"] = value
+
+        self._add_manifest_entries(parameters, "Cellular1,")
+
+        if overrides is not None:
+            self._request.update(overrides)
+
+    def add_veridian_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         # add tags indicating we want to get the Rap,Ticket
         self._request["@BBTicket"] = True
         self._request["@BMU,Ticket"] = True
 
         self._request["BMU,ChipID"] = parameters["ChipID"]
+        # restored's own request carries the board id from the build identity (ramrod capture,
+        # iPhone18,4 / iOS 27.0); without it the prefetched request never matches exactly.
+        board_id = parameters.get("BMU,BoardID")
+        if board_id is not None:
+            self._request["BMU,BoardID"] = board_id
         self._request["BMU,UniqueID"] = parameters["UniqueID"]
         self._request["BMU,ProductionMode"] = parameters["ProductionMode"]
 
@@ -738,35 +1009,14 @@ class TSSRequest:
         if nonce is not None:
             self._request["BMU,Nonce"] = nonce
 
-        for comp_name, node in manifest.items():
-            if not comp_name.startswith("BMU,"):
-                continue
-
-            manifest_entry = dict(node)
-
-            # handle RestoreRequestRules
-            rules = manifest_entry["Info"].get("RestoreRequestRules")
-            if rules is not None:
-                self.apply_restore_request_rules(manifest_entry, parameters, rules)
-
-            # Make sure we have a Digest key for Trusted items even if empty
-            trusted = manifest_entry.get("Trusted", False)
-
-            if trusted:
-                digest = manifest_entry.get("Digest")
-                if digest is None:
-                    logger.debug(f"No Digest data, using empty value for entry {comp_name}")
-                    manifest_entry["Digest"] = b""
-
-            manifest_entry.pop("Info")
-
-            # finally add entry to request
-            self._request[comp_name] = manifest_entry
+        self._add_manifest_entries(parameters, "BMU,")
 
         if overrides is not None:
             self._request.update(overrides)
 
-    def add_tcon_tags(self, parameters: dict, overrides: typing.Optional[dict] = None):
+    def add_tcon_tags(
+        self, parameters: dict[str, typing.Any], overrides: typing.Optional[dict[str, typing.Any]] = None
+    ):
         manifest = parameters["Manifest"]
 
         # add tags indicating we want to get the Baobab,Ticket
@@ -781,13 +1031,7 @@ class TSSRequest:
             "Baobab,SecurityDomain",
         )
 
-        for key in keys_to_copy_uint:
-            value = get_with_or_without_comma(parameters, key)
-
-            if isinstance(value, bytes):
-                self._request[key] = bytes_to_uint(value)
-            else:
-                self._request[key] = value
+        self._copy_uint_values(parameters, keys_to_copy_uint)
 
         isprod = bool(get_with_or_without_comma(parameters, "Baobab,ProductionMode", False))
         self._request["Baobab,ProductionMode"] = isprod
@@ -816,7 +1060,7 @@ class TSSRequest:
         if overrides is not None:
             self._request.update(overrides)
 
-    def img4_create_local_manifest(self, build_identity=None):
+    def img4_create_local_manifest(self, build_identity: typing.Optional[typing.Mapping[str, typing.Any]] = None):
         manifest = None
         if build_identity is not None:
             manifest = build_identity["Manifest"]
@@ -878,7 +1122,7 @@ class TSSRequest:
         if key in self._request:
             self._request.pop(key)
 
-    def update(self, options) -> None:
+    def update(self, options: dict[str, typing.Any]) -> None:
         self._request.update(options)
 
     async def send_receive(self) -> TSSResponse:
@@ -886,7 +1130,7 @@ class TSSRequest:
             "Cache-Control": "no-cache",
             "Content-type": 'text/xml; charset="utf-8"',
             "User-Agent": "InetURL/1.0",
-            "Expect": "",
+            "Expect": "100-continue",
         }
 
         logger.info("Sending TSS request...")
@@ -907,6 +1151,168 @@ class TSSRequest:
 
         message = content.split(b"MESSAGE=", 1)[1].split(b"&", 1)[0].decode()
         if message != "SUCCESS":
-            raise TSSError(f"server replied: {message}")
+            raise TSSError(f"Apple's signing server (TSS) refused the request: {message}")
 
         return TSSResponse(plistlib.loads(content.split(b"REQUEST_STRING=", 1)[1]))
+
+
+@dataclass(frozen=True)
+class PrefetchVariant:
+    """One on-device shape of a prefetchable peripheral's TSS state.
+
+    A chip may expose more than one shape (e.g. Savage is a flat ``Savage,*`` entry on
+    older SoCs but a nested ``YonkersDeviceInfo`` on newer ones). Each shape is one
+    variant; they're tried in order and the first whose nonce is actually present on the
+    device wins. A chip with a single shape has exactly one variant.
+    """
+
+    # TSS response ticket key (e.g. ``"SE2,Ticket"``).
+    ticket_name: str
+    # the reactive ``TSSRequest`` helper that knows this chip's quirks; called as
+    # ``add_tags(tss, parameters, None)`` on a fresh ``TSSRequest`` instance.
+    add_tags: typing.Callable[..., typing.Any]
+    # nested key under the PreflightInfo entry holding this variant's state
+    # (``None`` -> the entry itself, e.g. flat ``Savage,*``).
+    preflight_subkey: typing.Optional[str] = None
+    # nonce field name in the PreflightInfo entry; mutually exclusive with ``nonce_path``.
+    preflight_nonce: typing.Optional[str] = None
+    # list-of-paths whose bytes concatenate into one composite nonce (e.g. Vinyl's
+    # ``eUICC,Gold.Nonce`` + ``eUICC,Main.Nonce``); mutually exclusive with ``preflight_nonce``.
+    nonce_path: typing.Optional[list[list[str]]] = None
+    # nonce field name in ``DataRequestMsg.DeviceGeneratedRequest`` at restore time
+    # (used by ``Restore._lookup_prefetched_tss_by_ticket`` for nonce-match).
+    devgen_nonce: typing.Optional[str] = None
+    # composite (list-of-paths) variant of ``devgen_nonce``.
+    devgen_nonce_path: typing.Optional[list[list[str]]] = None
+
+
+@dataclass(frozen=True)
+class PrefetchableUpdater:
+    """A peripheral whose TSS ticket can be prefetched in the batched ``--tss-batch`` POST."""
+
+    # cache key / log label for this updater (e.g. ``"SE"``, ``"Savage"``).
+    name: str
+    # where to find this updater's state in ``PreflightInfo.DeviceInfo``.
+    preflight_key: str
+    # candidate on-device shapes, tried in order (first whose nonce is present wins).
+    variants: list[PrefetchVariant]
+
+
+# Hardcoded set of peripherals whose tickets the batched --tss-batch prefetch fetches in a
+# single combined TSS POST. Each chip's reactive add_*_tags helper is reused so the batched
+# request's per-chip handling stays identical to the reactive path. Restore._merge_device_info
+# preserves the manifest's int values when merging in DeviceInfo (Savage,ChipID otherwise gets
+# clobbered with raw bytes and TSS responds with a misleading "not eligible" error).
+PREFETCHABLE_UPDATERS: tuple[PrefetchableUpdater, ...] = (
+    PrefetchableUpdater(
+        "SE",
+        "SE",
+        [
+            # Modern SoCs (A19/iOS 27+) request the SE2 ticket, not the legacy SE ticket
+            # (ramrod capture on iPhone 18,4: ResponseTags == ['SE2,Ticket']). The legacy
+            # add_se_tags path stays for the reactive pre-SE2 flow; the prefetch targets SE2.
+            PrefetchVariant(
+                ticket_name="SE2,Ticket",
+                add_tags=TSSRequest.add_se2_tags,
+                preflight_nonce="SE,Nonce",
+                devgen_nonce="SE,Nonce",
+            ),
+        ],
+    ),
+    PrefetchableUpdater(
+        "Rose",
+        "Rose",
+        [
+            PrefetchVariant(
+                ticket_name="Rap,Ticket",
+                add_tags=TSSRequest.add_rose_tags,
+                preflight_nonce="Rap,Nonce",
+                devgen_nonce="Rap,Nonce",
+            ),
+        ],
+    ),
+    PrefetchableUpdater(
+        "Centauri",
+        "Centauri",
+        [
+            # Converged Wi-Fi/BT/UWB coprocessor. Restore loads usr/lib/updaters/
+            # libCentauriUpdater.dylib for it; on iOS 18+ that flows through the generic
+            # DeviceGenerated path with response ticket "Wireless1,Ticket". Personalized
+            # identically to Rose/Rap (see add_centauri_tags).
+            PrefetchVariant(
+                ticket_name="Wireless1,Ticket",
+                add_tags=TSSRequest.add_centauri_tags,
+                preflight_nonce="Wireless1,Nonce",
+                devgen_nonce="Wireless1,Nonce",
+            ),
+        ],
+    ),
+    # Savage has two on-device shapes. Newer SoCs (e.g. A19 / iPhone Air) expose a
+    # nested YonkersDeviceInfo with Yonkers,* fields; older ones expose flat Savage,*
+    # fields. Mirror get_device_generated_firmware_data's branch (YonkersDeviceInfo
+    # present -> Yonkers ticket, else flat Savage ticket): try each variant and use
+    # the first whose nonce is actually present on this device.
+    PrefetchableUpdater(
+        "Savage",
+        "Savage",
+        [
+            PrefetchVariant(
+                ticket_name="Yonkers,Ticket",
+                add_tags=TSSRequest.add_yonkers_tags,
+                preflight_subkey="YonkersDeviceInfo",
+                preflight_nonce="Yonkers,Nonce",
+                devgen_nonce="Yonkers,Nonce",
+            ),
+            PrefetchVariant(
+                ticket_name="Savage,Ticket",
+                add_tags=TSSRequest.add_savage_tags,
+                preflight_nonce="Savage,Nonce",
+                devgen_nonce="Savage,Nonce",
+            ),
+        ],
+    ),
+    PrefetchableUpdater(
+        "T200",
+        "T200",
+        [
+            PrefetchVariant(
+                ticket_name="BMU,Ticket",
+                add_tags=TSSRequest.add_veridian_tags,
+                preflight_nonce="Nonce",
+                devgen_nonce="BMU,Nonce",
+            ),
+        ],
+    ),
+    PrefetchableUpdater(
+        "Vinyl",
+        "Vinyl",
+        [
+            # eUICC (eSIM). Fires its own device-generated eUICC,Ticket during restore
+            # (usr/lib/updaters/libVinylUpdater.dylib) in addition to the AP-batch copy.
+            # Its nonce is a PAIR — eUICC,Gold.Nonce + eUICC,Main.Nonce — so we use a
+            # composite nonce_path; tags are built from the top-level eUICC,* dict.
+            PrefetchVariant(
+                ticket_name="eUICC,Ticket",
+                add_tags=TSSRequest.add_vinyl_prefetch_tags,
+                nonce_path=[["eUICC,Gold", "Nonce"], ["eUICC,Main", "Nonce"]],
+                devgen_nonce_path=[["eUICC,Gold", "Nonce"], ["eUICC,Main", "Nonce"]],
+            ),
+        ],
+    ),
+    PrefetchableUpdater(
+        "Baseband",
+        "Baseband",
+        [
+            # A19 baseband fires a device-generated Cellular1,Ticket during restore
+            # (usr/lib/updaters/...). Prefetchable only when the baseband manifest-key
+            # hashes are available pre-restore; if TSS rejects (or they're absent) the
+            # per-chip fallback drops it to the reactive path.
+            PrefetchVariant(
+                ticket_name="Cellular1,Ticket",
+                add_tags=TSSRequest.add_cellular_tags,
+                preflight_nonce="Cellular1,Nonce",
+                devgen_nonce="Cellular1,Nonce",
+            ),
+        ],
+    ),
+)

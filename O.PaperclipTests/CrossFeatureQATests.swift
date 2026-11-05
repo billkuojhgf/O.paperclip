@@ -49,7 +49,7 @@ struct CrossFeatureQATests {
         }
         let script = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("SimulatorEvidence/device_endpoint.py")
         let group = DeviceGroup(devices: settingsKeys.map {
-            DeviceManager(settingsKey: $0, cliCommand: ["/usr/bin/python3", script.path, root.path])
+            DeviceManager(settingsKey: $0, cliCommand: ["/usr/bin/python3", script.path, root.path], dvtStream: DVTLocationStream(command: ["/usr/bin/python3", script.path, root.path, "worker"]))
         })
         // Reuse the process transport fixture; no physical device or privileged USB tunnel.
         group.isWirelessMode = true

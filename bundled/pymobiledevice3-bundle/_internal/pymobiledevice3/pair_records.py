@@ -5,12 +5,13 @@ import uuid
 from collections.abc import Generator
 from contextlib import suppress
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from pymobiledevice3 import usbmux
 from pymobiledevice3.common import get_home_folder
 from pymobiledevice3.exceptions import MuxException, NotPairedError
 from pymobiledevice3.osu.os_utils import get_os_utils
+from pymobiledevice3.safe_paths import device_file_path, validate_device_filename
 from pymobiledevice3.usbmux import PlistMuxConnection
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ def generate_host_id(hostname: Optional[str] = None) -> str:
     return str(host_id).upper()
 
 
-def get_usbmux_pairing_record(identifier: str, usbmux_address: Optional[str] = None):
+async def get_usbmux_pairing_record(identifier: str, usbmux_address: Optional[str] = None):
     """
     Retrieve the pairing record from usbmuxd.
 
@@ -44,15 +45,17 @@ def get_usbmux_pairing_record(identifier: str, usbmux_address: Optional[str] = N
     :return: The pairing record if found, otherwise None.
     :rtype: dict or None
     """
-    with suppress(NotPairedError, MuxException), usbmux.create_mux(usbmux_address=usbmux_address) as mux:
-        if isinstance(mux, PlistMuxConnection):
-            pair_record = mux.get_pair_record(identifier)
-            if pair_record is not None:
-                return pair_record
+    with suppress(NotPairedError, MuxException):
+        mux = await usbmux.create_mux(usbmux_address=usbmux_address)
+        try:
+            if isinstance(mux, PlistMuxConnection):
+                return await mux.get_pair_record(identifier)
+        finally:
+            await mux.close()
     return None
 
 
-def get_itunes_pairing_record(identifier: str) -> Optional[dict]:
+def get_itunes_pairing_record(identifier: str) -> Optional[dict[str, Any]]:
     """
     Retrieve the pairing record from iTunes.
 
@@ -61,7 +64,7 @@ def get_itunes_pairing_record(identifier: str) -> Optional[dict]:
     :return: The pairing record if found, otherwise None.
     :rtype: Optional[dict]
     """
-    filename = OSUTILS.pair_record_path / f"{identifier}.plist"
+    filename = device_file_path(OSUTILS.pair_record_path, identifier, ".plist")
     try:
         with open(filename, "rb") as f:
             pair_record = plistlib.load(f)
@@ -70,7 +73,7 @@ def get_itunes_pairing_record(identifier: str) -> Optional[dict]:
     return pair_record
 
 
-def get_local_pairing_record(identifier: str, pairing_records_cache_folder: Path) -> Optional[dict]:
+def get_local_pairing_record(identifier: str, pairing_records_cache_folder: Path) -> Optional[dict[str, Any]]:
     """
     Retrieve the pairing record from local storage.
 
@@ -82,16 +85,16 @@ def get_local_pairing_record(identifier: str, pairing_records_cache_folder: Path
     :rtype: Optional[dict]
     """
     logger.debug("Looking for pymobiledevice3 pairing record")
-    path = pairing_records_cache_folder / f"{identifier}.{PAIRING_RECORD_EXT}"
+    path = device_file_path(pairing_records_cache_folder, identifier, f".{PAIRING_RECORD_EXT}")
     if not path.exists():
         logger.debug(f"No pymobiledevice3 pairing record found for device {identifier}")
         return None
     return plistlib.loads(path.read_bytes())
 
 
-def get_preferred_pair_record(
+async def get_preferred_pair_record(
     identifier: str, pairing_records_cache_folder: Path, usbmux_address: Optional[str] = None
-) -> dict:
+) -> Optional[dict[str, Any]]:
     """
     Look for an existing pair record for the connected device in the following order:
     - usbmuxd
@@ -104,11 +107,11 @@ def get_preferred_pair_record(
     :type pairing_records_cache_folder: Path
     :param usbmux_address: The address of the usbmuxd server.
     :type usbmux_address: Optional[str], optional
-    :return: The preferred pairing record.
-    :rtype: dict
+    :return: The preferred pairing record, or None if no record was found.
+    :rtype: Optional[dict]
     """
     # usbmuxd
-    pair_record = get_usbmux_pairing_record(identifier=identifier, usbmux_address=usbmux_address)
+    pair_record = await get_usbmux_pairing_record(identifier=identifier, usbmux_address=usbmux_address)
     if pair_record is not None:
         return pair_record
 
@@ -148,7 +151,7 @@ def get_remote_pairing_record_filename(identifier: str) -> str:
     :return: The filename for the remote pairing record.
     :rtype: str
     """
-    return f"remote_{identifier}"
+    return f"remote_{validate_device_filename(identifier)}"
 
 
 def iter_remote_pair_records() -> Generator[Path, None, None]:
@@ -170,3 +173,18 @@ def iter_remote_paired_identifiers() -> Generator[str, None, None]:
     """
     for file in iter_remote_pair_records():
         yield file.parts[-1].split("remote_", 1)[1].split(".", 1)[0]
+
+
+def iter_remote_pair_records_by_identifier() -> Generator[tuple[str, Path, dict[str, Any]], None, None]:
+    """
+    Iterate over the remote pairing records in the home folder, loaded.
+
+    :return: A generator yielding ``(identifier, path, pair_record)`` for every readable remote pairing record.
+    :rtype: Generator[tuple[str, Path, dict[str, Any]], None, None]
+    """
+    for file in iter_remote_pair_records():
+        identifier = file.parts[-1].split("remote_", 1)[1].split(".", 1)[0]
+        try:
+            yield identifier, file, plistlib.loads(file.read_bytes())
+        except (OSError, plistlib.InvalidFileException):
+            logger.debug("skipping unreadable remote pairing record: %s", file)

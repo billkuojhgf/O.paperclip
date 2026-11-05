@@ -1,66 +1,67 @@
 import asyncio
 import difflib
+import enum
 import importlib
 import logging
 import os
 import re
+import shutil
 import sys
 import textwrap
-import traceback
 import warnings
-from collections.abc import Sequence
-from typing import Annotated, Optional, Union
+from typing import Annotated, Any, Callable, Optional, Union, cast
 
-import click
-import coloredlogs
+import ansilogs
 import typer
-import typer.core
+import typer_injector
 from packaging.version import Version
+from rich.console import Console
+from rich.traceback import Traceback
 from typer.core import TyperGroup
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import TUNNEL_ENV_VAR, isatty, set_color_flag, set_verbosity
+try:
+    import shellingham
+except ImportError:  # pragma: no cover
+    shellingham = None
+
+# Must precede the other first-party imports (isort keeps it first) so their dependency
+# chains are lazy on Python 3.15+; see the module docstring.
+import pymobiledevice3._lazy_imports  # noqa: F401
+from pymobiledevice3.cli import cli_common
+from pymobiledevice3.cli.cli_common import (
+    FORCE_TUNNEL_ENV_VAR,
+    NATIVE_ENV_VAR,
+    RECONNECT_ANY_ENV_VAR,
+    TUNNEL_ENV_VAR,
+    UDID_ENV_VAR,
+    USERSPACE_ENV_VAR,
+    _cli_udid,
+    default_transport_preference,
+    isatty,
+    resolved_udid,
+    set_color_flag,
+    set_verbosity,
+)
 from pymobiledevice3.exceptions import (
-    AccessDeniedError,
-    CloudConfigurationAlreadyPresentError,
     ConnectionFailedError,
     ConnectionFailedToUsbmuxdError,
-    DeprecationError,
-    DeveloperModeError,
-    DeveloperModeIsNotEnabledError,
-    DeviceHasPasscodeSetError,
+    ConnectionTerminatedError,
     DeviceNotFoundError,
-    FeatureNotSupportedError,
-    InternalError,
     InvalidServiceError,
-    MessageNotSupportedError,
-    MissingValueError,
     NoDeviceConnectedError,
-    NotEnoughDiskSpaceError,
-    NotPairedError,
-    OSNotSupportedError,
-    PairingDialogResponsePendingError,
-    PasswordRequiredError,
-    QuicProtocolNotSupportedError,
+    PyMobileDevice3Exception,
     RSDRequiredError,
-    SetProhibitedError,
-    StartServiceError,
-    TunneldConnectionError,
-    UserDeniedPairingError,
 )
-from pymobiledevice3.lockdown import create_using_usbmux, retry_create_using_usbmux
-from pymobiledevice3.osu.os_utils import get_os_utils
+from pymobiledevice3.lockdown import retry_create_using_usbmux
 
-coloredlogs.install(level=logging.INFO)
+ansilogs.install(logging.INFO)
 
-logging.getLogger("quic").disabled = True
-logging.getLogger("asyncio").disabled = True
-logging.getLogger("parso.cache").disabled = True
-logging.getLogger("parso.cache.pickle").disabled = True
-logging.getLogger("parso.python.diff").disabled = True
-logging.getLogger("humanfriendly.prompts").disabled = True
-logging.getLogger("blib2to3.pgen2.driver").disabled = True
-logging.getLogger("urllib3.connectionpool").disabled = True
+logging.getLogger("quic").setLevel(logging.CRITICAL + 1)
+logging.getLogger("asyncio").setLevel(logging.CRITICAL + 1)
+logging.getLogger("parso").setLevel(logging.CRITICAL + 1)
+logging.getLogger("blib2to3").setLevel(logging.CRITICAL + 1)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL + 1)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ if sys.platform == "win32":
 
 INVALID_SERVICE_MESSAGE = """Failed to start service. Possible reasons are:
 - If you were trying to access a developer service (developer subcommand):
-    - If your device iOS version >= 15.0:
+    - If your device iOS version >= 16.0:
         - Make sure you first enabled "Developer Mode" via:
           > python3 -m pymobiledevice3 amfi enable-developer-mode
 
@@ -80,8 +81,10 @@ INVALID_SERVICE_MESSAGE = """Failed to start service. Possible reasons are:
       > python3 -m pymobiledevice3 mounter auto-mount
 
     - If your device iOS version >= 17.0:
-        - Make sure you passed the --rsd option to the subcommand
-          https://github.com/doronz88/pymobiledevice3#working-with-developer-tools-ios--170
+        - An RSD tunnel is established automatically; no flag is needed.
+        - On Linux/Windows with iOS 17.0-17.3, a privileged tunneld must be running:
+          > sudo python3 -m pymobiledevice3 remote tunneld
+          https://doronz88.github.io/pymobiledevice3/guides/ios17-tunnels/
 
 - Apple removed this service, or your iOS version does not support it.
 
@@ -89,7 +92,7 @@ INVALID_SERVICE_MESSAGE = """Failed to start service. Possible reasons are:
   https://github.com/doronz88/pymobiledevice3/issues/new?assignees=&labels=&projects=&template=bug_report.md&title=
 """
 
-CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 400}
+CONTEXT_SETTINGS: dict[str, Any] = {"help_option_names": ["-h", "--help"], "max_content_width": 400}
 
 # Mapping of index options to import file names
 CLI_GROUPS = {
@@ -98,12 +101,16 @@ CLI_GROUPS = {
     "amfi": "amfi",
     "apps": "apps",
     "backup2": "backup",
+    "btlogger": "btlogger",
     "bonjour": "bonjour",
     "companion": "companion_proxy",
     "crash": "crash",
+    "cryptex": "cryptex",
     "developer": "developer",
     "diagnostics": "diagnostics",
+    "doctor": "doctor",
     "lockdown": "lockdown",
+    "mobilesync": "mobilesync",
     "mounter": "mounter",
     "notification": "notification",
     "pcap": "pcap",
@@ -123,19 +130,59 @@ CLI_GROUPS = {
 
 # Set if used the `--reconnect` option
 RECONNECT = False
+_ORIGINAL_SHELLINGHAM_DETECT: Optional[Callable[[], tuple[str, str]]] = None
+
+
+class ExitCode(enum.IntEnum):
+    """Process exit codes returned by `main()`."""
+
+    SUCCESS = 0
+    ERROR = 1
+    ABORTED = 130  # SIGINT convention: 128 + signal number
+
+
+def _detect_shell_for_completion() -> tuple[str, str]:
+    assert _ORIGINAL_SHELLINGHAM_DETECT is not None  # set by _patch_xonsh_completion_detection before use
+    shell, executable = _ORIGINAL_SHELLINGHAM_DETECT()
+    if shell == "xonsh":
+        return ("fish" if shutil.which("fish") else "bash"), executable
+    return shell, executable
+
+
+def _patch_xonsh_completion_detection() -> None:
+    """Let Typer install fish completions for xonsh when available, otherwise bash."""
+    global _ORIGINAL_SHELLINGHAM_DETECT
+
+    if shellingham is None:
+        return
+
+    detect_shell = cast(Any, shellingham).detect_shell
+    _ORIGINAL_SHELLINGHAM_DETECT = getattr(detect_shell, "_pymobiledevice3_original", detect_shell)
+    if getattr(detect_shell, "_pymobiledevice3_xonsh_patched", False):
+        return
+
+    # Stash the original detector on the replacement function so re-invocations are idempotent.
+    _detect_shell_for_completion._pymobiledevice3_original = _ORIGINAL_SHELLINGHAM_DETECT  # pyright: ignore[reportFunctionMemberAccess]
+    _detect_shell_for_completion._pymobiledevice3_xonsh_patched = True  # pyright: ignore[reportFunctionMemberAccess]
+    shellingham.detect_shell = _detect_shell_for_completion
+
+
+_patch_xonsh_completion_detection()
 
 
 class Pmd3TyperGroup(TyperGroup):
-    def list_commands(self, ctx: click.Context) -> list[str]:
+    # Typer vendors click privately (typer._click) and exposes no public alias for the runtime
+    # Command/Context classes, so click-typed parameters are annotated `Any` to stay on public API.
+    def list_commands(self, ctx: Any) -> list[str]:
         # Order is preserved by dict insertion; adjust if you want alphabetical
         return list(CLI_GROUPS.keys())
 
-    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command:
+    def get_command(self, ctx: Any, cmd_name: str):
         if cmd_name not in CLI_GROUPS:
             self.handle_invalid_command(ctx, cmd_name)
         return self.import_and_get_command(ctx, cmd_name)
 
-    def handle_invalid_command(self, ctx, name: str) -> None:
+    def handle_invalid_command(self, ctx: Any, name: str) -> None:
         suggested_commands = self.search_commands(name)
         suggestion = self.format_suggestions(suggested_commands)
         # ctx.fail raises a ClickException underneath, which Typer displays nicely
@@ -149,21 +196,26 @@ class Pmd3TyperGroup(TyperGroup):
         return f"\nDid you mean:\n{cmds}"
 
     @staticmethod
-    def import_and_get_command(ctx: click.Context, name: str) -> click.Command:
+    def import_and_get_command(ctx: Any, name: str):
         module_name = f"pymobiledevice3.cli.{CLI_GROUPS[name]}"
         mod = importlib.import_module(module_name)
         # submodules expose a Typer Group named "cli"
         cli: typer.Typer = mod.cli
-        return typer.main.get_command(cli)
+        command = typer.main.get_command(cli)
+        # A collapsed single-command module keeps its inner command's click name
+        # (e.g. btlogger's "capture"), but help and suggestions render that name
+        # while dispatch goes by the CLI_GROUPS key — so align it.
+        command.name = name
+        return command
 
     @staticmethod
     def highlight_keyword(text: str, keyword: str) -> str:
         return re.sub(f"({keyword})", typer.style("\\1", bold=True), text, flags=re.IGNORECASE)
 
     @staticmethod
-    def collect_commands(command: Union[TyperGroup, click.Command]) -> Union[str, list[str]]:
+    def collect_commands(command: Any) -> Union[str, list[str]]:
         if isinstance(command, TyperGroup):  # group
-            cmds = []
+            cmds: list[str] = []
             for v in command.commands.values():
                 child = Pmd3TyperGroup.collect_commands(v)
                 if isinstance(child, list):
@@ -190,7 +242,11 @@ class Pmd3TyperGroup(TyperGroup):
             module_name = f"pymobiledevice3.cli.{CLI_GROUPS[key]}"
             mod = importlib.import_module(module_name)
             if isinstance(mod.cli, typer.Typer):
-                cmd = Pmd3TyperGroup.collect_commands(typer.main.get_group(mod.cli))
+                # Resolve like import_and_get_command does: a single-command module
+                # with no callback collapses into one command invoked by the group key.
+                cmd = Pmd3TyperGroup.collect_commands(typer.main.get_command(mod.cli))
+                if not isinstance(cmd, list):
+                    cmd = key
             else:
                 cmd = Pmd3TyperGroup.collect_commands(mod.cli.commands[key])
             if isinstance(cmd, list):
@@ -198,11 +254,6 @@ class Pmd3TyperGroup(TyperGroup):
             else:
                 all_commands.append(cmd)
         return all_commands
-
-    def resolve_command(
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[Optional[str], Optional[click.Command], list[str]]:
-        return super().resolve_command(ctx, args)
 
 
 app = InjectingTyper(
@@ -224,7 +275,10 @@ def _root(
         bool,
         typer.Option(
             "--reconnect",
-            help="Automatically reconnect if the device disconnects mid-command.",
+            help=(
+                "Automatically reconnect if the device disconnects mid-command "
+                f"(set {RECONNECT_ANY_ENV_VAR} to accept any device, not just the original one)."
+            ),
             show_default=False,
         ),
     ] = False,
@@ -251,190 +305,165 @@ def _root(
     set_color_flag(color)
 
 
-def device_might_need_tunneld(identifier: str) -> bool:
+def product_version_needs_tunnel(product_version: str) -> bool:
+    """True when the device's iOS version (>= 17.0) means a developer command needs an RSD tunnel."""
+    return Version(product_version) >= Version("17.0")
+
+
+def _report(error: PyMobileDevice3Exception) -> None:
+    """Tell the user what failed: the exception's message, and its traceback when running with ``-v``."""
+    logger.error(str(error) or type(error).__name__)
+    if logger.isEnabledFor(logging.DEBUG):
+        if sys.stderr.isatty():
+            # rich shows each frame's source in context; the CLI machinery's own frames add nothing
+            traceback = Traceback.from_exception(
+                type(error), error, error.__traceback__, suppress=[typer, typer_injector, asyncio]
+            )
+            Console(stderr=True, no_color=not cli_common.COLORED_OUTPUT).print(traceback)
+        else:
+            # redirected (e.g. to a file attached to an issue): a plain traceback reads and greps better
+            logger.debug("Traceback:", exc_info=error)
+    elif not error.worth_reporting:  # (that message already says to rerun with -v)
+        logger.info("Run again with -v for the full traceback (include it when reporting an issue)")
+
+
+def invoke_cli_with_error_handling() -> tuple[ExitCode, bool]:
     """
-    Determines if the device might require tunneling based on its product version.
-
-    This function uses the `create_using_usbmux` context manager to establish a lockdown
-    session with the specified identifier. It retrieves the device's product version,
-    and checks if it is greater than or equal to version "17.0". If so, the function
-    returns True, indicating that the device might require tunneling. Otherwise, it
-    returns False.
-
-    :param identifier: A string representing the device identifier.
-    :return: A boolean indicating whether the device might require tunneling.
+    Invoke the command line interface once. Returns (exit_code, reconnectable) - reconnectable is
+    True when the failure was that the device disconnected, which keeps the `--reconnect` retry
+    loop alive. A successful command never reaches this function's own return statements: it
+    exits earlier, via the SystemExit that Typer's own `app(...)` call raises.
     """
-    with create_using_usbmux(identifier) as lockdown:
-        return Version(lockdown.product_version) >= Version("17.0")
-
-
-class PossiblyMisplacedOption(click.NoSuchOption):
-    def __init__(
-        self,
-        option_name: str,
-        message: Optional[str] = None,
-        possibilities: Optional[Sequence[str]] = None,
-        ctx: Optional[click.Context] = None,
-        suggested_ctx: Optional[click.Context] = None,
-    ) -> None:
-        super().__init__(option_name, message, possibilities, ctx)
-        if suggested_ctx is not None:
-            if ctx is not None:
-                self.message += f" for subcommand: {ctx.command_path}"
-
-            suggestion = f"{suggested_ctx.command_path} {option_name}"
-            suggestion += ctx.command_path.removeprefix(suggested_ctx.command_path) if ctx is not None else " ..."
-
-            self.message += f"\nDid you mean: {suggestion}?"
-
-    @staticmethod
-    def from_no_such_option(e: click.NoSuchOption) -> "PossiblyMisplacedOption":
-        ctx = e.ctx
-        while ctx:
-            for param in ctx.command.params:
-                if isinstance(param, typer.core.TyperOption) and (
-                    e.option_name in param.opts or e.option_name in param.secondary_opts
-                ):
-                    break
-            else:
-                ctx = ctx.parent
-                continue
-            break
-
-        return PossiblyMisplacedOption(e.option_name, e.message, e.possibilities, e.ctx, ctx)
-
-
-def invoke_cli_with_error_handling() -> bool:
-    """
-    Invoke the command line interface and return `True` if the failure reason of the command was that the device was
-    disconnected.
-    """
+    reconnectable = False
     try:
         # Typer apps are callable; this executes the CLI with current sys.argv
-        try:
-            app(standalone_mode=False)
-        except click.NoSuchOption as e:
-            raise PossiblyMisplacedOption.from_no_such_option(e) from e
-    except NoDeviceConnectedError:
-        logger.error("Device is not connected")
-        return True
-    except ConnectionAbortedError:
-        logger.error("Device was disconnected")
-        return True
-    except NotPairedError:
-        logger.error("Device is not paired")
-    except UserDeniedPairingError:
-        logger.error("User refused to trust this computer")
-    except PairingDialogResponsePendingError:
-        logger.error("Waiting for user dialog approval")
-    except SetProhibitedError:
-        logger.error("lockdownd denied the access")
-    except MissingValueError:
-        logger.error("No such value")
-    except DeviceHasPasscodeSetError:
-        logger.error("Cannot enable developer-mode when passcode is set")
-    except DeveloperModeError:
-        logger.error("Failed to enable developer-mode.")
-    except ConnectionFailedToUsbmuxdError:
-        logger.error("Failed to connect to usbmuxd socket. Make sure it's running.")
-    except ConnectionFailedError:
-        logger.error("Failed to connect to service port.")
-        return True
-    except MessageNotSupportedError:
-        logger.error("Message not supported for this iOS version")
-        traceback.print_exc()
-    except InternalError:
-        logger.error("Internal Error")
-    except DeveloperModeIsNotEnabledError:
-        logger.error(
-            "Developer Mode is disabled. You can try to enable it using: "
-            "python3 -m pymobiledevice3 amfi enable-developer-mode"
-        )
+        app(args=["--help"] if len(sys.argv) == 1 else None)
+    except (NoDeviceConnectedError, ConnectionTerminatedError, ConnectionFailedError, DeviceNotFoundError) as e:
+        _report(e)
+        # The device may be back by the next attempt (after a disconnect it may still be re-enumerating
+        # while other devices are attached); usbmuxd itself being down is another matter.
+        reconnectable = not isinstance(e, ConnectionFailedToUsbmuxdError)
     except (InvalidServiceError, RSDRequiredError) as e:
-        should_retry_over_tunneld = False
+        reason = ""
+        # Both exceptions carry the device's product version (no extra device round-trip needed).
+        product_version = e.product_version
         if isinstance(e, RSDRequiredError):
-            logger.warning("Trying again over tunneld since RSD is required for this command")
-            should_retry_over_tunneld = True
+            reason = "RSD is required for this command"
         elif (
             (e.identifier is not None)
             and ("developer" in sys.argv)
             and ("--tunnel" not in sys.argv)
-            and device_might_need_tunneld(e.identifier)
+            and ("--userspace" not in sys.argv)
+            and ("--native" not in sys.argv)
+            and product_version_needs_tunnel(product_version)
         ):
-            logger.warning("Got an InvalidServiceError. Trying again over tunneld since it is a developer command")
-            should_retry_over_tunneld = True
-        if should_retry_over_tunneld:
-            # use a single space because Typer/Click will ignore envvars of empty strings
-            os.environ[TUNNEL_ENV_VAR] = e.identifier or " "
-            main()
-            return False
-        logger.error(INVALID_SERVICE_MESSAGE)
-    except PasswordRequiredError:
-        logger.error("Device is password protected. Please unlock and retry")
-    except AccessDeniedError:
-        logger.error(get_os_utils().access_denied_error)
-    except BrokenPipeError:
-        traceback.print_exc()
-    except TunneldConnectionError:
-        logger.error(
-            "Unable to connect to Tunneld. You can start one using:\nsudo python3 -m pymobiledevice3 remote tunneld"
-        )
-    except DeviceNotFoundError as e:
-        logger.error(f"Device not found: {e.udid}")
-    except NotEnoughDiskSpaceError:
-        logger.error("Not enough disk space")
-    except DeprecationError:
-        logger.error("failed to query MobileGestalt, MobileGestalt deprecated (iOS >= 17.4).")
-    except OSNotSupportedError as e:
-        logger.error(
-            f"Unsupported OS - {e.os_name}. To add support, consider contributing at "
-            f"https://github.com/doronz88/pymobiledevice3."
-        )
-    except CloudConfigurationAlreadyPresentError:
-        logger.error(
-            "A cloud configuration is already present on device. You must first erase the device in order "
-            "to install new one:\n"
-            "> pymobiledevice3 profile erase-device"
-        )
-    except FeatureNotSupportedError as e:
-        logger.error(
-            f"Missing implementation of `{e.feature}` on `{e.os_name}`. To add support, consider contributing at "
-            f"https://github.com/doronz88/pymobiledevice3."
-        )
-    except QuicProtocolNotSupportedError:
-        logger.error("Encountered a QUIC protocol error.")
-    except StartServiceError as e:
-        if e.message == "ServiceProhibited" and e.service_name == "com.apple.pcapd.shim.remote":
-            logger.error(
-                f"The {e.service_name} service is USB only (at least for some iOS versions).\n"
-                "Full discussion is available in: https://github.com/doronz88/pymobiledevice3/issues/1515"
+            reason = "it is a developer command on an iOS 17+ device"
+        # Retry once, establishing the default RSD chain in-process (see make_rsd_dependency): the
+        # preferred transport is chosen by default_transport_preference() (userspace;
+        # PYMOBILEDEVICE3_DEFAULT_FALLBACK overrides) and falls back through the other
+        # no-root path and tunneld as needed. FORCE_TUNNEL_ENV_VAR both requests this and guards
+        # against looping; an explicit transport env means the user already chose one, so don't retry.
+        if (
+            reason
+            and not os.getenv(USERSPACE_ENV_VAR)
+            and not os.getenv(TUNNEL_ENV_VAR)
+            and not os.getenv(NATIVE_ENV_VAR)
+            and not os.getenv(FORCE_TUNNEL_ENV_VAR)
+        ):
+            preferred = {
+                "native": "the native tunnel",
+                "userspace": "a no-root userspace tunnel",
+                "tunneld": "tunneld",
+            }[default_transport_preference()]
+            logger.warning(
+                f"Trying again over {preferred} since {reason} "
+                "(override with PYMOBILEDEVICE3_DEFAULT_FALLBACK, or --tunnel/--userspace/--native)"
             )
-        else:
-            logger.error(f"Failed to start: {e.service_name} with. Received error: {e.message}.")
-    except click.ClickException as e:
-        from typer import rich_utils
+            os.environ[FORCE_TUNNEL_ENV_VAR] = "1"
+            # Target the same device the tunnel would otherwise resolve by default.
+            if e.identifier and not os.getenv(UDID_ENV_VAR):
+                os.environ[UDID_ENV_VAR] = e.identifier
+            # main() only returns (rather than raising the SystemExit(0) a successful retry ends
+            # in) when the retried attempt also failed - propagate its actual exit code (e.g.
+            # ExitCode.ABORTED on Ctrl-C) instead of flattening it to a generic error.
+            exit_code = main()
+            return exit_code, False
+        logger.error(INVALID_SERVICE_MESSAGE)
+    except PyMobileDevice3Exception as e:
+        _report(e)
+    else:
+        # No exception: in practice unreachable, since a real Typer app() raises SystemExit(0) on
+        # success before ever returning here
+        return ExitCode.SUCCESS, False
+    return ExitCode.ERROR, reconnectable
 
-        rich_utils.rich_format_error(e)
-        sys.exit(e.exit_code)
 
-    return False
+def _retarget_reconnect_udid(udid: str) -> None:
+    """Point the `--reconnect` re-invocation at ``udid``: an explicit ``--udid`` on argv wins over
+    the env var, so rewrite both."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--udid" and i + 1 < len(sys.argv):
+            sys.argv[i + 1] = udid
+        elif arg.startswith("--udid="):
+            sys.argv[i] = f"--udid={udid}"
+    os.environ[UDID_ENV_VAR] = udid
 
 
-def main() -> None:
-    # Retry to invoke the CLI
-    while invoke_cli_with_error_handling():
-        # If reached here, this means the failure reason was that the device is disconnected
-        if not RECONNECT:
-            # If not invoked with the `--reconnect` option, break here
-            break
+def tolerate_unencodable_output() -> None:
+    """Escape, instead of crash on, characters the console encoding cannot represent.
+
+    Device-supplied text (syslog lines, process names, bundle names, ...) can carry any code point,
+    while a Windows console frequently hands Python a cp1252 stdout. With the default
+    `errors="strict"` a single emoji in a syslog line raises UnicodeEncodeError from inside print()
+    (issue #1942). `backslashreplace` keeps the character recoverable (`\\U0001f600`) rather than
+    dropping it, and matches what Python already does for stderr."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
+
+
+def main() -> ExitCode:
+    """Returns the process exit code. A successful command exits earlier via the SystemExit that
+    Typer's own `app(...)` call raises, from within `invoke_cli_with_error_handling()`; this loop
+    only ever runs again (or returns ExitCode.ABORTED) once that call has already logged an
+    error."""
+    tolerate_unencodable_output()
+    while True:
+        exit_code, reconnectable = invoke_cli_with_error_handling()
+        # Not a reconnectable failure, or not invoked with `--reconnect`: stop here.
+        if not reconnectable or not RECONNECT:
+            return exit_code
         try:
-            # Wait for the device to be available again
-            lockdown = retry_create_using_usbmux(None)
-            lockdown.close()
+            logger.info("Waiting for the device to be available again")
+            # Wait for the device the command targeted, not just any device. The target is the
+            # explicit --udid / env value, or whichever device the command's dependency resolved
+            # to (auto-pick or interactive prompt). RECONNECT_ANY_ENV_VAR opts out: accept the
+            # first available device even when its UDID differs from the original target.
+            serial = _cli_udid() or resolved_udid()
+            accept_any = bool(os.getenv(RECONNECT_ANY_ENV_VAR))
+            if accept_any and serial is not None:
+                logger.warning(
+                    f"{RECONNECT_ANY_ENV_VAR} is set: accepting the first available device, "
+                    f"even if its UDID differs from {serial}"
+                )
+            lockdown = asyncio.run(retry_create_using_usbmux(serial=None if accept_any else serial))
+            if accept_any and lockdown.udid:
+                if serial is not None and lockdown.udid != serial:
+                    logger.warning(f"Reconnected to a different device: {lockdown.udid} (was {serial})")
+                serial = lockdown.udid
+                # Retarget the re-invocation at the device that actually connected.
+                _retarget_reconnect_udid(serial)
+            elif serial is not None and not os.getenv(UDID_ENV_VAR):
+                # Stamp the target so the re-invocation resolves the same device instead of
+                # prompting again (or silently auto-picking another attached device).
+                os.environ[UDID_ENV_VAR] = serial
+            logger.info("Device connected")
+            asyncio.run(lockdown.close())
         except KeyboardInterrupt:
             print("Aborted.")
-            break
+            return ExitCode.ABORTED
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

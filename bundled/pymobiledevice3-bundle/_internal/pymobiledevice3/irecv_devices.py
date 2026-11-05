@@ -1,20 +1,43 @@
-from collections import namedtuple
+from typing import NamedTuple
 
-IRecvDevice = namedtuple("IRecvDevice", "product_type hardware_model board_id chip_id display_name")
 
-IRECV_DEVICES = (
+class IRecvDevice(NamedTuple):
+    product_type: str
+    hardware_model: str
+    board_id: int
+    chip_id: int
+    display_name: str
+
+
+IRECV_DEVICES: tuple[IRecvDevice, ...] = (
     # iPhone
     IRecvDevice(
-        product_type="iPhone1,1", hardware_model="m68ap", board_id=0x00, chip_id=0x8900, display_name="iPhone 2G"
+        product_type="iPhone1,1",
+        hardware_model="m68ap",
+        board_id=0x00,
+        chip_id=0x8900,
+        display_name="iPhone 2G",
     ),
     IRecvDevice(
-        product_type="iPhone1,2", hardware_model="n82ap", board_id=0x04, chip_id=0x8900, display_name="iPhone 3G"
+        product_type="iPhone1,2",
+        hardware_model="n82ap",
+        board_id=0x04,
+        chip_id=0x8900,
+        display_name="iPhone 3G",
     ),
     IRecvDevice(
-        product_type="iPhone2,1", hardware_model="n88ap", board_id=0x00, chip_id=0x8920, display_name="iPhone 3Gs"
+        product_type="iPhone2,1",
+        hardware_model="n88ap",
+        board_id=0x00,
+        chip_id=0x8920,
+        display_name="iPhone 3Gs",
     ),
     IRecvDevice(
-        product_type="iPhone3,1", hardware_model="n90ap", board_id=0x00, chip_id=0x8930, display_name="iPhone 4 (GSM)"
+        product_type="iPhone3,1",
+        hardware_model="n90ap",
+        board_id=0x00,
+        chip_id=0x8930,
+        display_name="iPhone 4 (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone3,2",
@@ -24,13 +47,25 @@ IRECV_DEVICES = (
         display_name="iPhone 4 (GSM) R2 2012",
     ),
     IRecvDevice(
-        product_type="iPhone3,3", hardware_model="n92ap", board_id=0x06, chip_id=0x8930, display_name="iPhone 4 (CDMA)"
+        product_type="iPhone3,3",
+        hardware_model="n92ap",
+        board_id=0x06,
+        chip_id=0x8930,
+        display_name="iPhone 4 (CDMA)",
     ),
     IRecvDevice(
-        product_type="iPhone4,1", hardware_model="n94ap", board_id=0x08, chip_id=0x8940, display_name="iPhone 4s"
+        product_type="iPhone4,1",
+        hardware_model="n94ap",
+        board_id=0x08,
+        chip_id=0x8940,
+        display_name="iPhone 4s",
     ),
     IRecvDevice(
-        product_type="iPhone5,1", hardware_model="n41ap", board_id=0x00, chip_id=0x8950, display_name="iPhone 5 (GSM)"
+        product_type="iPhone5,1",
+        hardware_model="n41ap",
+        board_id=0x00,
+        chip_id=0x8950,
+        display_name="iPhone 5 (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone5,2",
@@ -40,7 +75,11 @@ IRECV_DEVICES = (
         display_name="iPhone 5 (Global)",
     ),
     IRecvDevice(
-        product_type="iPhone5,3", hardware_model="n48ap", board_id=0x0A, chip_id=0x8950, display_name="iPhone 5c (GSM)"
+        product_type="iPhone5,3",
+        hardware_model="n48ap",
+        board_id=0x0A,
+        chip_id=0x8950,
+        display_name="iPhone 5c (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone5,4",
@@ -50,7 +89,11 @@ IRECV_DEVICES = (
         display_name="iPhone 5c (Global)",
     ),
     IRecvDevice(
-        product_type="iPhone6,1", hardware_model="n51ap", board_id=0x00, chip_id=0x8960, display_name="iPhone 5s (GSM)"
+        product_type="iPhone6,1",
+        hardware_model="n51ap",
+        board_id=0x00,
+        chip_id=0x8960,
+        display_name="iPhone 5s (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone6,2",
@@ -60,22 +103,46 @@ IRECV_DEVICES = (
         display_name="iPhone 5s (Global)",
     ),
     IRecvDevice(
-        product_type="iPhone7,1", hardware_model="n56ap", board_id=0x04, chip_id=0x7000, display_name="iPhone 6 Plus"
+        product_type="iPhone7,1",
+        hardware_model="n56ap",
+        board_id=0x04,
+        chip_id=0x7000,
+        display_name="iPhone 6 Plus",
     ),
     IRecvDevice(
-        product_type="iPhone7,2", hardware_model="n61ap", board_id=0x06, chip_id=0x7000, display_name="iPhone 6"
+        product_type="iPhone7,2",
+        hardware_model="n61ap",
+        board_id=0x06,
+        chip_id=0x7000,
+        display_name="iPhone 6",
     ),
     IRecvDevice(
-        product_type="iPhone8,1", hardware_model="n71ap", board_id=0x04, chip_id=0x8000, display_name="iPhone 6s"
+        product_type="iPhone8,1",
+        hardware_model="n71ap",
+        board_id=0x04,
+        chip_id=0x8000,
+        display_name="iPhone 6s",
     ),
     IRecvDevice(
-        product_type="iPhone8,1", hardware_model="n71map", board_id=0x04, chip_id=0x8003, display_name="iPhone 6s"
+        product_type="iPhone8,1",
+        hardware_model="n71map",
+        board_id=0x04,
+        chip_id=0x8003,
+        display_name="iPhone 6s",
     ),
     IRecvDevice(
-        product_type="iPhone8,2", hardware_model="n66ap", board_id=0x06, chip_id=0x8000, display_name="iPhone 6s Plus"
+        product_type="iPhone8,2",
+        hardware_model="n66ap",
+        board_id=0x06,
+        chip_id=0x8000,
+        display_name="iPhone 6s Plus",
     ),
     IRecvDevice(
-        product_type="iPhone8,2", hardware_model="n66map", board_id=0x06, chip_id=0x8003, display_name="iPhone 6s Plus"
+        product_type="iPhone8,2",
+        hardware_model="n66map",
+        board_id=0x06,
+        chip_id=0x8003,
+        display_name="iPhone 6s Plus",
     ),
     IRecvDevice(
         product_type="iPhone8,4",
@@ -106,7 +173,11 @@ IRECV_DEVICES = (
         display_name="iPhone 7 Plus (Global)",
     ),
     IRecvDevice(
-        product_type="iPhone9,3", hardware_model="d101ap", board_id=0x0C, chip_id=0x8010, display_name="iPhone 7 (GSM)"
+        product_type="iPhone9,3",
+        hardware_model="d101ap",
+        board_id=0x0C,
+        chip_id=0x8010,
+        display_name="iPhone 7 (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone9,4",
@@ -137,7 +208,11 @@ IRECV_DEVICES = (
         display_name="iPhone X (Global)",
     ),
     IRecvDevice(
-        product_type="iPhone10,4", hardware_model="d201ap", board_id=0x0A, chip_id=0x8015, display_name="iPhone 8 (GSM)"
+        product_type="iPhone10,4",
+        hardware_model="d201ap",
+        board_id=0x0A,
+        chip_id=0x8015,
+        display_name="iPhone 8 (GSM)",
     ),
     IRecvDevice(
         product_type="iPhone10,5",
@@ -147,10 +222,18 @@ IRECV_DEVICES = (
         display_name="iPhone 8 Plus (GSM)",
     ),
     IRecvDevice(
-        product_type="iPhone10,6", hardware_model="d221ap", board_id=0x0E, chip_id=0x8015, display_name="iPhone X (GSM)"
+        product_type="iPhone10,6",
+        hardware_model="d221ap",
+        board_id=0x0E,
+        chip_id=0x8015,
+        display_name="iPhone X (GSM)",
     ),
     IRecvDevice(
-        product_type="iPhone11,2", hardware_model="d321ap", board_id=0x0E, chip_id=0x8020, display_name="iPhone XS"
+        product_type="iPhone11,2",
+        hardware_model="d321ap",
+        board_id=0x0E,
+        chip_id=0x8020,
+        display_name="iPhone XS",
     ),
     IRecvDevice(
         product_type="iPhone11,4",
@@ -160,16 +243,32 @@ IRECV_DEVICES = (
         display_name="iPhone XS Max (China)",
     ),
     IRecvDevice(
-        product_type="iPhone11,6", hardware_model="d331pap", board_id=0x1A, chip_id=0x8020, display_name="iPhone XS Max"
+        product_type="iPhone11,6",
+        hardware_model="d331pap",
+        board_id=0x1A,
+        chip_id=0x8020,
+        display_name="iPhone XS Max",
     ),
     IRecvDevice(
-        product_type="iPhone11,8", hardware_model="n841ap", board_id=0x0C, chip_id=0x8020, display_name="iPhone XR"
+        product_type="iPhone11,8",
+        hardware_model="n841ap",
+        board_id=0x0C,
+        chip_id=0x8020,
+        display_name="iPhone XR",
     ),
     IRecvDevice(
-        product_type="iPhone12,1", hardware_model="n104ap", board_id=0x04, chip_id=0x8030, display_name="iPhone 11"
+        product_type="iPhone12,1",
+        hardware_model="n104ap",
+        board_id=0x04,
+        chip_id=0x8030,
+        display_name="iPhone 11",
     ),
     IRecvDevice(
-        product_type="iPhone12,3", hardware_model="d421ap", board_id=0x06, chip_id=0x8030, display_name="iPhone 11 Pro"
+        product_type="iPhone12,3",
+        hardware_model="d421ap",
+        board_id=0x06,
+        chip_id=0x8030,
+        display_name="iPhone 11 Pro",
     ),
     IRecvDevice(
         product_type="iPhone12,5",
@@ -186,13 +285,25 @@ IRECV_DEVICES = (
         display_name="iPhone SE (2nd gen)",
     ),
     IRecvDevice(
-        product_type="iPhone13,1", hardware_model="d52gap", board_id=0x0A, chip_id=0x8101, display_name="iPhone 12 mini"
+        product_type="iPhone13,1",
+        hardware_model="d52gap",
+        board_id=0x0A,
+        chip_id=0x8101,
+        display_name="iPhone 12 mini",
     ),
     IRecvDevice(
-        product_type="iPhone13,2", hardware_model="d53gap", board_id=0x0C, chip_id=0x8101, display_name="iPhone 12"
+        product_type="iPhone13,2",
+        hardware_model="d53gap",
+        board_id=0x0C,
+        chip_id=0x8101,
+        display_name="iPhone 12",
     ),
     IRecvDevice(
-        product_type="iPhone13,3", hardware_model="d53pap", board_id=0x0E, chip_id=0x8101, display_name="iPhone 12 Pro"
+        product_type="iPhone13,3",
+        hardware_model="d53pap",
+        board_id=0x0E,
+        chip_id=0x8101,
+        display_name="iPhone 12 Pro",
     ),
     IRecvDevice(
         product_type="iPhone13,4",
@@ -202,7 +313,11 @@ IRECV_DEVICES = (
         display_name="iPhone 12 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone14,2", hardware_model="d63ap", board_id=0x0C, chip_id=0x8110, display_name="iPhone 13 Pro"
+        product_type="iPhone14,2",
+        hardware_model="d63ap",
+        board_id=0x0C,
+        chip_id=0x8110,
+        display_name="iPhone 13 Pro",
     ),
     IRecvDevice(
         product_type="iPhone14,3",
@@ -212,10 +327,18 @@ IRECV_DEVICES = (
         display_name="iPhone 13 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone14,4", hardware_model="d16ap", board_id=0x08, chip_id=0x8110, display_name="iPhone 13 mini"
+        product_type="iPhone14,4",
+        hardware_model="d16ap",
+        board_id=0x08,
+        chip_id=0x8110,
+        display_name="iPhone 13 mini",
     ),
     IRecvDevice(
-        product_type="iPhone14,5", hardware_model="d17ap", board_id=0x0A, chip_id=0x8110, display_name="iPhone 13"
+        product_type="iPhone14,5",
+        hardware_model="d17ap",
+        board_id=0x0A,
+        chip_id=0x8110,
+        display_name="iPhone 13",
     ),
     IRecvDevice(
         product_type="iPhone14,6",
@@ -225,13 +348,25 @@ IRECV_DEVICES = (
         display_name="iPhone SE (3rd gen)",
     ),
     IRecvDevice(
-        product_type="iPhone14,7", hardware_model="d27ap", board_id=0x18, chip_id=0x8110, display_name="iPhone 14"
+        product_type="iPhone14,7",
+        hardware_model="d27ap",
+        board_id=0x18,
+        chip_id=0x8110,
+        display_name="iPhone 14",
     ),
     IRecvDevice(
-        product_type="iPhone14,8", hardware_model="d28ap", board_id=0x1A, chip_id=0x8110, display_name="iPhone 14 Plus"
+        product_type="iPhone14,8",
+        hardware_model="d28ap",
+        board_id=0x1A,
+        chip_id=0x8110,
+        display_name="iPhone 14 Plus",
     ),
     IRecvDevice(
-        product_type="iPhone15,2", hardware_model="d73ap", board_id=0x0C, chip_id=0x8120, display_name="iPhone 14 Pro"
+        product_type="iPhone15,2",
+        hardware_model="d73ap",
+        board_id=0x0C,
+        chip_id=0x8120,
+        display_name="iPhone 14 Pro",
     ),
     IRecvDevice(
         product_type="iPhone15,3",
@@ -241,13 +376,25 @@ IRECV_DEVICES = (
         display_name="iPhone 14 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone15,4", hardware_model="d37ap", board_id=0x08, chip_id=0x8120, display_name="iPhone 15"
+        product_type="iPhone15,4",
+        hardware_model="d37ap",
+        board_id=0x08,
+        chip_id=0x8120,
+        display_name="iPhone 15",
     ),
     IRecvDevice(
-        product_type="iPhone15,5", hardware_model="d38ap", board_id=0x0A, chip_id=0x8120, display_name="iPhone 15 Plus"
+        product_type="iPhone15,5",
+        hardware_model="d38ap",
+        board_id=0x0A,
+        chip_id=0x8120,
+        display_name="iPhone 15 Plus",
     ),
     IRecvDevice(
-        product_type="iPhone16,1", hardware_model="d83ap", board_id=0x04, chip_id=0x8130, display_name="iPhone 15 Pro"
+        product_type="iPhone16,1",
+        hardware_model="d83ap",
+        board_id=0x04,
+        chip_id=0x8130,
+        display_name="iPhone 15 Pro",
     ),
     IRecvDevice(
         product_type="iPhone16,2",
@@ -257,16 +404,11 @@ IRECV_DEVICES = (
         display_name="iPhone 15 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone17,3", hardware_model="d47ap", board_id=0x08, chip_id=0x8140, display_name="iPhone 16"
-    ),
-    IRecvDevice(
-        product_type="iPhone17,4", hardware_model="d48ap", board_id=0x0A, chip_id=0x8140, display_name="iPhone 16 Plus"
-    ),
-    IRecvDevice(
-        product_type="iPhone17,5", hardware_model="v59ap", board_id=0x04, chip_id=0x8140, display_name="iPhone 16e"
-    ),
-    IRecvDevice(
-        product_type="iPhone17,1", hardware_model="d93ap", board_id=0x0C, chip_id=0x8140, display_name="iPhone 16 Pro"
+        product_type="iPhone17,1",
+        hardware_model="d93ap",
+        board_id=0x0C,
+        chip_id=0x8140,
+        display_name="iPhone 16 Pro",
     ),
     IRecvDevice(
         product_type="iPhone17,2",
@@ -276,10 +418,32 @@ IRECV_DEVICES = (
         display_name="iPhone 16 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone18,4", hardware_model="d23ap", board_id=0x0A, chip_id=0x8150, display_name="iPhone Air"
+        product_type="iPhone17,3",
+        hardware_model="d47ap",
+        board_id=0x08,
+        chip_id=0x8140,
+        display_name="iPhone 16",
     ),
     IRecvDevice(
-        product_type="iPhone18,1", hardware_model="v53ap", board_id=0x0C, chip_id=0x8150, display_name="iPhone 17 Pro"
+        product_type="iPhone17,4",
+        hardware_model="d48ap",
+        board_id=0x0A,
+        chip_id=0x8140,
+        display_name="iPhone 16 Plus",
+    ),
+    IRecvDevice(
+        product_type="iPhone17,5",
+        hardware_model="v59ap",
+        board_id=0x04,
+        chip_id=0x8140,
+        display_name="iPhone 16e",
+    ),
+    IRecvDevice(
+        product_type="iPhone18,1",
+        hardware_model="v53ap",
+        board_id=0x0C,
+        chip_id=0x8150,
+        display_name="iPhone 17 Pro",
     ),
     IRecvDevice(
         product_type="iPhone18,2",
@@ -289,7 +453,53 @@ IRECV_DEVICES = (
         display_name="iPhone 17 Pro Max",
     ),
     IRecvDevice(
-        product_type="iPhone18,3", hardware_model="v57ap", board_id=0x08, chip_id=0x8150, display_name="iPhone 17"
+        product_type="iPhone18,3",
+        hardware_model="v57ap",
+        board_id=0x08,
+        chip_id=0x8150,
+        display_name="iPhone 17",
+    ),
+    IRecvDevice(
+        product_type="iPhone18,4",
+        hardware_model="d23ap",
+        board_id=0x0A,
+        chip_id=0x8150,
+        display_name="iPhone Air",
+    ),
+    IRecvDevice(
+        product_type="iPhone18,5",
+        hardware_model="v159ap",
+        board_id=0x16,
+        chip_id=0x8150,
+        display_name="iPhone 17e",
+    ),
+    IRecvDevice(
+        product_type="iPhone19,2",
+        hardware_model="v63ap",
+        board_id=0x0A,
+        chip_id=0x8160,
+        display_name="iPhone 18 Pro",
+    ),
+    IRecvDevice(
+        product_type="iPhone19,3",
+        hardware_model="v64ap",
+        board_id=0x0C,
+        chip_id=0x8160,
+        display_name="iPhone 18 Pro Max (US)",
+    ),
+    IRecvDevice(
+        product_type="iPhone19,4",
+        hardware_model="v68ap",
+        board_id=0x0E,
+        chip_id=0x8160,
+        display_name="iPhone Duo",
+    ),
+    IRecvDevice(
+        product_type="iPhone19,7",
+        hardware_model="v64sap",
+        board_id=0x12,
+        chip_id=0x8160,
+        display_name="iPhone 18 Pro Max (Global)",
     ),
     # iPod
     IRecvDevice(
@@ -342,15 +552,33 @@ IRECV_DEVICES = (
         display_name="iPod Touch (7th gen)",
     ),
     # iPad
-    IRecvDevice(product_type="iPad1,1", hardware_model="k48ap", board_id=0x02, chip_id=0x8930, display_name="iPad"),
     IRecvDevice(
-        product_type="iPad2,1", hardware_model="k93ap", board_id=0x04, chip_id=0x8940, display_name="iPad 2 (WiFi)"
+        product_type="iPad1,1",
+        hardware_model="k48ap",
+        board_id=0x02,
+        chip_id=0x8930,
+        display_name="iPad",
     ),
     IRecvDevice(
-        product_type="iPad2,2", hardware_model="k94ap", board_id=0x06, chip_id=0x8940, display_name="iPad 2 (GSM)"
+        product_type="iPad2,1",
+        hardware_model="k93ap",
+        board_id=0x04,
+        chip_id=0x8940,
+        display_name="iPad 2 (WiFi)",
     ),
     IRecvDevice(
-        product_type="iPad2,3", hardware_model="k95ap", board_id=0x02, chip_id=0x8940, display_name="iPad 2 (CDMA)"
+        product_type="iPad2,2",
+        hardware_model="k94ap",
+        board_id=0x06,
+        chip_id=0x8940,
+        display_name="iPad 2 (GSM)",
+    ),
+    IRecvDevice(
+        product_type="iPad2,3",
+        hardware_model="k95ap",
+        board_id=0x02,
+        chip_id=0x8940,
+        display_name="iPad 2 (CDMA)",
     ),
     IRecvDevice(
         product_type="iPad2,4",
@@ -360,10 +588,18 @@ IRECV_DEVICES = (
         display_name="iPad 2 (WiFi) R2 2012",
     ),
     IRecvDevice(
-        product_type="iPad2,5", hardware_model="p105ap", board_id=0x0A, chip_id=0x8942, display_name="iPad mini (WiFi)"
+        product_type="iPad2,5",
+        hardware_model="p105ap",
+        board_id=0x0A,
+        chip_id=0x8942,
+        display_name="iPad mini (WiFi)",
     ),
     IRecvDevice(
-        product_type="iPad2,6", hardware_model="p106ap", board_id=0x0C, chip_id=0x8942, display_name="iPad mini (GSM)"
+        product_type="iPad2,6",
+        hardware_model="p106ap",
+        board_id=0x0C,
+        chip_id=0x8942,
+        display_name="iPad mini (GSM)",
     ),
     IRecvDevice(
         product_type="iPad2,7",
@@ -415,7 +651,11 @@ IRECV_DEVICES = (
         display_name="iPad (4th gen, Global)",
     ),
     IRecvDevice(
-        product_type="iPad4,1", hardware_model="j71ap", board_id=0x10, chip_id=0x8960, display_name="iPad Air (WiFi)"
+        product_type="iPad4,1",
+        hardware_model="j71ap",
+        board_id=0x10,
+        chip_id=0x8960,
+        display_name="iPad Air (WiFi)",
     ),
     IRecvDevice(
         product_type="iPad4,2",
@@ -425,10 +665,18 @@ IRECV_DEVICES = (
         display_name="iPad Air (Cellular)",
     ),
     IRecvDevice(
-        product_type="iPad4,3", hardware_model="j73ap", board_id=0x14, chip_id=0x8960, display_name="iPad Air (China)"
+        product_type="iPad4,3",
+        hardware_model="j73ap",
+        board_id=0x14,
+        chip_id=0x8960,
+        display_name="iPad Air (China)",
     ),
     IRecvDevice(
-        product_type="iPad4,4", hardware_model="j85ap", board_id=0x0A, chip_id=0x8960, display_name="iPad mini 2 (WiFi)"
+        product_type="iPad4,4",
+        hardware_model="j85ap",
+        board_id=0x0A,
+        chip_id=0x8960,
+        display_name="iPad mini 2 (WiFi)",
     ),
     IRecvDevice(
         product_type="iPad4,5",
@@ -466,7 +714,11 @@ IRECV_DEVICES = (
         display_name="iPad mini 3 (China)",
     ),
     IRecvDevice(
-        product_type="iPad5,1", hardware_model="j96ap", board_id=0x08, chip_id=0x7000, display_name="iPad mini 4 (WiFi)"
+        product_type="iPad5,1",
+        hardware_model="j96ap",
+        board_id=0x08,
+        chip_id=0x7000,
+        display_name="iPad mini 4 (WiFi)",
     ),
     IRecvDevice(
         product_type="iPad5,2",
@@ -476,7 +728,11 @@ IRECV_DEVICES = (
         display_name="iPad mini 4 (Cellular)",
     ),
     IRecvDevice(
-        product_type="iPad5,3", hardware_model="j81ap", board_id=0x06, chip_id=0x7001, display_name="iPad Air 2 (WiFi)"
+        product_type="iPad5,3",
+        hardware_model="j81ap",
+        board_id=0x06,
+        chip_id=0x7001,
+        display_name="iPad Air 2 (WiFi)",
     ),
     IRecvDevice(
         product_type="iPad5,4",
@@ -707,7 +963,7 @@ IRECV_DEVICES = (
         hardware_model="j218ap",
         board_id=0x1E,
         chip_id=0x8020,
-        display_name="iPad Air (3rd gen, Celluar)",
+        display_name="iPad Air (3rd gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad11,6",
@@ -749,7 +1005,7 @@ IRECV_DEVICES = (
         hardware_model="j308ap",
         board_id=0x06,
         chip_id=0x8101,
-        display_name="iPad Air (4th gen, Celluar)",
+        display_name="iPad Air (4th gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad13,4",
@@ -819,7 +1075,21 @@ IRECV_DEVICES = (
         hardware_model="j408ap",
         board_id=0x12,
         chip_id=0x8103,
-        display_name="iPad Air (5th gen, Celluar)",
+        display_name="iPad Air (5th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad13,18",
+        hardware_model="j271ap",
+        board_id=0x14,
+        chip_id=0x8101,
+        display_name="iPad (10th gen, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad13,19",
+        hardware_model="j272ap",
+        board_id=0x16,
+        chip_id=0x8101,
+        display_name="iPad (10th gen, Cellular)",
     ),
     IRecvDevice(
         product_type="iPad14,1",
@@ -835,12 +1105,216 @@ IRECV_DEVICES = (
         chip_id=0x8110,
         display_name="iPad mini (6th gen, Cellular)",
     ),
-    # Apple TV
     IRecvDevice(
-        product_type="AppleTV2,1", hardware_model="k66ap", board_id=0x10, chip_id=0x8930, display_name="Apple TV 2"
+        product_type="iPad14,3",
+        hardware_model="j617ap",
+        board_id=0x08,
+        chip_id=0x8112,
+        display_name="iPad Pro 11-inch (4th gen, WiFi)",
     ),
     IRecvDevice(
-        product_type="AppleTV3,1", hardware_model="j33ap", board_id=0x08, chip_id=0x8942, display_name="Apple TV 3"
+        product_type="iPad14,4",
+        hardware_model="j618ap",
+        board_id=0x0A,
+        chip_id=0x8112,
+        display_name="iPad Pro 11-inch (4th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,5",
+        hardware_model="j620ap",
+        board_id=0x0C,
+        chip_id=0x8112,
+        display_name="iPad Pro 12.9-inch (6th gen, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,6",
+        hardware_model="j621ap",
+        board_id=0x0E,
+        chip_id=0x8112,
+        display_name="iPad Pro 12.9-inch (6th gen, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,8",
+        hardware_model="j507ap",
+        board_id=0x10,
+        chip_id=0x8112,
+        display_name="iPad Air 11-inch (M2, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,9",
+        hardware_model="j508ap",
+        board_id=0x12,
+        chip_id=0x8112,
+        display_name="iPad Air 11-inch (M2, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,10",
+        hardware_model="j537ap",
+        board_id=0x14,
+        chip_id=0x8112,
+        display_name="iPad Air 13-inch (M2, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad14,11",
+        hardware_model="j538ap",
+        board_id=0x16,
+        chip_id=0x8112,
+        display_name="iPad Air 13-inch (M2, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,3",
+        hardware_model="j607ap",
+        board_id=0x08,
+        chip_id=0x8122,
+        display_name="iPad Air 11-inch (M3, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,4",
+        hardware_model="j608ap",
+        board_id=0x0A,
+        chip_id=0x8122,
+        display_name="iPad Air 11-inch (M3, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,5",
+        hardware_model="j637ap",
+        board_id=0x0C,
+        chip_id=0x8122,
+        display_name="iPad Air 13-inch (M3, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,6",
+        hardware_model="j638ap",
+        board_id=0x0E,
+        chip_id=0x8122,
+        display_name="iPad Air 13-inch (M3, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,7",
+        hardware_model="j481ap",
+        board_id=0x10,
+        chip_id=0x8120,
+        display_name="iPad (A16, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad15,8",
+        hardware_model="j482ap",
+        board_id=0x12,
+        chip_id=0x8120,
+        display_name="iPad (A16, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,1",
+        hardware_model="j410ap",
+        board_id=0x08,
+        chip_id=0x8130,
+        display_name="iPad mini (A17 Pro, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,2",
+        hardware_model="j411ap",
+        board_id=0x0A,
+        chip_id=0x8130,
+        display_name="iPad mini (A17 Pro, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,3",
+        hardware_model="j717ap",
+        board_id=0x08,
+        chip_id=0x8132,
+        display_name="iPad Pro 11-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,4",
+        hardware_model="j718ap",
+        board_id=0x0A,
+        chip_id=0x8132,
+        display_name="iPad Pro 11-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,5",
+        hardware_model="j720ap",
+        board_id=0x0C,
+        chip_id=0x8132,
+        display_name="iPad Pro 13-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,6",
+        hardware_model="j721ap",
+        board_id=0x0E,
+        chip_id=0x8132,
+        display_name="iPad Pro 13-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,8",
+        hardware_model="j707ap",
+        board_id=0x10,
+        chip_id=0x8132,
+        display_name="iPad Air 11-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,9",
+        hardware_model="j708ap",
+        board_id=0x12,
+        chip_id=0x8132,
+        display_name="iPad Air 11-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,10",
+        hardware_model="j737ap",
+        board_id=0x14,
+        chip_id=0x8132,
+        display_name="iPad Air 13-inch (M4, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad16,11",
+        hardware_model="j738ap",
+        board_id=0x16,
+        chip_id=0x8132,
+        display_name="iPad Air 13-inch (M4, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,1",
+        hardware_model="j817ap",
+        board_id=0x08,
+        chip_id=0x8142,
+        display_name="iPad Pro 11-inch (M5, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,2",
+        hardware_model="j818ap",
+        board_id=0x0A,
+        chip_id=0x8142,
+        display_name="iPad Pro 11-inch (M5, Cellular)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,3",
+        hardware_model="j820ap",
+        board_id=0x0C,
+        chip_id=0x8142,
+        display_name="iPad Pro 13-inch (M5, WiFi)",
+    ),
+    IRecvDevice(
+        product_type="iPad17,4",
+        hardware_model="j821ap",
+        board_id=0x0E,
+        chip_id=0x8142,
+        display_name="iPad Pro 13-inch (M5, Cellular)",
+    ),
+    # Apple TV
+    IRecvDevice(
+        product_type="AppleTV2,1",
+        hardware_model="k66ap",
+        board_id=0x10,
+        chip_id=0x8930,
+        display_name="Apple TV 2",
+    ),
+    IRecvDevice(
+        product_type="AppleTV3,1",
+        hardware_model="j33ap",
+        board_id=0x08,
+        chip_id=0x8942,
+        display_name="Apple TV 3",
     ),
     IRecvDevice(
         product_type="AppleTV3,2",
@@ -850,10 +1324,18 @@ IRECV_DEVICES = (
         display_name="Apple TV 3 (2013)",
     ),
     IRecvDevice(
-        product_type="AppleTV5,3", hardware_model="j42dap", board_id=0x34, chip_id=0x7000, display_name="Apple TV 4"
+        product_type="AppleTV5,3",
+        hardware_model="j42dap",
+        board_id=0x34,
+        chip_id=0x7000,
+        display_name="Apple TV 4",
     ),
     IRecvDevice(
-        product_type="AppleTV6,2", hardware_model="j105aap", board_id=0x02, chip_id=0x8011, display_name="Apple TV 4K"
+        product_type="AppleTV6,2",
+        hardware_model="j105aap",
+        board_id=0x02,
+        chip_id=0x8011,
+        display_name="Apple TV 4K",
     ),
     IRecvDevice(
         product_type="AppleTV11,1",
@@ -862,16 +1344,27 @@ IRECV_DEVICES = (
         chip_id=0x8020,
         display_name="Apple TV 4K (2nd gen)",
     ),
+    IRecvDevice(
+        product_type="AppleTV14,1",
+        hardware_model="j255ap",
+        board_id=0x02,
+        chip_id=0x8110,
+        display_name="Apple TV 4K (3rd gen)",
+    ),
     # HomePod
     IRecvDevice(
         product_type="AudioAccessory1,1",
         hardware_model="b238aap",
         board_id=0x38,
         chip_id=0x7000,
-        display_name="HomePod",
+        display_name="HomePod (1st gen)",
     ),
     IRecvDevice(
-        product_type="AudioAccessory1,2", hardware_model="b238ap", board_id=0x1A, chip_id=0x7000, display_name="HomePod"
+        product_type="AudioAccessory1,2",
+        hardware_model="b238ap",
+        board_id=0x1A,
+        chip_id=0x7000,
+        display_name="HomePod (1st gen)",
     ),
     IRecvDevice(
         product_type="AudioAccessory5,1",
@@ -879,6 +1372,13 @@ IRECV_DEVICES = (
         board_id=0x22,
         chip_id=0x8006,
         display_name="HomePod mini",
+    ),
+    IRecvDevice(
+        product_type="AudioAccessory6,1",
+        hardware_model="b620ap",
+        board_id=0x18,
+        chip_id=0x8301,
+        display_name="HomePod (2nd gen)",
     ),
     # Apple Watch
     IRecvDevice(
@@ -1094,30 +1594,30 @@ IRECV_DEVICES = (
     IRecvDevice(
         product_type="Watch6,10",
         hardware_model="n143sap",
-        board_id=0x18,
+        board_id=0x28,
         chip_id=0x8301,
-        display_name="Apple Watch SE (2nd generation) (40mm)",
+        display_name="Apple Watch SE 2 (40mm)",
     ),
     IRecvDevice(
         product_type="Watch6,11",
         hardware_model="n143bap",
         board_id=0x2A,
         chip_id=0x8301,
-        display_name="Apple Watch SE (2nd generation) (44mm)",
+        display_name="Apple Watch SE 2 (44mm)",
     ),
     IRecvDevice(
         product_type="Watch6,12",
         hardware_model="n149sap",
         board_id=0x2C,
         chip_id=0x8301,
-        display_name="Apple Watch SE (2nd generation) (40mm Cellular)",
+        display_name="Apple Watch SE 2 (40mm Cellular)",
     ),
     IRecvDevice(
         product_type="Watch6,13",
         hardware_model="n149bap",
         board_id=0x2E,
         chip_id=0x8301,
-        display_name="Apple Watch SE (2nd generation) (44m Cellular)",
+        display_name="Apple Watch SE 2 (44mm Cellular)",
     ),
     IRecvDevice(
         product_type="Watch6,14",
@@ -1148,7 +1648,7 @@ IRECV_DEVICES = (
         display_name="Apple Watch Series 8 (45mm Cellular)",
     ),
     IRecvDevice(
-        product_type="Watch6,17",
+        product_type="Watch6,18",
         hardware_model="n199ap",
         board_id=0x26,
         chip_id=0x8301,
@@ -1280,6 +1780,41 @@ IRECV_DEVICES = (
         chip_id=0x8310,
         display_name="Apple Watch Series 11 (46mm Cellular)",
     ),
+    IRecvDevice(
+        product_type="Watch8,1",
+        hardware_model="n240ap",
+        board_id=0x02,
+        chip_id=0x8320,
+        display_name="Apple Watch Ultra 4",
+    ),
+    IRecvDevice(
+        product_type="Watch8,2",
+        hardware_model="n237sap",
+        board_id=0x08,
+        chip_id=0x8320,
+        display_name="Apple Watch Series 12 (42mm)",
+    ),
+    IRecvDevice(
+        product_type="Watch8,3",
+        hardware_model="n237bap",
+        board_id=0x0A,
+        chip_id=0x8320,
+        display_name="Apple Watch Series 12 (46mm)",
+    ),
+    IRecvDevice(
+        product_type="Watch8,4",
+        hardware_model="n238sap",
+        board_id=0x0C,
+        chip_id=0x8320,
+        display_name="Apple Watch Series 12 (42mm Cellular)",
+    ),
+    IRecvDevice(
+        product_type="Watch8,5",
+        hardware_model="n238bap",
+        board_id=0x0E,
+        chip_id=0x8320,
+        display_name="Apple Watch Series 12 (46mm Cellular)",
+    ),
     # Apple Silicon Macs
     IRecvDevice(
         product_type="ADP3,2",
@@ -1378,6 +1913,336 @@ IRECV_DEVICES = (
         board_id=0x2A,
         chip_id=0x8112,
         display_name="MacBook Pro (M2, 13-inch, 2022)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,3",
+        hardware_model="j473ap",
+        board_id=0x24,
+        chip_id=0x8112,
+        display_name="Mac mini (M2, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,5",
+        hardware_model="j414cap",
+        board_id=0x04,
+        chip_id=0x6021,
+        display_name="MacBook Pro (14-inch, M2 Max, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,6",
+        hardware_model="j416cap",
+        board_id=0x06,
+        chip_id=0x6021,
+        display_name="MacBook Pro (16-inch, M2 Max, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,8",
+        hardware_model="j180dap",
+        board_id=0x08,
+        chip_id=0x6022,
+        display_name="Mac Pro (2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,9",
+        hardware_model="j414sap",
+        board_id=0x04,
+        chip_id=0x6020,
+        display_name="MacBook Pro (14-inch, M2 Pro, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,10",
+        hardware_model="j416sap",
+        board_id=0x06,
+        chip_id=0x6020,
+        display_name="MacBook Pro (16-inch, M2 Pro, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,12",
+        hardware_model="j474sap",
+        board_id=0x02,
+        chip_id=0x6020,
+        display_name="Mac mini (M2 Pro, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,13",
+        hardware_model="j475cap",
+        board_id=0x0A,
+        chip_id=0x6021,
+        display_name="Mac Studio (M2 Max, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,14",
+        hardware_model="j475dap",
+        board_id=0x0A,
+        chip_id=0x6022,
+        display_name="Mac Studio (M2 Ultra, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac14,15",
+        hardware_model="j415ap",
+        board_id=0x2E,
+        chip_id=0x8112,
+        display_name="MacBook Air (M2, 15-inch, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,3",
+        hardware_model="j504ap",
+        board_id=0x22,
+        chip_id=0x8122,
+        display_name="MacBook Pro (14-inch, M3, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,4",
+        hardware_model="j433ap",
+        board_id=0x28,
+        chip_id=0x8122,
+        display_name="iMac 24-inch (M3, Two Ports, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,5",
+        hardware_model="j434ap",
+        board_id=0x2A,
+        chip_id=0x8122,
+        display_name="iMac 24-inch (M3, Four Ports, 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,6",
+        hardware_model="j514sap",
+        board_id=0x04,
+        chip_id=0x6030,
+        display_name="MacBook Pro (14-inch, M3 Pro, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,7",
+        hardware_model="j516sap",
+        board_id=0x06,
+        chip_id=0x6030,
+        display_name="MacBook Pro (16-inch, M3 Pro, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,8",
+        hardware_model="j514cap",
+        board_id=0x44,
+        chip_id=0x6031,
+        display_name="MacBook Pro (14-inch, M3 Max, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,9",
+        hardware_model="j516cap",
+        board_id=0x46,
+        chip_id=0x6031,
+        display_name="MacBook Pro (16-inch, M3 Max, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,10",
+        hardware_model="j514map",
+        board_id=0x44,
+        chip_id=0x6034,
+        display_name="MacBook Pro (14-inch, M3 Max, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,11",
+        hardware_model="j516map",
+        board_id=0x46,
+        chip_id=0x6034,
+        display_name="MacBook Pro (16-inch, M3 Max, Nov 2023)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,12",
+        hardware_model="j613ap",
+        board_id=0x30,
+        chip_id=0x8122,
+        display_name="MacBook Air (13-inch, M3, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,13",
+        hardware_model="j615ap",
+        board_id=0x32,
+        chip_id=0x8122,
+        display_name="MacBook Air (15-inch, M3, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac15,14",
+        hardware_model="j575dap",
+        board_id=0x44,
+        chip_id=0x6032,
+        display_name="Mac Studio (M3 Ultra, 2025)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,1",
+        hardware_model="j604ap",
+        board_id=0x22,
+        chip_id=0x8132,
+        display_name="MacBook Pro (14-inch, M4, Nov 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,2",
+        hardware_model="j623ap",
+        board_id=0x24,
+        chip_id=0x8132,
+        display_name="iMac 24-inch (M4, Two Ports, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,3",
+        hardware_model="j624ap",
+        board_id=0x26,
+        chip_id=0x8132,
+        display_name="iMac 24-inch (M4, Four Ports, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,5",
+        hardware_model="j616cap",
+        board_id=0x06,
+        chip_id=0x6041,
+        display_name="MacBook Pro (16-inch, M4 Max, Nov 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,6",
+        hardware_model="j614cap",
+        board_id=0x04,
+        chip_id=0x6041,
+        display_name="MacBook Pro (14-inch, M4 Max, Nov 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,7",
+        hardware_model="j616sap",
+        board_id=0x06,
+        chip_id=0x6040,
+        display_name="MacBook Pro (16-inch, M4 Pro, Nov 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,8",
+        hardware_model="j614sap",
+        board_id=0x04,
+        chip_id=0x6040,
+        display_name="MacBook Pro (14-inch, M4 Pro, Nov 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,9",
+        hardware_model="j575cap",
+        board_id=0x02,
+        chip_id=0x6041,
+        display_name="Mac Studio (M4 Max, 2025)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,10",
+        hardware_model="j773gap",
+        board_id=0x2A,
+        chip_id=0x8132,
+        display_name="Mac mini (M4, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,11",
+        hardware_model="j773sap",
+        board_id=0x02,
+        chip_id=0x6040,
+        display_name="Mac mini (M4 Pro, 2024)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,12",
+        hardware_model="j713ap",
+        board_id=0x2C,
+        chip_id=0x8132,
+        display_name="MacBook Air (13-inch, M4, 2025)",
+    ),
+    IRecvDevice(
+        product_type="Mac16,13",
+        hardware_model="j715ap",
+        board_id=0x2E,
+        chip_id=0x8132,
+        display_name="MacBook Air (15-inch, M4, 2025)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,2",
+        hardware_model="j704ap",
+        board_id=0x22,
+        chip_id=0x8142,
+        display_name="MacBook Pro (14-inch, M5, 2025)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,3",
+        hardware_model="j813ap",
+        board_id=0x24,
+        chip_id=0x8142,
+        display_name="MacBook Air (13-inch, M5, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,4",
+        hardware_model="j815ap",
+        board_id=0x26,
+        chip_id=0x8142,
+        display_name="MacBook Air (15-inch, M5, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,5",
+        hardware_model="j700ap",
+        board_id=0x64,
+        chip_id=0x8140,
+        display_name="MacBook Neo",
+    ),
+    IRecvDevice(
+        product_type="Mac17,6",
+        hardware_model="j716cap",
+        board_id=0x0E,
+        chip_id=0x6050,
+        display_name="MacBook Pro (16-inch, M5 Max, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,7",
+        hardware_model="j714cap",
+        board_id=0x0A,
+        chip_id=0x6050,
+        display_name="MacBook Pro (14-inch, M5 Max, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,8",
+        hardware_model="j716sap",
+        board_id=0x0C,
+        chip_id=0x6050,
+        display_name="MacBook Pro (16-inch, M5 Pro, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,9",
+        hardware_model="j714sap",
+        board_id=0x08,
+        chip_id=0x6050,
+        display_name="MacBook Pro (14-inch, M5 Pro, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,14",
+        hardware_model="j775cap",
+        board_id=0x10,
+        chip_id=0x6050,
+        display_name="Mac Studio (M5 Max, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,15",
+        hardware_model="j775dap",
+        board_id=0x12,
+        chip_id=0x6050,
+        display_name="Mac Studio (M5 Ultra, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac17,16",
+        hardware_model="j873sap",
+        board_id=0x02,
+        chip_id=0x6050,
+        display_name="Mac mini (M5 Pro, 2026)",
+    ),
+    IRecvDevice(
+        product_type="Mac18,5",
+        hardware_model="j873gap",
+        board_id=0x24,
+        chip_id=0x8152,
+        display_name="Mac mini (M6, 2026)",
+    ),
+    # Apple Silicon VMs (supported by Virtualization.framework on macOS 12)
+    IRecvDevice(
+        product_type="VirtualMac2,1",
+        hardware_model="vma2macosap",
+        board_id=0x20,
+        chip_id=0xFE00,
+        display_name="Apple Virtual Machine 1",
     ),
     # Apple T2 Coprocessor
     IRecvDevice(
@@ -1492,6 +2357,21 @@ IRECV_DEVICES = (
         chip_id=0x8012,
         display_name="Apple T2 MacBookPro16,4 (j215)",
     ),
+    # Lightning Video Adapters
+    IRecvDevice(
+        product_type="iAccy1,1",
+        hardware_model="b137ap",
+        board_id=0x00,
+        chip_id=0x8747,
+        display_name="Lightning Digital AV Adapter",
+    ),
+    IRecvDevice(
+        product_type="iAccy1,2",
+        hardware_model="b165ap",
+        board_id=0x02,
+        chip_id=0x8747,
+        display_name="Lightning to VGA Adapter",
+    ),
     # Apple Displays
     IRecvDevice(
         product_type="AppleDisplay2,1",
@@ -1499,5 +2379,42 @@ IRECV_DEVICES = (
         board_id=0x22,
         chip_id=0x8030,
         display_name="Studio Display",
+    ),
+    IRecvDevice(
+        product_type="AppleDisplay18,1",
+        hardware_model="j427ap",
+        board_id=0x02,
+        chip_id=0x8150,
+        display_name="Studio Display XDR",
+    ),
+    IRecvDevice(
+        product_type="AppleDisplay18,2",
+        hardware_model="j527ap",
+        board_id=0x04,
+        chip_id=0x8150,
+        display_name="Studio Display (2026)",
+    ),
+    # Apple Vision Pro
+    IRecvDevice(
+        product_type="RealityDevice14,1",
+        hardware_model="n301ap",
+        board_id=0x42,
+        chip_id=0x8112,
+        display_name="Apple Vision Pro",
+    ),
+    IRecvDevice(
+        product_type="RealityDevice17,1",
+        hardware_model="n301aap",
+        board_id=0x42,
+        chip_id=0x8142,
+        display_name="Apple Vision Pro (M5)",
+    ),
+    # Private Cloud Compute Research Environment
+    IRecvDevice(
+        product_type="iPhone99,11",
+        hardware_model="vresearch101ap",
+        board_id=0x90,
+        chip_id=0xFE01,
+        display_name="iPhone 99,11",
     ),
 )

@@ -1,13 +1,13 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional, cast
 
 import typer
 from pygments import formatters, highlight, lexers
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, print_hex, user_requested_colored_output
-from pymobiledevice3.services.pcapd import PcapdService
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_hex, user_requested_colored_output
+from pymobiledevice3.services.pcapd import INTERFACE_NAMES, CrossPlatformAddressFamily, DevicePacket, PcapdService
 
 cli = InjectingTyper(
     name="pcap",
@@ -16,21 +16,24 @@ cli = InjectingTyper(
 )
 
 
-def print_packet_header(packet, color: bool) -> None:
+def print_packet_header(packet: DevicePacket, color: bool) -> None:
     date = datetime.fromtimestamp(packet.seconds + (packet.microseconds / 1000000))
     data = (
         f"{date}: "
         f"Process {packet.comm} ({packet.pid}), "
-        f"Interface: {packet.interface_name} ({packet.interface_type.name}), "
-        f"Family: {packet.protocol_family.name}"
+        f"Interface: {packet.interface_name} ({INTERFACE_NAMES(packet.interface_type).name}), "
+        f"Family: {CrossPlatformAddressFamily(packet.protocol_family).name}"
     )
     if not color:
         print(data)
     else:
-        print(highlight(data, lexers.HspecLexer(), formatters.Terminal256Formatter(style="native")), end="")
+        print(
+            highlight(data, cast(Any, lexers).HspecLexer(), cast(Any, formatters).Terminal256Formatter(style="native")),
+            end="",
+        )
 
 
-def print_packet(packet, color: Optional[bool] = None):
+def print_packet(packet: DevicePacket, color: Optional[bool] = None) -> DevicePacket:
     """Return the packet, so it can be chained in a generator"""
     if color is None:
         color = user_requested_colored_output()
@@ -40,7 +43,8 @@ def print_packet(packet, color: Optional[bool] = None):
 
 
 @cli.command()
-def pcap(
+@async_command
+async def pcap(
     service_provider: ServiceProviderDep,
     out: Optional[Path] = None,
     count: Annotated[
@@ -69,10 +73,14 @@ def pcap(
     packets_generator = service.watch(packets_count=count, process=process, interface_name=interface)
 
     if out is not None:
-        packets_generator_with_print = (print_packet(p) for p in packets_generator)
+
+        async def packets_generator_with_print():
+            async for packet in packets_generator:
+                yield print_packet(packet)
+
         with out.open("wb") as out_file:
-            service.write_to_pcap(out_file, packets_generator_with_print)
+            await service.write_to_pcap(out_file, packets_generator_with_print())
         return
 
-    for packet in packets_generator:
+    async for packet in packets_generator:
         print_packet(packet)

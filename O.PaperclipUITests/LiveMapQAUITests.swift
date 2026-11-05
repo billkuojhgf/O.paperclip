@@ -16,6 +16,7 @@ final class LiveMapQAUITests: XCTestCase {
     private var temporaryDirectory: URL!
     private var overlayTitle: String?
     private let cameraKeys = ["map.center.lat", "map.center.lon", "map.span.lat", "map.span.lon"]
+    private var persistedCameraKeys: [String] { cameraKeys + ["map.camera"] }
 
     override func setUp() async throws {
         continueAfterFailure = false
@@ -34,7 +35,7 @@ final class LiveMapQAUITests: XCTestCase {
         app.launchArguments = ["-AppleLanguages", "(zh-Hant)", "-AppleLocale", "zh_TW"]
         app.terminate()
         let preferences = readPreferences()
-        for key in cameraKeys { originalCamera[key] = preferences[key] }
+        for key in persistedCameraKeys { originalCamera[key] = preferences[key] }
         temporaryDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("LiveMapQA-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
     }
@@ -61,7 +62,7 @@ final class LiveMapQAUITests: XCTestCase {
             app.terminate()
         }
         if let bundleID {
-            for key in cameraKeys {
+            for key in persistedCameraKeys {
                 CFPreferencesSetAppValue(key as CFString, originalCamera[key] as CFPropertyList?, bundleID as CFString)
             }
             XCTAssertTrue(CFPreferencesAppSynchronize(bundleID as CFString))
@@ -72,7 +73,7 @@ final class LiveMapQAUITests: XCTestCase {
     // LOC-01, LOC-02 (live success), LOC-07 (fixed), MAP-01 (native gestures + disk persistence).
     func testLiveTaipei101CompletionResultFixedPointAndCameraGestures() throws {
         // Clear only camera preferences, preserving all unrelated user settings.
-        for key in cameraKeys { CFPreferencesSetAppValue(key as CFString, nil, bundleID as CFString) }
+        for key in persistedCameraKeys { CFPreferencesSetAppValue(key as CFString, nil, bundleID as CFString) }
         XCTAssertTrue(CFPreferencesAppSynchronize(bundleID as CFString))
         launchAppWindow()
         click(app.radioButtons["定點"])
@@ -110,8 +111,7 @@ final class LiveMapQAUITests: XCTestCase {
         let selected = try XCTUnwrap(camera())
         let map = app.maps.firstMatch
         XCTAssertTrue(map.waitForExistence(timeout: 5))
-        map.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.55))
-            .press(forDuration: 0.1, thenDragTo: map.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.55)))
+        pan(map)
         waitUntil("Native pan must persist a changed center") {
             guard let value = self.camera() else { return false }
             return abs(value[1] - selected[1]) > 0.0001
@@ -155,8 +155,8 @@ final class LiveMapQAUITests: XCTestCase {
             return abs(value[0] - 25.0389) < 0.002 && abs(value[1] - 121.5695) < 0.002
         }
         let map = app.maps.firstMatch
-        let first = map.descendants(matching: .any).matching(identifier: firstName).firstMatch
-        let second = map.descendants(matching: .any).matching(identifier: secondName).firstMatch
+        let first = map.descendants(matching: .any).matching(identifier: "pure-point-\(firstName)").firstMatch
+        let second = map.descendants(matching: .any).matching(identifier: "pure-point-\(secondName)").firstMatch
         XCTAssertTrue(first.waitForExistence(timeout: 10))
         XCTAssertTrue(second.waitForExistence(timeout: 10))
         click(toggle)
@@ -183,9 +183,7 @@ final class LiveMapQAUITests: XCTestCase {
             return abs(value[0] - 25.0389) < 0.002 && abs(value[1] - 121.5695) < 0.002
         }
         let cameraBeforePan = try XCTUnwrap(camera())
-        app.activate()
-        map.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.55))
-            .press(forDuration: 0.5, thenDragTo: map.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.55)))
+        pan(map)
         waitUntil("Panning must change the persisted map center") {
             guard let value = self.camera() else { return false }
             return abs(value[0] - cameraBeforePan[0]) > 0.00001 || abs(value[1] - cameraBeforePan[1]) > 0.00001
@@ -196,12 +194,19 @@ final class LiveMapQAUITests: XCTestCase {
             guard let value = self.camera() else { return false }
             return abs(value[2] - cameraBeforeZoom[2]) > 0.00001 || abs(value[3] - cameraBeforeZoom[3]) > 0.00001
         }
-        // Wait for the production onEnd camera persistence before recording screen positions.
-        let stable = expectation(for: NSPredicate { _, _ in
-            guard let value = self.camera() else { return false }
-            return value[2] > 0 && first.exists && second.exists
-        }, evaluatedWith: app)
-        wait(for: [stable], timeout: 10)
+        var lastFrames: [CGRect] = []
+        var lastCamera: [Double]?
+        var stableSince = Date()
+        waitUntil("Camera and annotation positions must settle after zoom") {
+            let frames = [first.frame, second.frame]
+            let camera = self.camera()
+            defer { lastFrames = frames; lastCamera = camera }
+            guard camera != nil, frames == lastFrames, camera == lastCamera else {
+                stableSince = Date()
+                return false
+            }
+            return Date().timeIntervalSince(stableSince) >= 2
+        }
         let before = [first.frame, second.frame]
         attachScreen("Imported overlay after focus filter pan zoom")
         app.terminate()
@@ -214,6 +219,11 @@ final class LiveMapQAUITests: XCTestCase {
             }
         }
         attachScreen("Imported annotations restored after relaunch")
+    }
+
+    private func pan(_ map: XCUIElement) {
+        let start = map.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.55))
+        start.click(forDuration: 0.1, thenDragTo: map.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.55)))
     }
 
     private func selectASCIIKeyboard() {
@@ -303,11 +313,8 @@ final class LiveMapQAUITests: XCTestCase {
         click(app.buttons["匯入 KML"])
         let panel = app.sheets["open-panel"]
         XCTAssertTrue(panel.waitForExistence(timeout: 5))
-        let browser = panel.descendants(matching: .browser)["ColumnView"]
-        XCTAssertTrue(browser.waitForExistence(timeout: 5))
-        browser.click()
         selectASCIIKeyboard()
-        browser.typeKey("g", modifierFlags: [.command, .shift])
+        panel.typeKey("g", modifierFlags: [.command, .shift])
         let pathSheet = panel.sheets.firstMatch
         replaceText(in: pathSheet.textFields.firstMatch, with: file.path)
         pathSheet.textFields.firstMatch.typeKey(.return, modifierFlags: [])

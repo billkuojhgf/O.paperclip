@@ -1,146 +1,100 @@
+"""RemoteXPC wire format: the ``XpcWrapper`` frame and the recursive XPC object encoding inside it."""
+
 import dataclasses
+import enum
 import uuid
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Annotated, Any, Callable, Optional, cast
 
-from construct import (
+from bytestruct import (
+    CSTRING,
+    F64_LE,
+    GREEDY_BYTES,
+    I64_LE,
+    PASS,
+    U32_LE,
+    U64_LE,
     Aligned,
-    Array,
+    BinaryParseError,
+    BinaryStruct,
+    ByteReader,
     Bytes,
+    BytesLike,
+    CodecBase,
     Const,
-    CString,
-    Default,
-    Double,
-    Enum,
-    ExprAdapter,
-    FlagsEnum,
-    GreedyBytes,
-    Hex,
-    If,
-    Int32ul,
-    Int64sl,
-    Int64ul,
-    LazyBound,
-    Pass,
     Prefixed,
-    Probe,
-    Struct,
+    PrefixedArray,
     Switch,
-    this,
+    Tuple,
+    u32,
+    u64,
 )
-from construct import Optional as ConstructOptional
 
-XpcMessageType = Enum(
-    Hex(Int32ul),
-    NULL=0x00001000,
-    BOOL=0x00002000,
-    INT64=0x00003000,
-    UINT64=0x00004000,
-    DOUBLE=0x00005000,
-    POINTER=0x00006000,
-    DATE=0x00007000,
-    DATA=0x00008000,
-    STRING=0x00009000,
-    UUID=0x0000A000,
-    FD=0x0000B000,
-    SHMEM=0x0000C000,
-    MACH_SEND=0x0000D000,
-    ARRAY=0x0000E000,
-    DICTIONARY=0x0000F000,
-    ERROR=0x00010000,
-    CONNECTION=0x00011000,
-    ENDPOINT=0x00012000,
-    SERIALIZER=0x00013000,
-    PIPE=0x00014000,
-    MACH_RECV=0x00015000,
-    BUNDLE=0x00016000,
-    SERVICE=0x00017000,
-    SERVICE_INSTANCE=0x00018000,
-    ACTIVITY=0x00019000,
-    FILE_TRANSFER=0x0001A000,
-)
-XpcFlags = FlagsEnum(
-    Hex(Int32ul),
-    ALWAYS_SET=0x00000001,
-    PING=0x00000002,
-    DATA_PRESENT=0x00000100,
-    WANTING_REPLY=0x00010000,
-    REPLY=0x00020000,
-    FILE_TX_STREAM_REQUEST=0x00100000,
-    FILE_TX_STREAM_RESPONSE=0x00200000,
-    INIT_HANDSHAKE=0x00400000,
-)
-AlignedString = Aligned(4, CString("utf8"))
-XpcNull = Pass
-XpcBool = Int32ul
-XpcInt64 = Int64sl
-XpcUInt64 = Int64ul
-XpcDouble = Double
-XpcPointer = None
-XpcDate = Int64ul
-XpcData = Aligned(4, Prefixed(Int32ul, GreedyBytes))
-XpcString = Aligned(4, Prefixed(Int32ul, CString("utf8")))
-XpcUuid = Bytes(16)
-XpcFd = Int32ul
-XpcShmem = Struct("length" / Int32ul, Int32ul)
-XpcArray = Prefixed(Int32ul, Struct("count" / Int32ul, "entries" / Array(this.count, LazyBound(lambda: XpcObject))))
-XpcDictionaryEntry = Struct(
-    "key" / AlignedString,
-    "value" / LazyBound(lambda: XpcObject),
-)
-XpcDictionary = Prefixed(
-    Int32ul,
-    Struct(
-        "count" / Hex(Int32ul),
-        "entries" / If(this.count > 0, Array(this.count, XpcDictionaryEntry)),
-    ),
-)
-XpcFileTransfer = Struct(
-    "msg_id" / Int64ul,
-    "data" / LazyBound(lambda: XpcObject),
-)
-XpcObject = Struct(
-    "type" / XpcMessageType,
-    "data"
-    / Switch(
-        this.type,
-        {
-            XpcMessageType.DICTIONARY: XpcDictionary,
-            XpcMessageType.STRING: XpcString,
-            XpcMessageType.INT64: XpcInt64,
-            XpcMessageType.UINT64: XpcUInt64,
-            XpcMessageType.DOUBLE: XpcDouble,
-            XpcMessageType.BOOL: XpcBool,
-            XpcMessageType.NULL: XpcNull,
-            XpcMessageType.UUID: XpcUuid,
-            XpcMessageType.POINTER: XpcPointer,
-            XpcMessageType.DATE: XpcDate,
-            XpcMessageType.DATA: XpcData,
-            XpcMessageType.FD: XpcFd,
-            XpcMessageType.SHMEM: XpcShmem,
-            XpcMessageType.ARRAY: XpcArray,
-            XpcMessageType.FILE_TRANSFER: XpcFileTransfer,
-        },
-        default=Probe(lookahead=1000),
-    ),
-)
-XpcPayload = Struct(
-    "magic" / Hex(Const(0x42133742, Int32ul)),
-    "protocol_version" / Hex(Const(0x00000005, Int32ul)),
-    "obj" / XpcObject,
-)
-XpcWrapper = Struct(
-    "magic" / Hex(Const(0x29B00B92, Int32ul)),
-    "flags" / Default(XpcFlags, XpcFlags.ALWAYS_SET),
-    "message"
-    / Prefixed(
-        ExprAdapter(Int64ul, lambda obj, context: obj + 8, lambda obj, context: obj - 8),
-        Struct(
-            "message_id" / Hex(Default(Int64ul, 0)),
-            "payload" / ConstructOptional(XpcPayload),
-        ),
-    ),
-)
+
+class XpcMessageType(enum.IntEnum):
+    NULL = 0x00001000
+    BOOL = 0x00002000
+    INT64 = 0x00003000
+    UINT64 = 0x00004000
+    DOUBLE = 0x00005000
+    POINTER = 0x00006000
+    DATE = 0x00007000
+    DATA = 0x00008000
+    STRING = 0x00009000
+    UUID = 0x0000A000
+    FD = 0x0000B000
+    SHMEM = 0x0000C000
+    MACH_SEND = 0x0000D000
+    ARRAY = 0x0000E000
+    DICTIONARY = 0x0000F000
+    ERROR = 0x00010000
+    CONNECTION = 0x00011000
+    ENDPOINT = 0x00012000
+    SERIALIZER = 0x00013000
+    PIPE = 0x00014000
+    MACH_RECV = 0x00015000
+    BUNDLE = 0x00016000
+    SERVICE = 0x00017000
+    SERVICE_INSTANCE = 0x00018000
+    ACTIVITY = 0x00019000
+    FILE_TRANSFER = 0x0001A000
+
+
+class XpcFlags(enum.IntFlag):
+    ALWAYS_SET = 0x00000001
+    PING = 0x00000002
+    DATA_PRESENT = 0x00000100
+    WANTING_REPLY = 0x00010000
+    REPLY = 0x00020000
+    FILE_TX_STREAM_REQUEST = 0x00100000
+    FILE_TX_STREAM_RESPONSE = 0x00200000
+    INIT_HANDSHAKE = 0x00400000
+
+
+XPC_WRAPPER_MAGIC = 0x29B00B92
+XPC_PAYLOAD_MAGIC = 0x42133742
+XPC_PAYLOAD_PROTOCOL_VERSION = 0x00000005
+
+
+@dataclasses.dataclass
+class XpcWrapperHeader(BinaryStruct, byte_order="<"):
+    """Fixed header of a RemoteXPC frame."""
+
+    magic: Annotated[u32, Const(XPC_WRAPPER_MAGIC)]
+    flags: Annotated[XpcFlags, u32]
+    size: u64  # payload size, excluding message_id
+    message_id: u64
+
+
+@dataclasses.dataclass
+class XpcPayloadHeader(BinaryStruct, byte_order="<"):
+    """Header preceding the top-level XPC object of a frame's payload."""
+
+    magic: Annotated[u32, Const(XPC_PAYLOAD_MAGIC)]
+    protocol_version: Annotated[u32, Const(XPC_PAYLOAD_PROTOCOL_VERSION)]
+
+
+_PAYLOAD_HEADER = XpcPayloadHeader(XPC_PAYLOAD_MAGIC, XPC_PAYLOAD_PROTOCOL_VERSION).build()
 
 
 class XpcInt64Type(int):
@@ -153,194 +107,235 @@ class XpcUInt64Type(int):
 
 @dataclasses.dataclass
 class FileTransferType:
+    """An XPC file-transfer object: the payload itself travels on its own HTTP/2 stream.
+
+    ``transfer_id`` correlates the announcement with that stream. It is unset (0) on objects
+    decoded from the device, whose stream is derived positionally by the receiving code.
+    """
+
     transfer_size: int
+    transfer_id: int = 0
 
 
-def _decode_xpc_dictionary(xpc_object) -> dict:
-    if xpc_object.data.count == 0:
-        return {}
-    result = {}
-    for entry in xpc_object.data.entries:
-        result[entry.key] = decode_xpc_object(entry.value)
+@dataclasses.dataclass
+class XpcObject:
+    """One encoded XPC object.
+
+    ``type`` is an ``XpcMessageType``, or the raw ``int`` for a type unknown to this module. ``data``
+    depends on it:
+
+    - DICTIONARY: ``list[tuple[str, XpcObject]]`` (wire order)
+    - ARRAY: ``list[XpcObject]``
+    - FILE_TRANSFER: ``XpcFileTransfer``
+    - BOOL, INT64, UINT64, DATE, FD: ``int`` (BOOL is the raw 32-bit word); SHMEM: ``int`` length
+    - DOUBLE: ``float``; DATA, UUID: ``bytes``; STRING: ``str``
+    - NULL and types without a payload decoder: ``None`` (no payload bytes)
+    """
+
+    type: int
+    data: Any = None
+
+    @classmethod
+    def parse(cls, data: BytesLike) -> "XpcObject":
+        return cls.read(ByteReader(data))
+
+    @classmethod
+    def read(cls, reader: ByteReader) -> "XpcObject":
+        object_type: int
+        object_type, data = _XPC_OBJECT.read(reader)
+        return cls(_XPC_MESSAGE_TYPES.get(object_type, object_type), data)
+
+    def build(self) -> bytes:
+        return _XPC_OBJECT.build((self.type, self.data))
+
+
+@dataclasses.dataclass
+class XpcFileTransfer(BinaryStruct, byte_order="<"):
+    """Wire body of an ``XpcMessageType.FILE_TRANSFER`` object."""
+
+    msg_id: u64
+    data: Annotated[XpcObject, XpcObject]
+
+
+class _Unparsable(CodecBase[None]):
+    """A type whose payload layout is unknown, so nothing after it can be parsed."""
+
+    def read(self, reader: ByteReader) -> None:
+        raise BinaryParseError("XPC POINTER objects cannot be parsed", offset=reader.absolute - U32_LE.size)
+
+    def build(self, value: None) -> bytes:
+        return b""
+
+
+_XPC_MESSAGE_TYPES: dict[int, int] = {member.value: member for member in XpcMessageType}
+
+# Padding is relative to where each value starts, not to the enclosing container: a container whose declared
+# length is not a multiple of 4 leaves the objects after it unaligned.
+_XPC_OBJECT = Switch(
+    U32_LE,
+    {
+        XpcMessageType.NULL: PASS,
+        XpcMessageType.BOOL: U32_LE,
+        XpcMessageType.INT64: I64_LE,
+        XpcMessageType.UINT64: U64_LE,
+        XpcMessageType.DOUBLE: F64_LE,
+        XpcMessageType.POINTER: _Unparsable(),
+        XpcMessageType.DATE: I64_LE,  # int64_t nanoseconds (xpc_date_create)
+        XpcMessageType.DATA: Aligned(4, Prefixed(U32_LE, GREEDY_BYTES)),
+        XpcMessageType.STRING: Aligned(4, Prefixed(U32_LE, CSTRING)),
+        XpcMessageType.UUID: Bytes(16),
+        XpcMessageType.FD: U32_LE,
+        XpcMessageType.SHMEM: Aligned(8, U32_LE),  # u32 length + 4 reserved bytes
+        XpcMessageType.ARRAY: Prefixed(U32_LE, PrefixedArray(U32_LE, XpcObject)),
+        XpcMessageType.DICTIONARY: Prefixed(U32_LE, PrefixedArray(U32_LE, Tuple(Aligned(4, CSTRING), XpcObject))),
+        XpcMessageType.FILE_TRANSFER: XpcFileTransfer,
+    },
+    default=PASS,  # a type without a payload layout here: no payload bytes are consumed
+)
+
+
+@dataclasses.dataclass
+class XpcWrapper:
+    """A RemoteXPC message frame.
+
+    ``payload`` is the top-level XPC object, or ``None`` for a frame carrying none (or one whose
+    payload could not be parsed).
+    """
+
+    flags: int = XpcFlags.ALWAYS_SET
+    message_id: int = 0
+    payload: Optional[XpcObject] = None
+
+    @classmethod
+    def parse(cls, data: BytesLike) -> "XpcWrapper":
+        """Parse one frame from the start of ``data``; trailing bytes are ignored.
+
+        :raises TruncatedDataError: ``data`` holds only part of a frame.
+        :raises UnexpectedConstantError: ``data`` does not start with the wrapper magic.
+        """
+        header = XpcWrapperHeader.parse(data)
+        payload = ByteReader(data, XpcWrapperHeader.SIZE).sub(header.size)
+        return cls(flags=header.flags, message_id=header.message_id, payload=_parse_payload(payload))
+
+    def build(self) -> bytes:
+        body = b""
+        if self.payload is not None:
+            body = _PAYLOAD_HEADER + self.payload.build()
+        header = XpcWrapperHeader(XPC_WRAPPER_MAGIC, cast(XpcFlags, self.flags), len(body), self.message_id)
+        return header.build() + body
+
+
+def _parse_payload(reader: ByteReader) -> Optional[XpcObject]:
+    """Parse the optional payload; anything that is not a well-formed payload (including one nested too deeply
+    to recurse into) yields ``None``."""
+    try:
+        XpcPayloadHeader.read(reader)
+        return XpcObject.read(reader)
+    except (BinaryParseError, RecursionError):
+        return None
+
+
+def _decode_xpc_dictionary(xpc_object: XpcObject) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in xpc_object.data:
+        result[key] = decode_xpc_object(value)
     return result
 
 
-def _decode_xpc_array(xpc_object) -> list:
-    result = []
-    for entry in xpc_object.data.entries:
-        result.append(decode_xpc_object(entry))
-    return result
+def _decode_xpc_array(xpc_object: XpcObject) -> list[Any]:
+    return [decode_xpc_object(entry) for entry in xpc_object.data]
 
 
-def _decode_xpc_bool(xpc_object) -> bool:
-    return bool(xpc_object.data)
+# The Gregorian calendar repeats every 400 years, weekdays included, so shifting a date by this many days keeps
+# its month, day and weekday - everything a "second Sunday of March" daylight saving rule looks at.
+_GREGORIAN_CYCLE = timedelta(days=146097)
 
 
-def _decode_xpc_int64(xpc_object) -> XpcInt64Type:
-    return XpcInt64Type(xpc_object.data)
+def _decode_xpc_date(xpc_object: XpcObject) -> datetime:
+    seconds = xpc_object.data / 1000000000  # signed nanoseconds since 1970
+    try:
+        return datetime.fromtimestamp(seconds)
+    except (OverflowError, OSError, ValueError):
+        # Windows cannot convert dates before 1970 to local time: convert the same instant 400 years later
+        # (int64 nanoseconds reach back only to 1677) and shift the result back.
+        return datetime.fromtimestamp(seconds + _GREGORIAN_CYCLE.total_seconds()) - _GREGORIAN_CYCLE
 
 
-def _decode_xpc_uint64(xpc_object) -> XpcUInt64Type:
-    return XpcUInt64Type(xpc_object.data)
-
-
-def _decode_xpc_uuid(xpc_object) -> uuid.UUID:
-    return uuid.UUID(bytes=xpc_object.data)
-
-
-def _decode_xpc_string(xpc_object) -> str:
-    return xpc_object.data
-
-
-def _decode_xpc_data(xpc_object) -> bytes:
-    return xpc_object.data
-
-
-def _decode_xpc_date(xpc_object) -> datetime:
-    # Convert from nanoseconds to seconds
-    return datetime.fromtimestamp(xpc_object.data / 1000000000)
-
-
-def _decode_xpc_file_transfer(xpc_object) -> FileTransferType:
+def _decode_xpc_file_transfer(xpc_object: XpcObject) -> FileTransferType:
+    if xpc_object.data.data.type != XpcMessageType.DICTIONARY:
+        raise TypeError(f"deserialize error: {xpc_object}")
     return FileTransferType(transfer_size=_decode_xpc_dictionary(xpc_object.data.data)["s"])
 
 
-def _decode_xpc_double(xpc_object) -> float:
-    return xpc_object.data
+_XPC_DECODERS: dict[int, Callable[[XpcObject], Any]] = {
+    XpcMessageType.DICTIONARY: _decode_xpc_dictionary,
+    XpcMessageType.ARRAY: _decode_xpc_array,
+    XpcMessageType.BOOL: lambda xpc_object: bool(xpc_object.data),
+    XpcMessageType.INT64: lambda xpc_object: XpcInt64Type(xpc_object.data),
+    XpcMessageType.UINT64: lambda xpc_object: XpcUInt64Type(xpc_object.data),
+    XpcMessageType.UUID: lambda xpc_object: uuid.UUID(bytes=xpc_object.data),
+    XpcMessageType.STRING: lambda xpc_object: xpc_object.data,
+    XpcMessageType.DATA: lambda xpc_object: xpc_object.data,
+    XpcMessageType.DATE: _decode_xpc_date,
+    XpcMessageType.FILE_TRANSFER: _decode_xpc_file_transfer,
+    XpcMessageType.DOUBLE: lambda xpc_object: xpc_object.data,
+    XpcMessageType.NULL: lambda xpc_object: None,
+}
 
 
-def _decode_xpc_null(xpc_object) -> None:
-    return None
-
-
-def decode_xpc_object(xpc_object) -> Any:
-    decoders = {
-        XpcMessageType.DICTIONARY: _decode_xpc_dictionary,
-        XpcMessageType.ARRAY: _decode_xpc_array,
-        XpcMessageType.BOOL: _decode_xpc_bool,
-        XpcMessageType.INT64: _decode_xpc_int64,
-        XpcMessageType.UINT64: _decode_xpc_uint64,
-        XpcMessageType.UUID: _decode_xpc_uuid,
-        XpcMessageType.STRING: _decode_xpc_string,
-        XpcMessageType.DATA: _decode_xpc_data,
-        XpcMessageType.DATE: _decode_xpc_date,
-        XpcMessageType.FILE_TRANSFER: _decode_xpc_file_transfer,
-        XpcMessageType.DOUBLE: _decode_xpc_double,
-        XpcMessageType.NULL: _decode_xpc_null,
-    }
-    decoder = decoders.get(xpc_object.type)
+def decode_xpc_object(xpc_object: XpcObject) -> Any:
+    decoder = _XPC_DECODERS.get(xpc_object.type)
     if decoder is None:
         raise TypeError(f"deserialize error: {xpc_object}")
     return decoder(xpc_object)
 
 
-def _build_xpc_array(payload: list) -> dict:
-    entries = []
-    for entry in payload:
-        entry = _build_xpc_object(entry)
-        entries.append(entry)
-    return {"type": XpcMessageType.ARRAY, "data": {"count": len(entries), "entries": entries}}
+def _build_xpc_array(payload: list[Any]) -> XpcObject:
+    return XpcObject(XpcMessageType.ARRAY, [_build_xpc_object(entry) for entry in payload])
 
 
-def _build_xpc_dictionary(payload: dict) -> dict:
-    entries = []
-    for key, value in payload.items():
-        entry = {"key": key, "value": _build_xpc_object(value)}
-        entries.append(entry)
-    return {
-        "type": XpcMessageType.DICTIONARY,
-        "data": {
-            "count": len(entries),
-            "entries": entries,
-        },
-    }
+def _build_xpc_dictionary(payload: dict[str, Any]) -> XpcObject:
+    return XpcObject(XpcMessageType.DICTIONARY, [(key, _build_xpc_object(value)) for key, value in payload.items()])
 
 
-def _build_xpc_bool(payload: bool) -> dict:
-    return {
-        "type": XpcMessageType.BOOL,
-        "data": payload,
-    }
+def _build_xpc_file_transfer(payload: FileTransferType) -> XpcObject:
+    return XpcObject(
+        XpcMessageType.FILE_TRANSFER,
+        XpcFileTransfer(
+            msg_id=payload.transfer_id,
+            data=_build_xpc_dictionary({"s": XpcUInt64Type(payload.transfer_size)}),
+        ),
+    )
 
 
-def _build_xpc_string(payload: str) -> dict:
-    return {
-        "type": XpcMessageType.STRING,
-        "data": payload,
-    }
-
-
-def _build_xpc_data(payload: bool) -> dict:
-    return {
-        "type": XpcMessageType.DATA,
-        "data": payload,
-    }
-
-
-def _build_xpc_double(payload: float) -> dict:
-    return {
-        "type": XpcMessageType.DOUBLE,
-        "data": payload,
-    }
-
-
-def _build_xpc_uuid(payload: uuid.UUID) -> dict:
-    return {
-        "type": XpcMessageType.UUID,
-        "data": payload.bytes,
-    }
-
-
-def _build_xpc_null(payload: None) -> dict:
-    return {
-        "type": XpcMessageType.NULL,
-        "data": None,
-    }
-
-
-def _build_xpc_uint64(payload: XpcUInt64Type) -> dict:
-    return {
-        "type": XpcMessageType.UINT64,
-        "data": payload,
-    }
-
-
-def _build_xpc_int64(payload: XpcInt64Type) -> dict:
-    return {
-        "type": XpcMessageType.INT64,
-        "data": payload,
-    }
-
-
-def _build_xpc_object(payload: Any) -> dict:
+def _build_xpc_object(payload: Any) -> XpcObject:
     if payload is None:
-        return _build_xpc_null(payload)
-    payload_builders = {
-        list: _build_xpc_array,
-        dict: _build_xpc_dictionary,
-        bool: _build_xpc_bool,
-        str: _build_xpc_string,
-        bytes: _build_xpc_data,
-        bytearray: _build_xpc_data,
-        float: _build_xpc_double,
-        uuid.UUID: _build_xpc_uuid,
-        "XpcUInt64Type": _build_xpc_uint64,
-        "XpcInt64Type": _build_xpc_int64,
-    }
-    builder = payload_builders.get(type(payload), payload_builders.get(type(payload).__name__))
+        return XpcObject(XpcMessageType.NULL)
+    builder = _PAYLOAD_BUILDERS.get(type(payload)) or _PAYLOAD_BUILDERS.get(type(payload).__name__)
     if builder is None:
         raise TypeError(f"unrecognized type for: {payload} {type(payload)}")
     return builder(payload)
 
 
-def create_xpc_wrapper(d: dict, message_id: int = 0, wanting_reply: bool = False) -> bytes:
+_PAYLOAD_BUILDERS: dict[Any, Callable[[Any], XpcObject]] = {
+    list: _build_xpc_array,
+    dict: _build_xpc_dictionary,
+    bool: lambda value: XpcObject(XpcMessageType.BOOL, int(value)),
+    str: lambda value: XpcObject(XpcMessageType.STRING, value),
+    bytes: lambda value: XpcObject(XpcMessageType.DATA, value),
+    bytearray: lambda value: XpcObject(XpcMessageType.DATA, bytes(value)),
+    float: lambda value: XpcObject(XpcMessageType.DOUBLE, value),
+    uuid.UUID: lambda value: XpcObject(XpcMessageType.UUID, value.bytes),
+    FileTransferType: _build_xpc_file_transfer,
+    "XpcUInt64Type": lambda value: XpcObject(XpcMessageType.UINT64, int(value)),
+    "XpcInt64Type": lambda value: XpcObject(XpcMessageType.INT64, int(value)),
+}
+
+
+def create_xpc_wrapper(d: dict[str, Any], message_id: int = 0, wanting_reply: bool = False) -> bytes:
     flags = XpcFlags.ALWAYS_SET
     if len(d.keys()) > 0:
         flags |= XpcFlags.DATA_PRESENT
     if wanting_reply:
         flags |= XpcFlags.WANTING_REPLY
-
-    xpc_payload = {"message_id": message_id, "payload": {"obj": _build_xpc_object(d)}}
-
-    xpc_wrapper = {"flags": flags, "message": xpc_payload}
-    return XpcWrapper.build(xpc_wrapper)
+    return XpcWrapper(flags=flags, message_id=message_id, payload=_build_xpc_object(d)).build()

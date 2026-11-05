@@ -1,58 +1,59 @@
 import ipaddress
 import logging
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Union
+from typing import Annotated, Any, Optional, Union, cast
 
-from construct import Adapter, Bytes, Int8ul, Int16ub, Int32ul, Switch, this
-from construct_typed import DataclassMixin, TStruct, csfield
+from bytestruct import BinaryStruct, ByteReader, Bytes, BytesLike, ipv4, ipv6, u8, u16, u32
 
-from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
-
-
-class IpAddressAdapter(Adapter):
-    """Decode raw address bytes into ipaddress objects."""
-
-    def _decode(self, obj, context, path):
-        return ipaddress.ip_address(obj)
+from pymobiledevice3.dtx import DTXContext, DTXQueue, DTXService, dtx_method, dtx_on_dispatch, dtx_on_notification
+from pymobiledevice3.dtx_service import DtxService
+from pymobiledevice3.dtx_service_provider import DtxServiceProvider
 
 
 @dataclass
-class AddressV6(DataclassMixin):
+class AddressV6(BinaryStruct, byte_order="<"):
     """IPv6 payload for a socket address."""
 
-    flow_info: int = csfield(Int32ul)
-    address: ipaddress.IPv6Address = csfield(IpAddressAdapter(Bytes(16)))
-    scope_id: int = csfield(Int32ul)
+    flow_info: u32
+    address: ipv6
+    scope_id: u32
 
 
 @dataclass
-class AddressV4(DataclassMixin):
+class AddressV4(BinaryStruct, byte_order="<"):
     """IPv4 payload for a socket address."""
 
-    address: ipaddress.IPv4Address = csfield(IpAddressAdapter(Bytes(4)))
-    _zero: bytes = csfield(Bytes(8))
+    address: ipv4
+    _zero: Annotated[bytes, Bytes(8)]
 
 
 @dataclass
-class SocketAddress(DataclassMixin):
+class SocketAddress(BinaryStruct, byte_order=">"):
     """Parsed socket address with family-specific payload."""
 
-    length: int = csfield(Int8ul)
-    family: int = csfield(Int8ul)
-    port: int = csfield(Int16ub)
-    data: Union[AddressV4, AddressV6] = csfield(
-        Switch(
-            this.length,
-            {
-                0x1C: TStruct(AddressV6),
-                0x10: TStruct(AddressV4),
-            },
-        )
-    )
+    length: u8
+    family: u8
+    port: u16
+    #: ``None`` when ``length`` is neither that of a ``sockaddr_in`` nor of a ``sockaddr_in6``.
+    data: Optional[Union[AddressV4, AddressV6]] = None
 
+    @property
+    def address(self) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+        """The IP address, or ``None`` for an address family without a payload decoder."""
+        return None if self.data is None else self.data.address
 
-address_t = TStruct(SocketAddress)
+    @classmethod
+    def parse(cls, data: BytesLike) -> "SocketAddress":
+        """Parse a raw ``sockaddr`` (big-endian port, little-endian IPv6 flow info / scope id)."""
+        reader = ByteReader(data)
+        address = cls.read(reader)
+        if address.length == 0x1C:
+            address.data = AddressV6.read(reader)
+        elif address.length == 0x10:
+            address.data = AddressV4.read(reader)
+        return address
+
 
 MESSAGE_TYPE_INTERFACE_DETECTION = 0
 MESSAGE_TYPE_CONNECTION_DETECTION = 1
@@ -61,7 +62,7 @@ MESSAGE_TYPE_CONNECTION_UPDATE = 2
 
 @dataclass
 class InterfaceDetectionEvent:
-    """Interface detection event emitted by Instruments."""
+    """A network interface discovered by the monitor, identified by its index and name."""
 
     interface_index: int
     name: str
@@ -69,7 +70,7 @@ class InterfaceDetectionEvent:
 
 @dataclass
 class ConnectionDetectionEvent:
-    """Connection detection event emitted by Instruments."""
+    """A newly detected socket connection with its endpoints, owning process and buffer state."""
 
     local_address: SocketAddress
     remote_address: SocketAddress
@@ -83,7 +84,7 @@ class ConnectionDetectionEvent:
 
 @dataclass
 class ConnectionUpdateEvent:
-    """Connection update event emitted by Instruments."""
+    """Periodic traffic statistics for a previously detected connection, keyed by `connection_serial`."""
 
     rx_packets: int
     rx_bytes: int
@@ -101,35 +102,77 @@ class ConnectionUpdateEvent:
 NetworkMonitorEvent = Union[InterfaceDetectionEvent, ConnectionDetectionEvent, ConnectionUpdateEvent]
 
 
-class NetworkMonitor:
-    """Iterate over network monitoring events from the Instruments service."""
-
+class NetworkMonitorService(DTXService):
     IDENTIFIER = "com.apple.instruments.server.services.networking"
 
-    def __init__(self, dvt: DvtSecureSocketProxyService):
-        self.logger = logging.getLogger(__name__)
-        self._channel = dvt.make_channel(self.IDENTIFIER)
+    def __init__(self, ctx: DTXContext) -> None:
+        super().__init__(ctx)
+        self.events: DTXQueue[Any] = DTXQueue()
 
-    def __enter__(self) -> "NetworkMonitor":
-        self._channel.startMonitoring(expects_reply=False)
+    def on_closed(self, reason: str = "") -> None:
+        self.shutdown_queue(self.events)
+        super().on_closed(reason)
+
+    @dtx_method("startMonitoring", expects_reply=False)
+    async def start_monitoring(self) -> None: ...
+
+    @dtx_method("stopMonitoring")
+    async def stop_monitoring(self) -> None: ...
+
+    @dtx_on_dispatch
+    async def _on_dispatch(self, selector: str, *args: Any) -> None:
+        await self.events.put((selector, list(args)))
+
+    @dtx_on_notification
+    async def _on_notification(self, payload: Any) -> None:
+        await self.events.put(payload)
+
+
+class NetworkMonitor(DtxService[NetworkMonitorService]):
+    """
+    Monitor device network activity over the Instruments networking channel.
+
+    Constructed with a `DvtProvider`. Use as an async context manager: entering starts
+    monitoring and exiting stops it. The object is async-iterable, yielding decoded
+    `InterfaceDetectionEvent`, `ConnectionDetectionEvent` and `ConnectionUpdateEvent`
+    instances as they arrive.
+    """
+
+    def __init__(self, dvt: DtxServiceProvider):
+        super().__init__(dvt)
+        self.logger = logging.getLogger(__name__)
+
+    async def __aenter__(self) -> "NetworkMonitor":
+        await self.connect()
+        await self.service.start_monitoring()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self._channel.stopMonitoring()
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.service.stop_monitoring()
 
-    def __iter__(self) -> Iterator[NetworkMonitorEvent]:
-        """Yield network events as they arrive from the service."""
+    async def __aiter__(self) -> AsyncIterator[Optional[NetworkMonitorEvent]]:
+        """
+        Decode and yield network events as they arrive from the service.
 
+        Each raw message is dispatched by its leading message-type code. Socket addresses on
+        connection-detection events are parsed into `SocketAddress` structures. Unrecognized
+        or malformed payloads are logged and skipped (no event is yielded for them).
+
+        :yields: The decoded event, or `None` when a known message type carried no payload.
+        """
         while True:
-            message = self._channel.receive_plist()
+            message = await self._receive_message()
 
             event = None
 
             if message is None:
                 continue
+            if not isinstance(message, (list, tuple)) or len(cast(Sequence[Any], message)) < 2:
+                self.logger.warning(f"unsupported event payload: {message!r}")
+                continue
 
             if message[0] == MESSAGE_TYPE_INTERFACE_DETECTION:
-                event = InterfaceDetectionEvent(*message[1])
+                event = InterfaceDetectionEvent(*cast(tuple[Any, ...], message[1]))
             elif message[0] == MESSAGE_TYPE_CONNECTION_DETECTION:
                 (
                     local_address,
@@ -140,10 +183,10 @@ class NetworkMonitor:
                     recv_buffer_used,
                     serial_number,
                     kind,
-                ) = message[1]
+                ) = cast(tuple[Any, ...], message[1])
                 event = ConnectionDetectionEvent(
-                    local_address=address_t.parse(local_address),
-                    remote_address=address_t.parse(remote_address),
+                    local_address=SocketAddress.parse(local_address),
+                    remote_address=SocketAddress.parse(remote_address),
                     interface_index=interface_index,
                     pid=pid,
                     recv_buffer_size=recv_buffer_size,
@@ -152,7 +195,10 @@ class NetworkMonitor:
                     kind=kind,
                 )
             elif message[0] == MESSAGE_TYPE_CONNECTION_UPDATE:
-                event = ConnectionUpdateEvent(*message[1])
+                event = ConnectionUpdateEvent(*cast(tuple[Any, ...], message[1]))
             else:
                 self.logger.warning(f"unsupported event type: {message[0]}")
             yield event
+
+    async def _receive_message(self):
+        return await self.service.events.get()

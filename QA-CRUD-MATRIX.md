@@ -12,6 +12,15 @@
 
 ## 執行證據（持續更新，非結案）
 
+### 非 root 遷移分支地圖修正（2026-11-05）
+
+- `LiveMapQAUITests.testImportedOverlayToggleCategoryFocusAndRestoredAnnotationPositions` 完整通過，未刪除開關／分類／平移／縮放／重啟後兩點位置斷言；證據 `/tmp/paperclip-map-final-regression.xcresult`，exit 0。
+- 自動化平移改用 macOS 滑鼠 `click(forDuration:thenDragTo:)`；原觸控 `press` 未送達原生地圖拖曳事件。圖層圓點使用實際 SwiftUI accessibility identifier，避免 MapKit 快取的點名節點。
+- 獨立原生 Map 重現：尺寸 `579×418 → 1079×788` 使相機距離 `4400 → 8294.74`；尺寸 identity 後保持 `4400`。產品保存原生相機並在地圖尺寸變更時重建 Map，已由上述重啟點位斷言驗證。
+- pinned Python runtime 的 worker 測試 30 項通過；Release build、deep/strict codesign 驗證與 bundled worker byte comparison exit 0。既有 AppViewModel Sendable warning 仍存在。
+- 完整 `prepare.py` 驗收依 GUI 排他協調中止，不能作為全套通過證據；新 Release GUI smoke 與真機 GPS 驗收仍未完成。已讓出 GUI 給 `fix-right-panel`；本分支未合併、未安裝至 `/Applications`。
+
+
 ### 最新根因與證據（16:07，尚未結案）
 
 - KML／多點原失敗：ASCII 鍵盤控制後真實 GUI 兩案例通過；checkbox 原 String cast 亦已改為 NSNumber，未放寬產品預期。

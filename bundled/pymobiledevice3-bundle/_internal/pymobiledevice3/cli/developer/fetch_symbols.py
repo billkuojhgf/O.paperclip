@@ -1,5 +1,5 @@
-import asyncio
 import logging
+import shutil
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -8,10 +8,12 @@ from ipsw_parser.dsc import create_device_support_layout, get_device_support_pat
 from packaging.version import Version
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, print_json
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_json
 from pymobiledevice3.exceptions import RSDRequiredError
+from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.safe_paths import resolve_device_path, validate_device_filename
 from pymobiledevice3.services.dtfetchsymbols import DtFetchSymbols
 from pymobiledevice3.services.remote_fetch_symbols import RemoteFetchSymbolsService
 
@@ -25,47 +27,69 @@ cli = InjectingTyper(
 )
 
 
-async def fetch_symbols_list_task(service_provider: LockdownServiceProvider) -> None:
+@cli.command("list")
+@async_command
+async def fetch_symbols_list(service_provider: ServiceProviderDep) -> None:
+    """list of files to be downloaded"""
     if Version(service_provider.product_version) < Version("17.0"):
-        print_json(DtFetchSymbols(service_provider).list_files())
+        print_json(await DtFetchSymbols(service_provider).list_files())
     else:
         if not isinstance(service_provider, RemoteServiceDiscoveryService):
-            raise RSDRequiredError(service_provider.identifier)
+            assert isinstance(service_provider, LockdownClient)  # non-RSD providers are lockdown clients
+            raise RSDRequiredError(service_provider.identifier, service_provider.product_version)
 
         async with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
             print_json([f.file_path for f in await fetch_symbols.get_dsc_file_list()])
 
 
-@cli.command("list")
-def fetch_symbols_list(service_provider: ServiceProviderDep) -> None:
-    """list of files to be downloaded"""
-    asyncio.run(fetch_symbols_list_task(service_provider), debug=True)
+async def fetch_symbols_download_task(
+    service_provider: LockdownServiceProvider, out: Optional[Path] = None, force: bool = False
+) -> None:
+    """
+    Download the device's symbols into `out`, or into its Xcode DeviceSupport directory when omitted.
 
-
-async def fetch_symbols_download_task(service_provider: LockdownServiceProvider, out: Optional[Path] = None) -> None:
+    Symbols which were already downloaded are kept unless `force` is set: a finalized DeviceSupport
+    directory is left untouched, and so is every file of `out` already having the size the device
+    reports (devices older than iOS 17 report no sizes, so their files are always downloaded).
+    """
     should_create_device_support_layout = False
     if out is None:
         assert service_provider.product_type is not None  # for type checker
+        validate_device_filename(service_provider.product_type)
+        validate_device_filename(service_provider.product_version)
+        if service_provider.product_build_version:
+            validate_device_filename(service_provider.product_build_version)
         out = get_device_support_path(
-            service_provider.product_type, service_provider.product_version, service_provider.product_build_version
+            service_provider.product_type,
+            service_provider.product_version,
+            service_provider.product_build_version or "",
         )
         should_create_device_support_layout = True
+        # Xcode and `create_device_support_layout()` both mark a completed directory with `.finalized`.
+        # The frameworks only show up once the shared cache was split into its images.
+        if (out / ".finalized").exists() and (out / "Symbols/System/Library/Frameworks").is_dir():
+            if not force:
+                logger.info(f"Symbols were already downloaded into: {out} (use --force to download them again)")
+                return
+            shutil.rmtree(out)
 
-    logger.info(f"Downloading DSC into: {out}")
+    symbols_out = out / "Symbols" if should_create_device_support_layout else out
 
-    out.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Downloading DSC into: {symbols_out}")
+
+    symbols_out.mkdir(parents=True, exist_ok=True)
 
     if Version(service_provider.product_version) < Version("17.0"):
         fetch_symbols = DtFetchSymbols(service_provider)
-        files = fetch_symbols.list_files()
+        files = await fetch_symbols.list_files()
 
-        downloaded_files = set()
+        downloaded_files: set[Path] = set()
 
         for i, file in enumerate(files):
             if file.startswith("/"):
                 # trim root to allow relative download
                 file = file[1:]
-            file = out / file
+            file = resolve_device_path(symbols_out, file)
 
             if file not in downloaded_files:
                 # first time the file was seen in list, means we can safely remove any old copy if any
@@ -76,27 +100,36 @@ async def fetch_symbols_download_task(service_provider: LockdownServiceProvider,
             with open(file, "ab") as f:
                 # same file may appear twice, so we'll need to append data into it
                 logger.info(f"writing to: {file}")
-                fetch_symbols.get_file(i, f)
+                await fetch_symbols.get_file(i, f)
     else:
         if not isinstance(service_provider, RemoteServiceDiscoveryService):
-            raise RSDRequiredError(service_provider.identifier)
+            assert isinstance(service_provider, LockdownClient)  # non-RSD providers are lockdown clients
+            raise RSDRequiredError(service_provider.identifier, service_provider.product_version)
         async with RemoteFetchSymbolsService(service_provider) as fetch_symbols:
-            await fetch_symbols.download(out)
+            await fetch_symbols.download(symbols_out, force=force)
 
     if should_create_device_support_layout:
         assert service_provider.product_type is not None  # for type checker
         create_device_support_layout(
-            service_provider.product_type, service_provider.product_version, service_provider.product_build_version, out
+            service_provider.product_type,
+            service_provider.product_version,
+            service_provider.product_build_version or "",
+            symbols_out,
         )
 
 
 @cli.command("download")
-def fetch_symbols_download(
+@async_command
+async def fetch_symbols_download(
     service_provider: ServiceProviderDep,
     out: Annotated[
         Optional[Path],
         typer.Argument(dir_okay=True, file_okay=False),
     ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Download the symbols again even if they were already downloaded."),
+    ] = False,
 ) -> None:
     """
     Fetches symbols from the given device and saves them into Xcode DeviceSupport directory.
@@ -104,5 +137,7 @@ def fetch_symbols_download(
     This command downloads symbol data. Optionally, the user can specify an output directory where the data will
     be stored. If no output directory is provided, the symbols will be downloaded into the Xcode directory directly
     (DeviceSupport).
+
+    Symbols which were already downloaded are kept, unless --force is given.
     """
-    asyncio.run(fetch_symbols_download_task(service_provider, out), debug=True)
+    await fetch_symbols_download_task(service_provider, out, force)

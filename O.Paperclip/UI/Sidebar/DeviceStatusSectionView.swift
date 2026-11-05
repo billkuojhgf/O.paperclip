@@ -65,7 +65,7 @@ struct DeviceStatusSectionView: View {
                     .lineLimit(3)
             } else if !vm.deviceManager.isConnected {
                 Text(isWirelessMode
-                     ? "確保 iPhone 與 Mac 在同一個 Wi‑Fi 網路，按下開始連線。"
+                     ? "確保裝置與 Mac 在同一個 Wi‑Fi 網路，並已透過信任的 USB 完成配對。"
                      : "先插上手機並解鎖，按下開始連線即可。")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -117,7 +117,7 @@ private struct DeviceSlotView: View {
             }
             TextField("裝置 UDID", text: $device.tunnelUDID)
                 .disabled(device.isConnected || device.isConnecting)
-            Text(device.isWirelessMode ? "Wi‑Fi" : "USB").font(.caption)
+            Text(device.isConnected ? device.activeConnectionLabel : (device.isWirelessMode ? "Wi‑Fi" : "USB")).font(.caption)
             Text(device.deviceName).font(.caption)
             if let error = device.lastError {
                 Text(error).font(.caption).foregroundStyle(.red)

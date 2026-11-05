@@ -1,15 +1,20 @@
 import asyncio
 import contextlib
+import logging
 from base64 import b64decode, b64encode
 from datetime import datetime
 from io import BytesIO
-from typing import Optional
+from typing import Any, Optional
 
 from PIL import Image
 
+from pymobiledevice3.exceptions import ScreencastUnavailableError
+
+logger = logging.getLogger(__name__)
+
 
 class ScreenCast:
-    def __init__(self, target, format_: str, quality: int, max_width: int, max_height: int):
+    def __init__(self, target: Any, format_: str, quality: int, max_width: int, max_height: int):
         """
         :param pymobiledevice3.services.web_protocol.cdp_target.CdpTarget target:
         :param format_: Image compression format. Allowed values: jpeg, png.
@@ -22,52 +27,54 @@ class ScreenCast:
         self.quality = quality
         self.max_width = max_width
         self.max_height = max_height
-        self.frames_acked = []
+        self.frames_acked: list[int] = []
         self.frame_id = 1
         self.frame_interval = 250
         self.device_width = 0
         self.device_height = 0
         self.page_scale_factor = 0
         self._run = True
-        self.recording_task: Optional[asyncio.Task] = None
+        self.recording_task: Optional[asyncio.Task[None]] = None
 
-    @property
-    def scale(self) -> float:
+    def get_scale(self) -> float:
         """The amount screen pixels in one devtools pixel."""
         real_height = self.device_height * self.page_scale_factor
         real_width = self.device_width * self.page_scale_factor
         return min(self.max_height / real_height, self.max_width / real_width, 1) * self.page_scale_factor
 
-    @property
-    def scaled_width(self) -> int:
+    def get_scaled_width(self) -> int:
         """Width of screenshot after scaling."""
-        return int(self.scale * self.device_width)
+        return int(self.get_scale() * self.device_width)
 
-    @property
-    def scaled_height(self) -> int:
+    def get_scaled_height(self) -> int:
         """Height of screenshot after scaling."""
-        return int(self.scale * self.device_height)
+        return int(self.get_scale() * self.device_height)
 
-    async def start(self, message_id: int):
+    async def start(self) -> None:
         """
         Start sending screenshots to the devtools.
-        :param message_id: Message id to use when requesting WIR data concerning the screencast.
         """
         device_size = await self.target.evaluate_and_result(
-            message_id,
-            (
-                '(window.innerWidth > 0 ? window.innerWidth : screen.width) + "," + '
-                '(window.innerHeight > 0 ? window.innerHeight : screen.height) + "," + '
-                "window.devicePixelRatio"
-            ),
+            '(window.innerWidth > 0 ? window.innerWidth : screen.width) + "," + '
+            '(window.innerHeight > 0 ? window.innerHeight : screen.height) + "," + '
+            "window.devicePixelRatio"
         )
+        if not isinstance(device_size, str):
+            # A JSContext debuggable has no page to capture: its global object carries no window
+            # or screen, so the evaluation comes back as a thrown ReferenceError rather than the
+            # size. A page that stopped answering lands here too.
+            raise ScreencastUnavailableError(
+                "The target did not report a screen size to capture; it may not be a page."
+            )
         self.device_width, self.device_height, self.page_scale_factor = list(map(int, device_size.split(",")))
         self._run = True
-        self.recording_task = asyncio.create_task(self.recording_loop(message_id))
+        self.recording_task = asyncio.create_task(self.recording_loop())
 
     async def stop(self):
         """Stop sending screenshots to the devtools."""
         self._run = False
+        if self.recording_task is None:
+            return
         self.recording_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self.recording_task
@@ -83,64 +90,80 @@ class ScreenCast:
         :param data: Base64 of JPEG data.
         :return: Base 64 of resized JPEG data.
         """
-        resized_img = Image.open(BytesIO(b64decode(data)))
-        resized_img = resized_img.resize((self.scaled_width, self.scaled_height), Image.ANTIALIAS)
+        # Pillow's stub coverage for the Image method chain varies across versions/platforms
+        # (partially-unknown resize() signature on CI); pin the local to Any to stay type-clean.
+        resized_img: Any = Image.open(BytesIO(b64decode(data)))
+        resized_img = resized_img.resize((self.get_scaled_width(), self.get_scaled_height()), Image.Resampling.LANCZOS)
         resized_img = resized_img.convert("RGB")
         resized = BytesIO()
         resized_img.save(resized, format="jpeg", quality="maximum")
         return b64encode(resized.getvalue()).decode()
 
-    async def get_offsets(self, message_id: int):
+    async def get_offsets(self):
         """
         Get the offset of the screenshot from the start of the page.
-        :param message_id: Message id to use when requesting WIR data concerning the screencast.
         :return: Tuple of (offsetTop, pageXOffset, pageYOffset).
         :rtype: tuple
         """
         frame_size = await self.target.evaluate_and_result(
-            message_id, 'window.document.body.offsetTop + "," + window.pageXOffset + "," + window.pageYOffset'
+            'window.document.body.offsetTop + "," + window.pageXOffset + "," + window.pageYOffset'
         )
         if frame_size is None or not isinstance(frame_size, str):
             return 0, 0, 0
         return tuple(map(int, frame_size.split(",")))
 
-    async def recording_loop(self, message_id):
+    async def recording_loop(self) -> None:
         """
-        Fetch screenshots and send to devtools.
-        :param message_id: Message id to use when requesting WIR data concerning the screencast.
+        Fetch screenshots and send them to devtools until stopped.
         """
         while self._run:
             await asyncio.sleep(self.frame_interval / 1000)
             if self.frame_id > 1 and (self.frame_id - 1) not in self.frames_acked:
                 continue
-            self.frame_id += 1
-            offset_top, scroll_offset_x, scroll_offset_y = await self.get_offsets(message_id)
-            event = await self.target.send_message_with_result(
-                message_id,
-                "Page.snapshotRect",
-                {
-                    "x": 0,
-                    "y": 0,
-                    "width": self.device_width,
-                    "height": self.device_height,
-                    "coordinateSystem": "Viewport",
+            try:
+                await self._send_frame()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single bad frame (e.g. a missed/timed-out device response) must not kill the
+                # stream; without this the device screen silently freezes for the whole session.
+                logger.exception("screencast frame failed; skipping")
+
+    async def _send_frame(self) -> None:
+        offset_top, scroll_offset_x, scroll_offset_y = await self.get_offsets()
+        event = await self.target.send_message_with_result(
+            "Page.snapshotRect",
+            {
+                "x": 0,
+                "y": 0,
+                "width": self.device_width,
+                "height": self.device_height,
+                "coordinateSystem": "Viewport",
+            },
+        )
+        data = event.get("result", {}).get("dataURL")
+        if not data:
+            # No usable snapshot this round (device busy / response lost mid-navigation); try
+            # again next tick. frame_id must not advance here: the loop waits for the last id's
+            # ack, and an id that was never actually sent can never be acked - the screencast
+            # would freeze for the rest of the session.
+            return
+        data = data[data.find("base64,") + 7 :]
+        await self.target.output_queue.put({
+            "method": "Page.screencastFrame",
+            "params": {
+                "data": self.resize_jpeg(data),
+                "sessionId": self.frame_id,
+                "metadata": {
+                    "pageScaleFactor": self.page_scale_factor,
+                    "offsetTop": offset_top,
+                    "deviceWidth": self.get_scaled_width(),
+                    "deviceHeight": self.get_scaled_height(),
+                    "scrollOffsetX": scroll_offset_x,
+                    "scrollOffsetY": scroll_offset_y,
+                    # Page.ScreencastFrameMetadata.timestamp is a number (seconds), not a string
+                    "timestamp": datetime.now().timestamp(),
                 },
-            )
-            data = event["result"]["dataURL"]
-            data = data[data.find("base64,") + 7 :]
-            await self.target.output_queue.put({
-                "method": "Page.screencastFrame",
-                "params": {
-                    "data": self.resize_jpeg(data),
-                    "sessionId": self.frame_id - 1,
-                    "metadata": {
-                        "pageScaleFactor": self.page_scale_factor,
-                        "offsetTop": offset_top,
-                        "deviceWidth": self.scaled_width,
-                        "deviceHeight": self.scaled_height,
-                        "scrollOffsetX": scroll_offset_x,
-                        "scrollOffsetY": scroll_offset_y,
-                        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f"),
-                    },
-                },
-            })
+            },
+        })
+        self.frame_id += 1

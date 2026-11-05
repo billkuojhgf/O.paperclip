@@ -1,21 +1,32 @@
+import fnmatch
+import json
 import logging
 import os
 import posixpath
 import re
 from contextlib import nullcontext
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional, TextIO
 
 import typer
 from typer_injector import InjectingTyper
+from typing_extensions import assert_never
 
 from pymobiledevice3.cli.cli_common import (
     ServiceProviderDep,
-    get_last_used_terminal_formatting,
+    async_command,
     user_requested_colored_output,
 )
 from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
-from pymobiledevice3.services.os_trace import OsTraceService, SyslogEntry, SyslogLogLevel
+from pymobiledevice3.services.os_trace import (
+    OS_TRACE_RELAY_STREAM_FLAGS_DEFAULT,
+    OsActivityStreamFlag,
+    OsTraceService,
+    SyslogEntry,
+    SyslogLabel,
+    SyslogLogLevel,
+)
 from pymobiledevice3.services.syslog import SyslogService
 
 logger = logging.getLogger(__name__)
@@ -27,16 +38,48 @@ cli = InjectingTyper(
 )
 
 
+class SyslogFormat(str, Enum):
+    TEXT = "text"
+    JSON = "json"
+
+
+def format_json_line(syslog_entry: SyslogEntry) -> str:
+    label: Optional[dict[str, str]] = None
+    if syslog_entry.label is not None:
+        label = {"subsystem": syslog_entry.label.subsystem, "category": syslog_entry.label.category}
+    return json.dumps(
+        {
+            "pid": syslog_entry.pid,
+            "procid": syslog_entry.procid,
+            "thread_id": syslog_entry.thread_id,
+            "timestamp": syslog_entry.timestamp.isoformat(),
+            "level": syslog_entry.level.name,
+            "image_name": syslog_entry.image_name,
+            "image_offset": syslog_entry.image_offset,
+            "image_uuid": str(syslog_entry.image_uuid) if syslog_entry.image_uuid else None,
+            "process_image_uuid": str(syslog_entry.process_image_uuid) if syslog_entry.process_image_uuid else None,
+            "filename": syslog_entry.filename,
+            "mach_timestamp": syslog_entry.mach_timestamp,
+            "message": syslog_entry.message,
+            "label": label,
+        },
+        ensure_ascii=False,
+    )
+
+
 @cli.command("live-old")
-def syslog_live_old(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def syslog_live_old(service_provider: ServiceProviderDep) -> None:
     """view live syslog lines in raw bytes form from old relay"""
-    for line in SyslogService(service_provider=service_provider).watch():
-        print(line)
+    async with SyslogService(service_provider=service_provider) as service:
+        async for line in service.watch():
+            print(line)
 
 
-def format_line(
-    color: bool, pid: int, syslog_entry: SyslogEntry, include_label: bool, image_offset: bool = False
-) -> Optional[str]:
+def _format_line_fields(
+    syslog_entry: SyslogEntry, *, include_label: bool, image_offset: bool
+) -> list[tuple[str, Optional[str]]]:
+    """Split the rendered line into ``(text, color)`` fields; the separators between them have no color."""
     log_level_colors = {
         SyslogLogLevel.NOTICE.name: "white",
         SyslogLogLevel.INFO.name: "white",
@@ -46,153 +89,233 @@ def format_line(
         SyslogLogLevel.USER_ACTION.name: "white",
     }
 
-    syslog_pid = syslog_entry.pid
-    timestamp = syslog_entry.timestamp
     level = syslog_entry.level.name
-    filename = syslog_entry.filename
+    log_level_color = log_level_colors.get(level, "white")  # a level unknown to us (newer iOS)
     image_name = posixpath.basename(syslog_entry.image_name)
-    message = syslog_entry.message
-    process_name = posixpath.basename(filename)
+    process_name = posixpath.basename(syslog_entry.filename)
     image_offset_str = f"+0x{syslog_entry.image_offset:x}" if image_offset and image_name else ""
-    label = ""
 
-    if (pid != -1) and (syslog_pid != pid):
-        return None
-
-    if syslog_entry.label is not None:
-        label = f"[{syslog_entry.label.subsystem}][{syslog_entry.label.category}]"
-
-    if color:
-        timestamp = typer.style(str(timestamp), "green")
-        process_name = typer.style(process_name, "magenta")
-        if len(image_name) > 0:
-            image_name = typer.style(image_name, "magenta")
-        if image_offset:
-            image_offset_str = typer.style(image_offset_str, "blue")
-        syslog_pid = typer.style(syslog_pid, "cyan")
-        log_level_color = log_level_colors[level]
-        level = typer.style(level, log_level_color)
-        label = typer.style(label, "cyan")
-        message = typer.style(message, log_level_color)
-
-    line_format = "{timestamp} {process_name}{{{image_name}{image_offset_str}}}[{pid}] <{level}>: {message}"
+    fields: list[tuple[str, Optional[str]]] = [
+        (str(syslog_entry.timestamp), "green"),
+        (" ", None),
+        (process_name, "magenta"),
+        ("{", None),
+        (image_name, "magenta"),
+        (image_offset_str, "blue"),
+        ("}[", None),
+        (str(syslog_entry.pid), "cyan"),
+        ("] <", None),
+        (level, log_level_color),
+        (">: ", None),
+        (syslog_entry.message, log_level_color),
+    ]
 
     if include_label:
-        line_format += f" {label}"
+        label = ""
+        if syslog_entry.label is not None:
+            label = f"[{syslog_entry.label.subsystem}][{syslog_entry.label.category}]"
+        fields += [(" ", None), (label, "cyan")]
 
-    line = line_format.format(
-        timestamp=timestamp,
-        process_name=process_name,
-        image_name=image_name,
-        pid=syslog_pid,
-        level=level,
-        message=message,
-        image_offset_str=image_offset_str,
-    )
-
-    return line
+    return fields
 
 
-def syslog_live(
+def _style_text(text: str, fg: Optional[str]) -> str:
+    return typer.style(text, fg) if fg is not None and text else text
+
+
+def _style_fields(fields: list[tuple[str, Optional[str]]], highlights: list[tuple[int, int]]) -> str:
+    """Color each field, making the ``highlights`` (``(start, end)`` in the plain line, sorted) bold and underlined."""
+    chunks: list[str] = []
+    offset = 0
+    for text, fg in fields:
+        # Everything in the field before ``pos`` has been emitted.
+        pos = 0
+        for span_start, span_end in highlights:
+            start, end = max(span_start - offset, pos), min(span_end - offset, len(text))
+            if start < end:
+                chunks.append(_style_text(text[pos:start], fg))
+                chunks.append(typer.style(text[start:end], fg, bold=True, underline=True))
+                pos = end
+        chunks.append(_style_text(text[pos:], fg))
+        offset += len(text)
+    return "".join(chunks)
+
+
+def format_line(syslog_entry: SyslogEntry, *, include_label: bool, image_offset: bool, color: bool) -> str:
+    fields = _format_line_fields(syslog_entry, include_label=include_label, image_offset=image_offset)
+    if color:
+        return _style_fields(fields, highlights=[])
+    return "".join(text for text, _ in fields)
+
+
+def _should_skip_line(line: str, invert_match: list[str], invert_match_insensitive: list[str]) -> bool:
+    for m in invert_match:
+        if m in line:
+            return True
+
+    line_lower = line.lower()
+    return any(m.lower() in line_lower for m in invert_match_insensitive)
+
+
+def _matches_any_glob(value: str, patterns: list[str]) -> bool:
+    lowered = value.lower()
+    return any(fnmatch.fnmatchcase(lowered, pattern.lower()) for pattern in patterns)
+
+
+def _should_keep_label(label: Optional[SyslogLabel], subsystem: list[str], category: list[str]) -> bool:
+    """Keep an entry based on its os_log subsystem/category label.
+
+    ``subsystem``/``category`` are case-insensitive glob patterns. Within a single option
+    the patterns are OR-ed (match any); the two options are AND-ed (subsystem AND category
+    must each match when both are given). An entry with no label is dropped as soon as any
+    label filter is active, since it has no subsystem/category to match against.
+    """
+    if not subsystem and not category:
+        return True
+    if label is None:
+        return False
+    subsystem_ok = not subsystem or _matches_any_glob(label.subsystem, subsystem)
+    category_ok = not category or _matches_any_glob(label.category, category)
+    return subsystem_ok and category_ok
+
+
+def _should_keep_line(
+    line: str, match: list[str], match_insensitive: list[str], match_regex: list[re.Pattern[str]]
+) -> bool:
+    for m in match:
+        if m not in line:
+            return False
+
+    line_lower = line.lower()
+    if not all(m.lower() in line_lower for m in match_insensitive):
+        return False
+
+    if not match_regex:
+        return True
+
+    return any(regex.search(line) for regex in match_regex)
+
+
+def _highlight_spans(
+    line: str, match: list[str], match_insensitive: list[str], match_regex: list[re.Pattern[str]]
+) -> list[tuple[int, int]]:
+    """``(start, end)`` of every hit of the match filters in the plain ``line``, sorted by start."""
+    hits = [hit for m in match for hit in re.finditer(re.escape(m), line)]
+    hits += [hit for m in match_insensitive for hit in re.finditer(re.escape(m), line, re.IGNORECASE)]
+    hits += [hit for regex in match_regex for hit in regex.finditer(line)]
+    return sorted(hit.span() for hit in hits if hit.end() > hit.start())
+
+
+def _emit_line(line: str, out: Optional[TextIO]) -> None:
+    print(line, flush=True)
+    if out:
+        print(line, file=out, flush=True)
+
+
+async def syslog_live(
     service_provider: LockdownServiceProvider,
     out: Optional[TextIO],
     pid: int,
     process_name: Optional[str],
     match: list[str],
+    invert_match: list[str],
     match_insensitive: list[str],
+    invert_match_insensitive: list[str],
     include_label: bool,
     regex: list[str],
     insensitive_regex: list[str],
+    subsystem: list[str],
+    category: list[str],
+    no_debug: bool = False,
+    no_info: bool = False,
     image_offset: bool = False,
     start_after: Optional[str] = None,
+    output_format: SyslogFormat = SyslogFormat.TEXT,
 ) -> None:
-    match_regex = [re.compile(f".*({r}).*", re.DOTALL) for r in regex]
-    match_regex += [re.compile(f".*({r}).*", re.IGNORECASE | re.DOTALL) for r in insensitive_regex]
+    match_regex = [re.compile(r, re.DOTALL) for r in regex]
+    match_regex += [re.compile(r, re.IGNORECASE | re.DOTALL) for r in insensitive_regex]
     started = start_after is None
 
-    if start_after is not None:
+    if start_after is not None and output_format is SyslogFormat.TEXT:
         print(f'Waiting for "{start_after}" ...', flush=True)
 
-    def replace(m):
-        if len(m.groups()) and line:
-            return line.replace(m.group(1), typer.style(m.group(1), bold=True, underline=True))
-        return ""
+    should_color_output = output_format is SyslogFormat.TEXT and user_requested_colored_output()
+    stream_flags = OS_TRACE_RELAY_STREAM_FLAGS_DEFAULT
+    if no_debug:
+        stream_flags &= ~OsActivityStreamFlag.DEBUG
+    if no_info:
+        stream_flags &= ~OsActivityStreamFlag.INFO
 
-    for syslog_entry in OsTraceService(lockdown=service_provider).syslog(pid=pid):
+    async for syslog_entry in OsTraceService(lockdown=service_provider).syslog(pid=pid, stream_flags=stream_flags):
         if process_name and posixpath.basename(syslog_entry.filename) != process_name:
             continue
 
-        line_no_style = format_line(False, pid, syslog_entry, include_label, image_offset)
-        line = format_line(user_requested_colored_output(), pid, syslog_entry, include_label, image_offset)
-
-        if line_no_style is None or line is None:
+        if pid != -1 and syslog_entry.pid != pid:
             continue
 
+        if no_debug and syslog_entry.level == SyslogLogLevel.DEBUG:
+            continue
+
+        if no_info and syslog_entry.level == SyslogLogLevel.INFO:
+            # I don't really understand why INFO is retrieved when not requested, but this is imitating
+            # Console.app behavior
+            continue
+
+        if not _should_keep_label(syslog_entry.label, subsystem, category):
+            continue
+
+        # Filters always run against the plain rendered line, so a given set of flags
+        # selects the same entries regardless of output format.
+        line = format_line(
+            syslog_entry,
+            include_label=include_label,
+            image_offset=image_offset,
+            color=False,
+        )
+
         if not started:
-            if start_after not in line_no_style:
+            assert start_after is not None  # started is initialized True when start_after is None
+            if start_after not in line:
                 continue
             started = True
 
-        skip = False
-
-        if match is not None:
-            for m in match:
-                match_line = line
-                if m not in match_line:
-                    skip = True
-                    break
-                else:
-                    if user_requested_colored_output():
-                        match_line = match_line.replace(m, typer.style(m, bold=True, underline=True))
-                        line = match_line
-
-        if match_insensitive is not None:
-            for m in match_insensitive:
-                m = m.lower()
-                if m not in line.lower():
-                    skip = True
-                    break
-                else:
-                    if user_requested_colored_output():
-                        start = line.lower().index(m)
-                        end = start + len(m)
-                        last_color_formatting = get_last_used_terminal_formatting(line[:start])
-                        line = (
-                            line[:start]
-                            + typer.style(line[start:end], bold=True, underline=True)
-                            + last_color_formatting
-                            + line[end:]
-                        )
-
-        if match_regex:
-            skip = True
-            for r in match_regex:
-                if not r.findall(line_no_style):
-                    continue
-                line = re.sub(r, replace, line)
-                skip = False
-
-        if skip:
+        if _should_skip_line(line, invert_match, invert_match_insensitive):
             continue
 
-        print(line, flush=True)
+        if not _should_keep_line(line, match, match_insensitive, match_regex):
+            continue
 
-        if out:
-            if user_requested_colored_output():
-                print(line, file=out, flush=True)
+        if output_format is SyslogFormat.JSON:
+            _emit_line(format_json_line(syslog_entry), out)
+
+        elif output_format is SyslogFormat.TEXT:
+            if should_color_output:
+                # Highlights are found on the plain line, where the offsets line up with the fields.
+                styled_line = _style_fields(
+                    _format_line_fields(syslog_entry, include_label=include_label, image_offset=image_offset),
+                    _highlight_spans(line, match, match_insensitive, match_regex),
+                )
             else:
-                print(line_no_style, file=out, flush=True)
+                styled_line = line
+
+            _emit_line(styled_line, out)
+
+        else:
+            assert_never(output_format)
 
 
 @cli.command("live")
-def cli_syslog_live(
+@async_command
+async def cli_syslog_live(
     service_provider: ServiceProviderDep,
     out: Annotated[
         Optional[Path],
         typer.Option(
             "--out",
             "-o",
-            help="log file",
+            help="Save every log entry to this file. NOTE: stdout is not suppressed — entries are "
+            "printed to both stdout and the file (tee-like). Redirect stdout with '>/dev/null' to keep "
+            "only the file.",
         ),
     ] = None,
     pid: Annotated[
@@ -212,7 +335,15 @@ def cli_syslog_live(
         typer.Option(
             "--match",
             "-m",
-            help="match expression",
+            help="filter only logs matching this expression (repeatable; all must match - conjunction).",
+        ),
+    ] = None,
+    invert_match: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--invert-match",
+            "-v",
+            help="filter only logs not matching this expression (repeatable; any match excludes - disjunction).",
         ),
     ] = None,
     match_insensitive: Annotated[
@@ -220,14 +351,25 @@ def cli_syslog_live(
         typer.Option(
             "--match-insensitive",
             "-mi",
-            help="case-insensitive match expression",
+            help="filter only logs matching this expression, case-insensitively "
+            "(repeatable; all must match - conjunction).",
+        ),
+    ] = None,
+    invert_match_insensitive: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--invert-match-insensitive",
+            "-vi",
+            help="filter only logs not matching this expression, case-insensitively "
+            "(repeatable; any match excludes - disjunction).",
         ),
     ] = None,
     include_label: Annotated[
         bool,
         typer.Option(
             "--label",
-            help="should include label",
+            help="Include the subsystem/category label in the rendered line "
+            "(JSON output always emits the label field).",
         ),
     ] = False,
     regex: Annotated[
@@ -235,7 +377,7 @@ def cli_syslog_live(
         typer.Option(
             "--regex",
             "-e",
-            help="filter only lines matching given regex",
+            help="filter only lines matching given regex (repeatable; any match includes - disjunction).",
         ),
     ] = None,
     insensitive_regex: Annotated[
@@ -243,7 +385,28 @@ def cli_syslog_live(
         typer.Option(
             "--insensitive-regex",
             "-ei",
-            help="filter only lines matching given regex (insensitive)",
+            help="filter only lines matching given regex, case-insensitively "
+            "(repeatable; any match includes - disjunction).",
+        ),
+    ] = None,
+    subsystem: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--subsystem",
+            "-s",
+            help="keep only entries whose os_log subsystem matches this case-insensitive glob "
+            "(e.g. 'com.apple.WebKit*'). Repeatable; an entry is kept if it matches any "
+            "(disjunction). Entries with no subsystem/category label are dropped when set.",
+        ),
+    ] = None,
+    category: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--category",
+            "-c",
+            help="keep only entries whose os_log category matches this case-insensitive glob "
+            "(e.g. 'Network'). Repeatable; an entry is kept if it matches any (disjunction). "
+            "Combined with --subsystem as a conjunction (both must match).",
         ),
     ] = None,
     image_offset: Annotated[
@@ -251,37 +414,68 @@ def cli_syslog_live(
         typer.Option(
             "--image-offset",
             "-io",
-            help="Include image offset in log line",
+            help="Include image offset in log line (text mode only; JSON always emits image_offset).",
+        ),
+    ] = False,
+    no_debug: Annotated[
+        bool,
+        typer.Option(
+            "--no-debug",
+            help="Suppress DEBUG entries.",
+        ),
+    ] = False,
+    no_info: Annotated[
+        bool,
+        typer.Option(
+            "--no-info",
+            help="Suppress INFO entries.",
         ),
     ] = False,
     start_after: Annotated[
         Optional[str],
         typer.Option(
             "--start-after",
-            help="Start printing only after this string is seen",
+            help="Start printing only after this string is seen.",
         ),
     ] = None,
+    output_format: Annotated[
+        SyslogFormat,
+        typer.Option(
+            "--format",
+            help="Output format. 'json' emits one JSON object per line (NDJSON). Filters match against "
+            "the rendered text line in both formats.",
+            case_sensitive=False,
+        ),
+    ] = SyslogFormat.TEXT,
 ) -> None:
     """view live syslog lines"""
 
-    with out.open("wt") if out else nullcontext() as out_file:
-        syslog_live(
+    with out.open("wt", encoding="utf-8") if out else nullcontext() as out_file:
+        await syslog_live(
             service_provider,
             out_file,
             pid,
             process_name,
             match or [],
+            invert_match or [],
             match_insensitive or [],
+            invert_match_insensitive or [],
             include_label,
             regex or [],
             insensitive_regex or [],
+            subsystem or [],
+            category or [],
+            no_debug,
+            no_info,
             image_offset,
             start_after,
+            output_format,
         )
 
 
 @cli.command("collect")
-def syslog_collect(
+@async_command
+async def syslog_collect(
     service_provider: ServiceProviderDep,
     out: Annotated[
         Path,
@@ -326,6 +520,6 @@ def syslog_collect(
             "the file with the likes of the Console.app and the `log show` utilities"
         )
 
-    OsTraceService(lockdown=service_provider).collect(
+    await OsTraceService(lockdown=service_provider).collect(
         str(out), size_limit=size_limit, age_limit=age_limit, start_time=start_time
     )

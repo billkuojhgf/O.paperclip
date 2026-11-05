@@ -33,8 +33,15 @@
 ```bash
 git clone https://github.com/agocia/O.Paperclip.git
 cd O.Paperclip
+uv python install 3.13
+uv venv --managed-python --python 3.13 build/python-bundle
+uv pip sync --python build/python-bundle/bin/python --require-hashes scripts/requirements-bundled.txt
+zsh scripts/build-bundled-pymobiledevice3.sh
+bash scripts/build-dvt-stream.sh
 xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Release build
 ```
+
+The CLI and per-device worker use `pymobiledevice3 11.49.2` and the same hashed dependency lock. Python is only needed to rebuild the tools. Use managed Python with OpenSSL PSK support and verify every embedded library's deployment floor against macOS 14; a successful build does not certify physical-device, Intel or universal2 compatibility.
 
 ---
 
@@ -70,7 +77,7 @@ This command creates three temporary Simulators, runs the full test scheme with 
 2. Open O.Paperclip
 3. In the sidebar, make sure `USB` is selected in the connection mode switcher
 4. Click `Start Connection`
-5. If prompted, enter your Mac administrator password (required to create the tunnel)
+5. Keep the device unlocked while developer services are prepared. No Mac administrator authorization is requested.
 
 **Wi-Fi connection:**
 1. Make sure your iPhone and Mac are on the same Wi-Fi network
@@ -116,6 +123,8 @@ Use the segmented control at the top of the sidebar to switch between three mode
 
 > You can also type an address or place name in the search bar to jump directly to a location.
 
+The map saves its camera center, distance, heading, and pitch after gestures, and restores them across relaunches and startup window resizing.
+
 ---
 
 ### Step 4: Stop Spoofing
@@ -139,11 +148,11 @@ You can import KML geographic data and display custom markers on the map:
 **Q: The app keeps loading after I click "Start Connection".**  
 A: Make sure the iPhone is unlocked and the Mac is trusted. For Wi-Fi mode, confirm both devices are on the same network.
 
-**Q: Why am I asked for the administrator password?**  
-A: This is expected. Creating the tunnel requires temporary root privileges.
+**Q: Does connection require my Mac administrator password or Touch ID?**
+A: No. Each normal-user worker owns one device's userspace tunnel and location service. Only USB devices explicitly missing CoreDeviceProxy may use Apple's native tunnel, which can compete with Xcode/remoted. No sudo/root-helper fallback exists. iPhone trust, passcode, Developer Mode and pairing remain required. Physical GPS stability, Wi-Fi pairing and macOS 14 operation need separate device acceptance; automated fixtures do not prove them.
 
 **Q: Wi-Fi connection failed and it switched back to USB.**  
-A: The app automatically falls back to USB. If you want Wi-Fi specifically, make sure both devices are on the same network and your firewall is not blocking the connection.
+A: Only Wi-Fi-unavailable/unsupported errors allow USB fallback for the same UDID. Pairing, locked-device and protocol errors do not switch transports. Missing RemotePairing/altIRK data requires a trusted USB connection; existing pairing records are never automatically deleted or force-refreshed.
 
 **Q: I am already connected over USB. Can I switch directly to Wi-Fi?**  
 A: Yes. Just change the connection mode in the sidebar to `Wi-Fi`, and the app will automatically disconnect the current USB session and rebuild the tunnel over Wi-Fi.

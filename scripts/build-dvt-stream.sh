@@ -7,43 +7,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-PYTHON_BIN="${PYTHON_BIN:-$HOME/.local/pipx/venvs/pymobiledevice3/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/build/python-bundle/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then
-  PYTHON_BIN="python3"
+  echo "ERROR: Python not found at $PYTHON_BIN"; exit 1
 fi
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [ ! -x "$PYTHON_BIN" ]; then
-  echo "ERROR: python3 is not installed."; exit 1
-fi
-PY_VER=$($PYTHON_BIN -c 'import sys; print("%d.%d" % (sys.version_info.major, sys.version_info.minor))')
-MINOR=${PY_VER#*.}
-MAJOR=$(echo "$PY_VER" | cut -d. -f1)
-if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "${MINOR%%.*}" -lt 10 ]; }; then
-  echo "ERROR: Python 3.10+ is required. Found Python $PY_VER"; exit 1
-fi
-
-# PyInstaller check
-if ! "$PYTHON_BIN" -m PyInstaller --version >/dev/null 2>&1; then
-  echo "ERROR: PyInstaller is not installed for this Python."; exit 1
-fi
-
-echo "[INFO] Checking pymobiledevice3 availability..."
-if ! "$PYTHON_BIN" -c 'import pymobiledevice3' >/dev/null 2>&1; then
-  echo "ERROR: pymobiledevice3 Python package is not installed in the environment."; exit 1
-fi
-
-echo "[INFO] Using Python: $PYTHON_BIN"
-echo "[INFO] Building dvt-location-stream with PyInstaller..."
-pushd "$ROOT_DIR" >/dev/null
-"$PYTHON_BIN" -m PyInstaller --onefile --name dvt-location-stream scripts/dvt_location_stream.py
-popd >/dev/null
-
-DIST_DIR="$ROOT_DIR/dist"
-BUNDLED_DIR="$ROOT_DIR/bundled"
-mkdir -p "$BUNDLED_DIR"
-cp "$DIST_DIR/dvt-location-stream" "$BUNDLED_DIR/dvt-location-stream"
-chmod +x "$BUNDLED_DIR/dvt-location-stream"
-
-# Cleanup
-rm -rf "$ROOT_DIR/dist" "$ROOT_DIR/build" "$ROOT_DIR/*.spec" 2>/dev/null || true
-
-echo "[INFO] Built and placed at: $BUNDLED_DIR/dvt-location-stream"
+"$PYTHON_BIN" -c 'import importlib.metadata as m; assert m.version("pymobiledevice3") == "11.49.2"; assert m.version("pyinstaller") == "6.22.3"'
+COLLECT=(--collect-all pymobiledevice3 --recursive-copy-metadata pymobiledevice3 --collect-all pykdebugparser --recursive-copy-metadata pykdebugparser)
+for MODULE in pmd_pytcp pmd_net_addr pmd_net_proto pytun_pmd3 ipsw_parser pyimg4 apple_compress; do
+  "$PYTHON_BIN" -c "import $MODULE"
+  COLLECT+=(--collect-all "$MODULE" --recursive-copy-metadata "${MODULE//_/-}")
+done
+for MODULE in zeroconf readchar; do
+  if "$PYTHON_BIN" -c "import $MODULE" 2>/dev/null; then
+    COLLECT+=(--collect-all "$MODULE" --recursive-copy-metadata "$MODULE")
+  fi
+done
+"$PYTHON_BIN" -m PyInstaller --noconfirm --clean --onefile --name dvt-location-stream \
+  --distpath "$ROOT_DIR/build/python-worker-dist" \
+  --workpath "$ROOT_DIR/build/pyinstaller-worker" \
+  --specpath "$ROOT_DIR/build/specs-worker" \
+  "${COLLECT[@]}" "$ROOT_DIR/scripts/dvt_location_stream.py"
+"$ROOT_DIR/build/python-worker-dist/dvt-location-stream" --check-runtime
+cp "$ROOT_DIR/build/python-worker-dist/dvt-location-stream" "$ROOT_DIR/bundled/dvt-location-stream"
+chmod +x "$ROOT_DIR/bundled/dvt-location-stream"
+echo "[INFO] Built bundled/dvt-location-stream"

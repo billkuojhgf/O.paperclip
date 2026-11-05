@@ -2,6 +2,15 @@ import MapKit
 import SwiftUI
 
 enum PersistedMapRegionStore {
+    static func loadCamera() -> MapCamera? {
+        guard let values = UserDefaults.standard.array(forKey: "map.camera") as? [Double],
+              values.count == 5, values.allSatisfy(\.isFinite), values[2] > 0 else { return nil }
+        let center = CLLocationCoordinate2D(latitude: values[0], longitude: values[1])
+        guard CLLocationCoordinate2DIsValid(center), (0...360).contains(values[3]),
+              (0...90).contains(values[4]) else { return nil }
+        return MapCamera(centerCoordinate: center, distance: values[2], heading: values[3], pitch: values[4])
+    }
+
     static func load(defaults: UserDefaults = .standard) -> MKCoordinateRegion {
         let latitude = defaults.object(forKey: "map.center.lat") as? Double ?? AppConstants.Map.defaultLatitude
         let longitude = defaults.object(forKey: "map.center.lon") as? Double ?? AppConstants.Map.defaultLongitude

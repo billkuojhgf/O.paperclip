@@ -1,39 +1,48 @@
-import asyncio
 import logging
 from functools import update_wrapper
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Callable, Optional
 from urllib.error import URLError
 
 import typer
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, print_json
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command, print_json
 from pymobiledevice3.exceptions import (
     AlreadyMountedError,
     DeveloperDiskImageNotFoundError,
     NotMountedError,
     UnsupportedCommandError,
 )
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.mobile_image_mounter import (
     DeveloperDiskImageMounter,
     MobileImageMounterService,
+    PersonalizedDdi,
     PersonalizedImageMounter,
     auto_mount,
+    uses_personalized_image,
 )
 
 logger = logging.getLogger(__name__)
 
+#: How to remove an iOS 17+ DeveloperDiskImage. Which one applies depends on the front-end that put
+#: it there: `cryptex list` shows the DDI only when it was installed as a cryptex.
+PERSONALIZED_DDI_REMOVAL_HINT = (
+    "remove it first with `cryptex uninstall com.apple.MobileAsset.DDI` (if `cryptex list` shows it) "
+    "or `mounter umount-personalized`"
+)
 
-def catch_errors(func):
-    def catch_function(*args, **kwargs):
+
+def catch_errors(func: Callable[..., Any]) -> Callable[..., Any]:
+    def catch_function(*args: Any, **kwargs: Any) -> Any:
         try:
             return func(*args, **kwargs)
-        except AlreadyMountedError:
+        except AlreadyMountedError as e:
             logger.error("Given image was already mounted")
-        except UnsupportedCommandError:
+            raise typer.Exit(1) from e
+        except UnsupportedCommandError as e:
             logger.error("Your iOS version doesn't support this command")
+            raise typer.Exit(1) from e
 
     return update_wrapper(catch_function, func)
 
@@ -46,11 +55,13 @@ cli = InjectingTyper(
 
 
 @cli.command("list")
-def mounter_list(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_list(service_provider: ServiceProviderDep) -> None:
     """list all mounted images"""
-    output = []
+    output: list[dict[str, Any]] = []
 
-    images = MobileImageMounterService(lockdown=service_provider).copy_devices()
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        images = await mounter.list_images()
     for image in images:
         image_signature = image.get("ImageSignature")
         if image_signature is not None:
@@ -61,10 +72,12 @@ def mounter_list(service_provider: ServiceProviderDep) -> None:
 
 
 @cli.command("lookup")
-def mounter_lookup(service_provider: ServiceProviderDep, image_type: str) -> None:
+@async_command
+async def mounter_lookup(service_provider: ServiceProviderDep, image_type: str) -> None:
     """lookup mounter image type"""
     try:
-        signature = MobileImageMounterService(lockdown=service_provider).lookup_image(image_type)
+        async with MobileImageMounterService(lockdown=service_provider) as mounter:
+            signature = await mounter.lookup_image(image_type)
         print_json(signature)
     except NotMountedError:
         logger.error(f"Disk image of type: {image_type} is not mounted")
@@ -72,10 +85,12 @@ def mounter_lookup(service_provider: ServiceProviderDep, image_type: str) -> Non
 
 @cli.command("umount-developer")
 @catch_errors
-def mounter_umount_developer(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_umount_developer(service_provider: ServiceProviderDep) -> None:
     """unmount Developer image"""
     try:
-        DeveloperDiskImageMounter(lockdown=service_provider).umount()
+        async with DeveloperDiskImageMounter(lockdown=service_provider) as mounter:
+            await mounter.umount()
         logger.info("Developer image unmounted successfully")
     except NotMountedError:
         logger.error("Developer image isn't currently mounted")
@@ -83,10 +98,12 @@ def mounter_umount_developer(service_provider: ServiceProviderDep) -> None:
 
 @cli.command("umount-personalized")
 @catch_errors
-def mounter_umount_personalized(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_umount_personalized(service_provider: ServiceProviderDep) -> None:
     """unmount Personalized image"""
     try:
-        PersonalizedImageMounter(lockdown=service_provider).umount()
+        async with PersonalizedImageMounter(lockdown=service_provider) as mounter:
+            await mounter.umount()
         logger.info("Personalized image unmounted successfully")
     except NotMountedError:
         logger.error("Personalized image isn't currently mounted")
@@ -94,7 +111,8 @@ def mounter_umount_personalized(service_provider: ServiceProviderDep) -> None:
 
 @cli.command("mount-developer")
 @catch_errors
-def mounter_mount_developer(
+@async_command
+async def mounter_mount_developer(
     service_provider: ServiceProviderDep,
     image: Annotated[
         Path,
@@ -114,22 +132,15 @@ def mounter_mount_developer(
     ],
 ) -> None:
     """mount developer image"""
-    DeveloperDiskImageMounter(lockdown=service_provider).mount(image, signature)
+    async with DeveloperDiskImageMounter(lockdown=service_provider) as mounter:
+        await mounter.mount(image, signature)
     logger.info("Developer image mounted successfully")
-
-
-async def mounter_mount_personalized_task(
-    service_provider: LockdownServiceProvider, image: str, trust_cache: str, build_manifest: str
-) -> None:
-    await PersonalizedImageMounter(lockdown=service_provider).mount(
-        Path(image), Path(build_manifest), Path(trust_cache)
-    )
-    logger.info("Personalized image mounted successfully")
 
 
 @cli.command("mount-personalized")
 @catch_errors
-def mounter_mount_personalized(
+@async_command
+async def mounter_mount_personalized(
     service_provider: ServiceProviderDep,
     image: Annotated[
         Path,
@@ -157,30 +168,14 @@ def mounter_mount_personalized(
     ],
 ) -> None:
     """mount personalized image"""
-    asyncio.run(
-        mounter_mount_personalized_task(service_provider, str(image), str(trust_cache), str(build_manifest)), debug=True
-    )
-
-
-async def mounter_auto_mount_task(service_provider: LockdownServiceProvider, xcode: str, version: str) -> None:
-    try:
-        await auto_mount(service_provider, xcode=xcode, version=version)
-        logger.info("DeveloperDiskImage mounted successfully")
-    except URLError:
-        logger.warning("failed to query DeveloperDiskImage versions")
-    except DeveloperDiskImageNotFoundError:
-        logger.error("Unable to find the correct DeveloperDiskImage")
-    except AlreadyMountedError:
-        logger.error("DeveloperDiskImage already mounted")
-    except PermissionError as e:
-        logger.error(
-            f"DeveloperDiskImage could not be saved to Xcode default path ({e.filename}). "
-            f"Please make sure your user has the necessary permissions"
-        )
+    async with PersonalizedImageMounter(lockdown=service_provider) as mounter:
+        await mounter.mount(Path(image), Path(build_manifest), Path(trust_cache))
+    logger.info("Personalized image mounted successfully")
 
 
 @cli.command("auto-mount")
-def mounter_auto_mount(
+@async_command
+async def mounter_auto_mount(
     service_provider: ServiceProviderDep,
     xcode: Annotated[
         Optional[Path],
@@ -188,8 +183,8 @@ def mounter_auto_mount(
             "--xcode",
             "-x",
             exists=True,
-            file_okay=True,
-            dir_okay=False,
+            file_okay=False,
+            dir_okay=True,
             help="Xcode application path used to figure out automatically the DeveloperDiskImage path",
         ),
     ] = None,
@@ -197,45 +192,96 @@ def mounter_auto_mount(
         Optional[str],
         typer.Option(help="Use a different DeveloperDiskImage version from the one retrieved by lockdownconnection"),
     ] = None,
+    image: Annotated[
+        Optional[PersonalizedDdi],
+        typer.Option(
+            "--image",
+            help="iOS 17+ only: force this DeveloperDiskImage instead of choosing one by iOS version "
+            "(cryptex from iOS 27, personalized-dmg below it)",
+        ),
+    ] = None,
 ) -> None:
-    """auto-detect correct DeveloperDiskImage and mount it"""
-    asyncio.run(mounter_auto_mount_task(service_provider, str(xcode), version), debug=True)
+    """auto-detect correct DeveloperDiskImage and mount it
+
+    Exits non-zero when no image could be mounted. An image that is already mounted is what was
+    asked for, so that succeeds -- scripts can run this unconditionally before developer commands.
+    """
+    if image is not None and not uses_personalized_image(service_provider):
+        logger.error(f"--image {image.value} needs iOS 17 or later")
+        raise typer.Exit(1)
+    try:
+        await auto_mount(
+            service_provider, xcode=str(xcode) if xcode is not None else None, version=version, image=image
+        )
+        logger.info("DeveloperDiskImage mounted successfully")
+    except AlreadyMountedError:
+        if uses_personalized_image(service_provider):
+            logger.info(f"DeveloperDiskImage already mounted; to replace it, {PERSONALIZED_DDI_REMOVAL_HINT}")
+        else:
+            logger.info("DeveloperDiskImage already mounted; to replace it, run `mounter umount-developer` first")
+    except URLError as e:
+        logger.error("failed to query DeveloperDiskImage versions")
+        raise typer.Exit(1) from e
+    except DeveloperDiskImageNotFoundError as e:
+        logger.error("Unable to find the correct DeveloperDiskImage")
+        raise typer.Exit(1) from e
+    except PermissionError as e:
+        logger.error(
+            f"DeveloperDiskImage could not be saved to Xcode default path ({e.filename}). "
+            f"Please make sure your user has the necessary permissions"
+        )
+        raise typer.Exit(1) from e
 
 
 @cli.command("query-developer-mode-status")
-def mounter_query_developer_mode_status(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_query_developer_mode_status(service_provider: ServiceProviderDep) -> None:
     """Query developer mode status"""
-    print_json(MobileImageMounterService(lockdown=service_provider).query_developer_mode_status())
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        print_json(await mounter.query_developer_mode_status())
 
 
 @cli.command("query-nonce")
-def mounter_query_nonce(service_provider: ServiceProviderDep, image_type: Annotated[str, typer.Option()]) -> None:
+@async_command
+async def mounter_query_nonce(
+    service_provider: ServiceProviderDep, image_type: Annotated[Optional[str], typer.Option()] = None
+) -> None:
     """Query nonce"""
-    print_json(MobileImageMounterService(lockdown=service_provider).query_nonce(image_type))
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        print_json(await mounter.query_nonce(image_type))
 
 
 @cli.command("query-personalization-identifiers")
-def mounter_query_personalization_identifiers(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_query_personalization_identifiers(service_provider: ServiceProviderDep) -> None:
     """Query personalization identifiers"""
-    print_json(MobileImageMounterService(lockdown=service_provider).query_personalization_identifiers())
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        print_json(await mounter.query_personalization_identifiers())
 
 
 @cli.command("query-personalization-manifest")
-def mounter_query_personalization_manifest(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_query_personalization_manifest(service_provider: ServiceProviderDep) -> None:
     """Query personalization manifest"""
-    result = []
-    mounter = MobileImageMounterService(lockdown=service_provider)
-    for device in mounter.copy_devices():
-        result.append(mounter.query_personalization_manifest(device["PersonalizedImageType"], device["ImageSignature"]))
+    result: list[bytes] = []
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        for device in await mounter.copy_devices():
+            result.append(
+                await mounter.query_personalization_manifest(device["PersonalizedImageType"], device["ImageSignature"])
+            )
     print_json(result)
 
 
 @cli.command("roll-personalization-nonce")
-def mounter_roll_personalization_nonce(service_provider: ServiceProviderDep) -> None:
-    MobileImageMounterService(lockdown=service_provider).roll_personalization_nonce()
+@async_command
+async def mounter_roll_personalization_nonce(service_provider: ServiceProviderDep) -> None:
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        await mounter.roll_personalization_nonce()
 
 
 @cli.command("roll-cryptex-nonce")
-def mounter_roll_cryptex_nonce(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def mounter_roll_cryptex_nonce(service_provider: ServiceProviderDep) -> None:
     """Roll cryptex nonce (will reboot)"""
-    MobileImageMounterService(lockdown=service_provider).roll_cryptex_nonce()
+    async with MobileImageMounterService(lockdown=service_provider) as mounter:
+        await mounter.roll_cryptex_nonce()

@@ -1,12 +1,13 @@
 import plistlib
-from io import BytesIO
+from typing import IO, Any, cast
 
 from pymobiledevice3.exceptions import PyMobileDevice3Exception
-from pymobiledevice3.lockdown import LockdownClient
 from pymobiledevice3.services.lockdown_service import LockdownService
 
 
 class ProvisioningProfile:
+    """A provisioning profile, exposing the embedded plist parsed from its raw bytes."""
+
     def __init__(self, buf: bytes):
         self.buf = buf
 
@@ -19,40 +20,68 @@ class ProvisioningProfile:
 
 
 class MisagentService(LockdownService):
+    """
+    Manage provisioning profiles installed on the device.
+
+    Wraps the ``com.apple.misagent`` lockdown service to install, remove and enumerate
+    provisioning profiles. Being a `LockdownService`, instances may be used as an async
+    context manager::
+
+        async with MisagentService(lockdown) as misagent:
+            profiles = await misagent.copy_all()
+    """
+
     SERVICE_NAME = "com.apple.misagent"
     RSD_SERVICE_NAME = "com.apple.misagent.shim.remote"
 
-    def __init__(self, lockdown: LockdownClient):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
+    async def install(self, plist: IO[bytes]) -> dict[str, Any]:
+        """
+        Install a provisioning profile on the device.
 
-    def install(self, plist: BytesIO) -> dict:
-        response = self.service.send_recv_plist({
+        :param plist: stream whose contents are the raw provisioning profile to install;
+            read in full and sent to the device.
+        :returns: the device's response plist.
+        :raises PyMobileDevice3Exception: if the device reports a non-zero status.
+        """
+        response = await self.service.send_recv_plist({
             "MessageType": "Install",
             "Profile": plist.read(),
             "ProfileType": "Provisioning",
         })
         if response["Status"]:
-            raise PyMobileDevice3Exception(f"invalid status: {response}")
+            raise PyMobileDevice3Exception(f"The device refused to install the provisioning profile: {response}")
 
         return response
 
-    def remove(self, profile_id: str) -> dict:
-        response = self.service.send_recv_plist({
+    async def remove(self, profile_id: str) -> dict[str, Any]:
+        """
+        Remove an installed provisioning profile.
+
+        :param profile_id: identifier of the profile to remove.
+        :returns: the device's response plist.
+        :raises PyMobileDevice3Exception: if the device reports a non-zero status.
+        """
+        response = await self.service.send_recv_plist({
             "MessageType": "Remove",
             "ProfileID": profile_id,
             "ProfileType": "Provisioning",
         })
         if response["Status"]:
-            raise PyMobileDevice3Exception(f"invalid status: {response}")
+            raise PyMobileDevice3Exception(
+                f"The device refused to remove provisioning profile {profile_id}: {response}"
+            )
 
         return response
 
-    def copy_all(self) -> list[ProvisioningProfile]:
-        response = self.service.send_recv_plist({"MessageType": "CopyAll", "ProfileType": "Provisioning"})
-        if response["Status"]:
-            raise PyMobileDevice3Exception(f"invalid status: {response}")
+    async def copy_all(self) -> list[ProvisioningProfile]:
+        """
+        Retrieve all provisioning profiles installed on the device.
 
-        return [ProvisioningProfile(p) for p in response["Payload"]]
+        :returns: list of `ProvisioningProfile` objects, one per installed profile.
+        :raises PyMobileDevice3Exception: if the device reports a non-zero status.
+        """
+        response = await self.service.send_recv_plist({"MessageType": "CopyAll", "ProfileType": "Provisioning"})
+        if response["Status"]:
+            raise PyMobileDevice3Exception(f"The device refused to list the provisioning profiles: {response}")
+
+        return [ProvisioningProfile(p) for p in cast(list[bytes], response["Payload"])]

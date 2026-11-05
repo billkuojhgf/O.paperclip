@@ -1,9 +1,14 @@
 import plistlib
-from typing import Optional
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any, Optional
 
 from pymobiledevice3.remote.core_device.core_device_service import CoreDeviceService
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.remote.xpc_message import XpcInt64Type
+
+FEATURE_LISTAPPS = "com.apple.coredevice.feature.listapps"
+FEATURE_STREAMAPPLIST = "com.apple.coredevice.feature.streamapplist"
 
 
 class AppServiceService(CoreDeviceService):
@@ -23,18 +28,32 @@ class AppServiceService(CoreDeviceService):
         include_hidden_apps: bool = True,
         include_internal_apps: bool = True,
         include_default_apps: bool = True,
-    ) -> list[dict]:
-        """List applications"""
-        return await self.invoke(
-            "com.apple.coredevice.feature.listapps",
-            {
-                "includeAppClips": include_app_clips,
-                "includeRemovableApps": include_removable_apps,
-                "includeHiddenApps": include_hidden_apps,
-                "includeInternalApps": include_internal_apps,
-                "includeDefaultApps": include_default_apps,
-            },
-        )
+        require_container_access: bool = False,
+        include_app_group_identifiers: bool = False,
+        include_container_paths: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List applications.
+
+        The streaming variant is preferred whenever the DDI advertises it: DDIs new enough to
+        offer streamapplist (iOS 26 era) never reply to a well-formed non-streaming listapps
+        request (and the stuck call wedges dtappserviced) — Xcode 26 uses streamapplist there
+        too. Older DDIs advertise only listapps, which they answer fine.
+        """
+        arguments = {
+            "includeAppClips": include_app_clips,
+            "includeRemovableApps": include_removable_apps,
+            "includeHiddenApps": include_hidden_apps,
+            "includeInternalApps": include_internal_apps,
+            "includeDefaultApps": include_default_apps,
+            # Required since iOS 26 (InstalledAppsRequestParams). requireContainerAccess=True
+            # needs the com.apple.private.CoreDevice.obtainContainerAccess entitlement.
+            "requireContainerAccess": require_container_access,
+            "includeAppGroupIdentifiers": include_app_group_identifiers,
+            "includeContainerPaths": include_container_paths,
+        }
+        if FEATURE_STREAMAPPLIST in self.rsd.get_service_features(self.service_name):
+            return [app async for app in self.stream_invoke(FEATURE_STREAMAPPLIST, arguments)]
+        return await self.invoke(FEATURE_LISTAPPS, arguments)
 
     async def launch_application(
         self,
@@ -42,10 +61,21 @@ class AppServiceService(CoreDeviceService):
         arguments: Optional[list[str]] = None,
         kill_existing: bool = True,
         start_suspended: bool = False,
-        environment: Optional[dict] = None,
-        extra_options: Optional[dict] = None,
-    ) -> list[dict]:
-        """launch application"""
+        environment: Optional[dict[str, str]] = None,
+        extra_options: Optional[dict[str, Any]] = None,
+        stdio_identifier: Optional[uuid.UUID] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Launch an application.
+
+        :param stdio_identifier: identifier of an `OpenStdioSocketService` socket to attach as the
+            process's stdin, stdout and stderr. ``None`` leaves them unattached.
+        """
+        standard_io_identifiers: dict[str, Any] = {}
+        if stdio_identifier is not None:
+            standard_io_identifiers = dict.fromkeys(
+                ("standardInput", "standardOutput", "standardError"), stdio_identifier
+            )
         return await self.invoke(
             "com.apple.coredevice.feature.launchapplication",
             {
@@ -61,15 +91,53 @@ class AppServiceService(CoreDeviceService):
                     "user": {"shortName": "mobile"},
                     "platformSpecificOptions": plistlib.dumps(extra_options if extra_options is not None else {}),
                 },
-                "standardIOIdentifiers": {},
+                "standardIOIdentifiers": standard_io_identifiers,
             },
         )
 
-    async def list_processes(self) -> list[dict]:
+    async def list_processes(self) -> list[dict[str, Any]]:
         """List processes"""
         return (await self.invoke("com.apple.coredevice.feature.listprocesses"))["processTokens"]
 
-    async def list_roots(self) -> dict:
+    async def stream_apps(
+        self,
+        include_app_clips: bool = True,
+        include_removable_apps: bool = True,
+        include_hidden_apps: bool = True,
+        include_internal_apps: bool = True,
+        include_default_apps: bool = True,
+        require_container_access: bool = False,
+        include_app_group_identifiers: bool = False,
+        include_container_paths: bool = False,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the installed application list, yielding each app as it is pushed.
+
+        Streaming counterpart of ``list_apps``; elements share the same shape.
+        """
+        async for app in self.stream_invoke(
+            FEATURE_STREAMAPPLIST,
+            {
+                "includeAppClips": include_app_clips,
+                "includeRemovableApps": include_removable_apps,
+                "includeHiddenApps": include_hidden_apps,
+                "includeInternalApps": include_internal_apps,
+                "includeDefaultApps": include_default_apps,
+                "requireContainerAccess": require_container_access,
+                "includeAppGroupIdentifiers": include_app_group_identifiers,
+                "includeContainerPaths": include_container_paths,
+            },
+        ):
+            yield app
+
+    async def stream_processes(self) -> AsyncIterator[dict[str, Any]]:
+        """Stream the process list, yielding each process token as it is pushed.
+
+        Streaming counterpart of ``list_processes``; elements share the same shape.
+        """
+        async for process in self.stream_invoke("com.apple.coredevice.feature.streamprocesslist"):
+            yield process
+
+    async def list_roots(self) -> dict[str, Any]:
         """
         List roots.
 
@@ -77,7 +145,7 @@ class AppServiceService(CoreDeviceService):
         """
         return await self.invoke("com.apple.coredevice.feature.listroots", {"rootPoint": {"relative": "/"}})
 
-    async def spawn_executable(self, executable: str, arguments: list[str]) -> dict:
+    async def spawn_executable(self, executable: str, arguments: list[str]) -> dict[str, Any]:
         """
         Spawn given executable.
 
@@ -107,7 +175,7 @@ class AppServiceService(CoreDeviceService):
             },
         )
 
-    async def monitor_process_termination(self, pid: int) -> dict:
+    async def monitor_process_termination(self, pid: int) -> dict[str, Any]:
         """
         Monitor process termination.
 
@@ -124,7 +192,7 @@ class AppServiceService(CoreDeviceService):
         """
         await self.invoke("com.apple.coredevice.feature.uninstallapp", {"bundleIdentifier": bundle_identifier})
 
-    async def send_signal_to_process(self, pid: int, signal: int) -> dict:
+    async def send_signal_to_process(self, pid: int, signal: int) -> dict[str, Any]:
         """
         Send signal to given process by its pid
         """
@@ -133,22 +201,5 @@ class AppServiceService(CoreDeviceService):
             {
                 "process": {"processIdentifier": XpcInt64Type(pid)},
                 "signal": XpcInt64Type(signal),
-            },
-        )
-
-    async def fetch_icons(
-        self, bundle_identifier: str, width: float, height: float, scale: float, allow_placeholder: bool
-    ) -> dict:
-        """
-        Fetch given application's icons
-        """
-        return await self.invoke(
-            "com.apple.coredevice.feature.fetchappicons",
-            {
-                "width": width,
-                "height": height,
-                "scale": scale,
-                "allowPlaceholder": allow_placeholder,
-                "bundleIdentifier": bundle_identifier,
             },
         )

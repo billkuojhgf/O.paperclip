@@ -315,12 +315,6 @@ struct O_PaperclipTests {
         #expect(urls == [remoteURL])
     }
 
-    @Test func pidParserOnlyAcceptsPositiveIntegers() {
-        #expect(PrivilegedTunnelPIDParser.parse("123\n") == 123)
-        #expect(PrivilegedTunnelPIDParser.parse("0") == nil)
-        #expect(PrivilegedTunnelPIDParser.parse("-5") == nil)
-        #expect(PrivilegedTunnelPIDParser.parse("1; rm -rf /") == nil)
-    }
 
     @Test func deviceLogRedactorMasksSensitiveValues() {
         let udid = "0000111122223333444455556666777788889999"

@@ -1,9 +1,12 @@
+from typing import Any, Optional
+
 from pymobiledevice3.exceptions import WirError
 from pymobiledevice3.services.web_protocol.automation_session import (
     MODIFIER_TO_KEY,
     RESOURCES,
     VIRTUAL_KEYS,
     KeyboardInteractionType,
+    KeyModifier,
     MouseButton,
     MouseInteraction,
     Point,
@@ -22,42 +25,45 @@ FOCUS = (RESOURCES / "focus.js").read_text()
 
 
 class WebElement(SeleniumApi):
-    def __init__(self, session, id_):
+    def __init__(self, session: Any, id_: dict[str, Any]):
         """
         :param pymobiledevice3.services.web_protocol.automation_session.AutomationSession session: Automation session.
         :param dict id_: Element id.
         """
         self.session = session
         self.id_ = id_
-        self.node_id = id_[f"session-node-{self.session.id_}"]
+        self.node_id = id_[f"session-node-{self.session.get_id()}"]
 
     async def clear(self):
         """Clears the text if it's a text entry element."""
-        if not self.is_editable():
+        if not await self.is_editable():
             return
-        rect, center, _is_obscured = await self._compute_layout()
-        if rect is None or center is None:
+        layout = await self._compute_layout()
+        if layout is None:
             return
         await self._evaluate_js_function(ELEMENT_CLEAR)
 
     async def click(self):
         """Clicks the element."""
-        rect, center, is_obscured = await self._compute_layout(use_viewport=True)
-        if rect is None or is_obscured or center is None:
+        layout = await self._compute_layout(use_viewport=True)
+        if layout is None:
             return
-        if self.tag_name == "option":
+        _rect, center, is_obscured = layout
+        if is_obscured:
+            return
+        if await self.get_tag_name() == "option":
             await self._select_option_element()
         else:
             await self.session.perform_mouse_interaction(
                 center.x, center.y, MouseButton.LEFT, MouseInteraction.SINGLE_CLICK
             )
 
-    async def find_element(self, by=By.ID, value=None):
+    async def find_element(self, by: By = By.ID, value: Optional[str] = None):
         """Find an element given a By strategy and locator."""
         elem = await self.session.find_elements(by, value, root=self.id_)
         return None if elem is None else WebElement(self.session, elem)
 
-    async def find_elements(self, by=By.ID, value=None):
+    async def find_elements(self, by: By = By.ID, value: Optional[str] = None):
         """Find elements given a By strategy and locator."""
         elements = await self.session.find_elements(by, value, single=False, root=self.id_)
         return [WebElement(self.session, elem) for elem in elements]
@@ -86,42 +92,41 @@ class WebElement(SeleniumApi):
         """Returns whether the element is selected. Can be used to check if a checkbox or radio button is selected."""
         return bool(await self.get_dom_attribute("selected"))
 
-    @property
-    async def location(self) -> Point:
+    async def get_location(self) -> Point:
         """The location of the element in the renderable canvas."""
-        rect = await self.rect
+        rect = await self.get_rect()
         return Point(x=rect.x, y=rect.y)
 
-    @property
-    async def location_once_scrolled_into_view(self) -> Point:
+    async def get_location_once_scrolled_into_view(self) -> Point:
         """Returns the top lefthand corner location on the screen, or ``None`` if the element is not visible."""
         rect = await self.session.execute_script(
             "arguments[0].scrollIntoView(true); return arguments[0].getBoundingClientRect(); ", self.id_
         )
         return Point(x=round(rect["x"]), y=round(rect["y"]))
 
-    @property
-    async def rect(self) -> Rect:
+    async def get_rect(self) -> Rect:
         """The size and location of the element."""
-        return (await self._compute_layout(scroll_if_needed=False))[0]
+        layout = await self._compute_layout(scroll_if_needed=False)
+        if layout is None:
+            raise WirError("Cannot get the element's position and size; it may no longer be on the page.")
+        return layout[0]
 
-    @property
-    async def screenshot_as_base64(self) -> str:
+    async def _get_screenshot_as_base64(self) -> str:
         """Gets the screenshot of the current element as a base64 encoded string."""
         return await self.session.screenshot_as_base64(scroll=True, node_id=self.node_id)
 
-    async def send_keys(self, value):
+    async def send_keys(self, value: str):
         """
         Simulates typing into the element.
         :param value: A string for typing, or setting form fields.
         """
         await self._evaluate_js_function(FOCUS)
-        interactions = []
-        sticky_modifier = set()
+        interactions: list[dict[str, Any]] = []
+        sticky_modifier: set[KeyModifier] = set()
         for key in value:
             if key in VIRTUAL_KEYS:
                 virtual_key, modifier = VIRTUAL_KEYS[key]
-                interaction = {"type": KeyboardInteractionType.INSERT_BY_KEY, "key": virtual_key}
+                interaction: dict[str, Any] = {"type": KeyboardInteractionType.INSERT_BY_KEY, "key": virtual_key}
                 if modifier is not None:
                     sticky_modifier ^= {modifier}
                     interaction["type"] = (
@@ -136,15 +141,16 @@ class WebElement(SeleniumApi):
             interactions.append({"type": KeyboardInteractionType.KEY_RELEASE, "key": MODIFIER_TO_KEY[modifier]})
         await self.session.perform_keyboard_interactions(interactions)
 
-    @property
-    async def size(self) -> Size:
+    async def get_size(self) -> Size:
         """The size of the element."""
-        rect = await self.rect
+        rect = await self.get_rect()
         return Size(height=rect.height, width=rect.width)
 
     async def submit(self):
         """Submits a form."""
         form = await self.find_element(By.XPATH, "./ancestor-or-self::form")
+        if form is None:
+            raise WirError("Cannot submit: the element is not inside a form.")
         submit_code = (
             "var e = arguments[0].ownerDocument.createEvent('Event');"
             "e.initEvent('submit', true, true);"
@@ -152,13 +158,11 @@ class WebElement(SeleniumApi):
         )
         await self.session.execute_script(submit_code, form.id_)
 
-    @property
-    async def tag_name(self) -> str:
+    async def get_tag_name(self) -> str:
         """This element's ``tagName`` property."""
         return await self._evaluate_js_function("function(element) { return element.tagName.toLowerCase() }")
 
-    @property
-    async def text(self) -> str:
+    async def get_text(self) -> str:
         """The text of the element."""
         return await self._evaluate_js_function(
             'function(element) { return element.innerText.replace(/^[^\\S\\xa0]+|[^\\S\\xa0]+$/g, "") }'
@@ -166,13 +170,16 @@ class WebElement(SeleniumApi):
 
     async def touch(self) -> None:
         """Simulate touch interaction on the element."""
-        _rect, center, _is_obscured = await self._compute_layout(use_viewport=True)
+        layout = await self._compute_layout(use_viewport=True)
+        if layout is None:
+            return
+        _rect, center, _is_obscured = layout
         await self.session.perform_interaction_sequence(
-            [{"sourceId": self.session.id_, "sourceType": "Touch"}],
-            [{"states": [{"sourceId": self.session.id_, "location": {"x": center.x, "y": center.y}}]}],
+            [{"sourceId": self.session.get_id(), "sourceType": "Touch"}],
+            [{"states": [{"sourceId": self.session.get_id(), "location": {"x": center.x, "y": center.y}}]}],
         )
 
-    async def value_of_css_property(self, property_name) -> str:
+    async def value_of_css_property(self, property_name: str) -> str:
         """The value of a CSS property."""
         return await self._evaluate_js_function(
             "function(element) {"
@@ -184,13 +191,15 @@ class WebElement(SeleniumApi):
         """Returns whether the element is editable."""
         return await self._evaluate_js_function(IS_EDITABLE)
 
-    async def _compute_layout(self, scroll_if_needed=True, use_viewport=False):
+    async def _compute_layout(
+        self, scroll_if_needed: bool = True, use_viewport: bool = False
+    ) -> Optional[tuple[Rect, Point, bool]]:
         try:
             result = await self.session.compute_element_layout(
                 self.node_id, scroll_if_needed, "LayoutViewport" if use_viewport else "Page"
             )
         except WirError:
-            return
+            return None
 
         origin = result["rect"]["origin"]
         size = result["rect"]["size"]
@@ -201,8 +210,8 @@ class WebElement(SeleniumApi):
     async def _select_option_element(self):
         await self.session.select_option_element(self.node_id)
 
-    async def _evaluate_js_function(self, function, *args):
+    async def _evaluate_js_function(self, function: str, *args: Any):
         return await self.session.evaluate_js_function(function, self.id_, *args)
 
-    def __eq__(self, other):
+    def __eq__(self, other: Any):
         return self.id_ == other.id_

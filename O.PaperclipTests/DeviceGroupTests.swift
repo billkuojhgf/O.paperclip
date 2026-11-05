@@ -18,7 +18,7 @@ struct DeviceGroupTests {
     @MainActor
     @Test func stoppingGroupStopsAllRunningStreams() async throws {
         let streams = (0..<3).map { _ in MockDVTLocationStream() }
-        for stream in streams { stream.isRunning = true }
+        for stream in streams { stream.isConnected = true; stream.isRunning = true }
         let devices = streams.map { DeviceManager(settingsKey: "stop-\(UUID().uuidString)", dvtStream: $0) }
         let group = DeviceGroup(devices: devices)
         group.stopContinuousLocationStream()
@@ -27,6 +27,7 @@ struct DeviceGroupTests {
             try await Task.sleep(for: .milliseconds(20))
         }
         #expect(streams.allSatisfy { !$0.isRunning && $0.stopCallCount == 1 })
+        #expect(streams.allSatisfy { $0.isConnected })
     }
 
     @MainActor
@@ -35,7 +36,7 @@ struct DeviceGroupTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let script = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("SimulatorEvidence/device_endpoint.py")
         let devices = (0..<3).map { index in
-            let device = DeviceManager(settingsKey: "test-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", script.path, root.path])
+            let device = DeviceManager(settingsKey: "test-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", script.path, root.path], dvtStream: DVTLocationStream(command: ["/usr/bin/python3", script.path, root.path, "worker"]))
             device.tunnelUDID = "phone-\(index)"
             return device
         }
@@ -53,12 +54,12 @@ struct DeviceGroupTests {
             }
             group.stopContinuousLocationStream()
             try await group.clearSimulatedLocationAsync()
-            let commands = try String(contentsOf: root.appendingPathComponent("commands.jsonl"), encoding: .utf8).split(separator: "\n").map {
-                try JSONDecoder().decode([String].self, from: Data($0.utf8))
+            let events = try String(contentsOf: root.appendingPathComponent("lifecycle.jsonl"), encoding: .utf8).split(separator: "\n").map {
+                try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any]
             }
             for index in 0..<3 {
-                #expect(commands.contains { $0.starts(with: ["remote", "start-tunnel"]) && $0.contains(wireless ? "wifi" : "usb") && $0.suffix(2) == ["--udid", "phone-\(index)"] })
-                #expect(commands.contains { $0.starts(with: ["developer", "simulate-location", "clear"]) && $0.contains("phone-\(index)") })
+                #expect(events.contains { $0["event"] as? String == "ready" && $0["udid"] as? String == "phone-\(index)" && $0["transport"] as? String == (wireless ? "userspace-wifi" : "userspace-usb") })
+                #expect(events.contains { $0["event"] as? String == "clear" && $0["udid"] as? String == "phone-\(index)" })
             }
             await devices[1].disconnectAsync()
             #expect(group.isConnected)
@@ -76,7 +77,7 @@ struct DeviceGroupTests {
         try #require(observers.count == 3, "驗收必須包含三個 Simulator。")
         let script = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("SimulatorEvidence/device_endpoint.py")
         let devices = (0..<3).map { index in
-            let device = DeviceManager(settingsKey: "sim-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", script.path, root.path])
+            let device = DeviceManager(settingsKey: "sim-\(UUID().uuidString)", cliCommand: ["/usr/bin/python3", script.path, root.path], dvtStream: DVTLocationStream(command: ["/usr/bin/python3", script.path, root.path, "worker"]))
             device.tunnelUDID = "phone-\(index)"
             return device
         }

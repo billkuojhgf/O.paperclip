@@ -2,20 +2,26 @@ import contextlib
 import plistlib
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from uuid import uuid4
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.hazmat.primitives.serialization import Encoding
-from cryptography.hazmat.primitives.serialization.pkcs7 import PKCS7SignatureBuilder
+from cryptography.hazmat.primitives.serialization.pkcs7 import PKCS7Options, PKCS7SignatureBuilder
 
-from pymobiledevice3.exceptions import CloudConfigurationAlreadyPresentError, ProfileError
-from pymobiledevice3.lockdown import LockdownClient
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
+from pymobiledevice3.exceptions import (
+    CloudConfigurationAlreadyPresentError,
+    ConnectionTerminatedError,
+    PasscodeSetError,
+    ProfileError,
+)
 from pymobiledevice3.services.lockdown_service import LockdownService
 
 ERROR_CLOUD_CONFIGURATION_ALREADY_PRESENT = 14002
+KEYBAG_ERROR_DOMAIN = "DMCKeybagErrorDomain"
+ERROR_KEYBAG_PASSCODE_SET = 37002
 GLOBAL_HTTP_PROXY_UUID = "86a52338-52f7-4c09-b005-52baf3dc4882"
 GLOBAL_RESTRICTIONS_UUID = "e22a0a66-08a8-43f5-9bbc-5279af35bb2b"
 
@@ -24,82 +30,194 @@ class Purpose(Enum):
     PostSetupInstallation = "PostSetupInstallation"
 
 
+class WallpaperScreen(Enum):
+    """The ``Where`` value of a ``Wallpaper`` settings item."""
+
+    LOCK = 1
+    HOME = 2
+    BOTH = 3
+
+
 class MobileConfigService(LockdownService):
+    """
+    Manage configuration profiles and cloud (supervision) configuration.
+
+    Wraps the ``com.apple.mobile.MCInstall`` lockdown service used by MDM/Apple
+    Configurator. It can list, install and remove configuration profiles, drive
+    supervision and cloud-configuration state, and erase the device. Some operations
+    require supervised/silent installation, which is unlocked by `escalate` using a
+    supervision identity (a PEM keybag holding both certificate and private key).
+
+    Being a `LockdownService`, instances may be used as an async context manager::
+
+        async with MobileConfigService(lockdown) as mc:
+            profiles = await mc.get_profile_list()
+    """
+
     SERVICE_NAME = "com.apple.mobile.MCInstall"
     RSD_SERVICE_NAME = "com.apple.mobile.MCInstall.shim.remote"
 
-    def __init__(self, lockdown: LockdownServiceProvider) -> None:
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
+    async def hello(self) -> None:
+        """Perform the ``HelloHostIdentifier`` handshake with the service."""
+        await self._send_recv({"RequestType": "HelloHostIdentifier"})
 
-    def hello(self) -> None:
-        self._send_recv({"RequestType": "HelloHostIdentifier"})
+    async def flush(self) -> None:
+        """Issue a ``Flush`` request to the service."""
+        await self._send_recv({"RequestType": "Flush"})
 
-    def flush(self) -> None:
-        self._send_recv({"RequestType": "Flush"})
-
-    def escalate(self, keybag_file: Path) -> None:
+    async def escalate(self, keybag_file: Path) -> None:
         """
-        Authenticate with the device.
+        Authenticate as a supervisor to unlock silent/supervised operations.
 
-        :param keybag_file: Certificate file in PEM format, containing certificate and private key.
-        :return: None
+        Runs the ``Escalate`` challenge-response handshake using the supervision identity,
+        then requests keybag migration. Must be called before silent profile installation.
+
+        :param keybag_file: path to a PEM file containing both the supervisor certificate
+            and its (unencrypted) private key.
         """
-        with open(keybag_file, "rb") as keybag_file:
-            keybag_file = keybag_file.read()
-        private_key = serialization.load_pem_private_key(keybag_file, password=None)
-        cer = x509.load_pem_x509_certificate(keybag_file)
+        with open(keybag_file, "rb") as f:
+            keybag_data = f.read()
+        private_key = serialization.load_pem_private_key(keybag_data, password=None)
+        if not isinstance(private_key, (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
+            raise ProfileError(
+                f"The supervision keybag must hold an RSA or EC private key, not {type(private_key).__name__}"
+            )
+        cer = x509.load_pem_x509_certificate(keybag_data)
         public_key = cer.public_bytes(Encoding.DER)
-        escalate_response = self._send_recv({"RequestType": "Escalate", "SupervisorCertificate": public_key})
+        escalate_response = await self._send_recv({"RequestType": "Escalate", "SupervisorCertificate": public_key})
         signed_challenge = (
             PKCS7SignatureBuilder()
             .set_data(escalate_response["Challenge"])
             .add_signer(cer, private_key, hashes.SHA256())
-            .sign(Encoding.DER, [])
+            .sign(Encoding.DER, [PKCS7Options.Binary])
         )
-        self._send_recv({"RequestType": "EscalateResponse", "SignedRequest": signed_challenge})
-        self._send_recv({"RequestType": "ProceedWithKeybagMigration"})
+        await self._send_recv({"RequestType": "EscalateResponse", "SignedRequest": signed_challenge})
+        await self._send_recv({"RequestType": "ProceedWithKeybagMigration"})
 
-    def get_stored_profile(self, purpose: Purpose = Purpose.PostSetupInstallation) -> dict:
-        return self._send_recv({"RequestType": "GetStoredProfile", "Purpose": purpose.value})
+    async def get_stored_profile(self, purpose: Purpose = Purpose.PostSetupInstallation) -> dict[str, Any]:
+        """
+        Retrieve a profile stored on the device for a given purpose.
 
-    def store_profile(self, profile_data: bytes, purpose: Purpose = Purpose.PostSetupInstallation) -> None:
-        self._send_recv({"RequestType": "StoreProfile", "ProfileData": profile_data, "Purpose": purpose.value})
+        :param purpose: purpose the profile was stored under.
+        :returns: the device's response plist.
+        """
+        return await self._send_recv({"RequestType": "GetStoredProfile", "Purpose": purpose.value})
 
-    def get_cloud_configuration(self) -> dict:
-        return self._send_recv({"RequestType": "GetCloudConfiguration"}).get("CloudConfiguration")
+    async def store_profile(self, profile_data: bytes, purpose: Purpose = Purpose.PostSetupInstallation) -> None:
+        """
+        Store a profile on the device for later use under a given purpose.
 
-    def set_cloud_configuration(self, cloud_configuration: dict) -> None:
-        self._send_recv({"RequestType": "SetCloudConfiguration", "CloudConfiguration": cloud_configuration})
+        :param profile_data: raw profile bytes to store.
+        :param purpose: purpose to store the profile under.
+        """
+        await self._send_recv({"RequestType": "StoreProfile", "ProfileData": profile_data, "Purpose": purpose.value})
 
-    def establish_provisional_enrollment(self, nonce: bytes) -> None:
-        self._send_recv({"RequestType": "EstablishProvisionalEnrollment", "Nonce": nonce})
+    async def get_cloud_configuration(self) -> Optional[dict[str, Any]]:
+        """
+        Retrieve the device's cloud (supervision) configuration.
 
-    def set_wifi_power_state(self, state: bool) -> None:
-        self._send_recv({"RequestType": "SetWiFiPowerState", "PowerState": state})
+        :returns: the ``CloudConfiguration`` dictionary, or None if not set.
+        """
+        return (await self._send_recv({"RequestType": "GetCloudConfiguration"})).get("CloudConfiguration")
 
-    def erase_device(self, preserve_data_plan: bool, disallow_proximity_setup: bool) -> None:
-        with contextlib.suppress(ConnectionAbortedError):
-            self._send_recv({
+    async def set_cloud_configuration(self, cloud_configuration: dict[str, Any]) -> None:
+        """
+        Set the device's cloud (supervision) configuration.
+
+        :param cloud_configuration: cloud configuration dictionary to apply.
+        """
+        await self._send_recv({"RequestType": "SetCloudConfiguration", "CloudConfiguration": cloud_configuration})
+
+    async def download_and_apply_cloud_configuration(
+        self, username: Optional[str] = None, password: Optional[str] = None
+    ) -> None:
+        """
+        Ask the device to download and apply its DEP cloud configuration.
+
+        :param username: optional MDM enrollment username.
+        :param password: optional MDM enrollment password.
+        """
+        await self._send_recv({
+            "RequestType": "DownloadAndApplyCloudConfiguration",
+            "MDMUsername": username or "",
+            "MDMPassword": password or "",
+        })
+
+    async def establish_provisional_enrollment(self, nonce: bytes) -> None:
+        """
+        Establish a provisional MDM enrollment.
+
+        :param nonce: enrollment nonce.
+        """
+        await self._send_recv({"RequestType": "EstablishProvisionalEnrollment", "Nonce": nonce})
+
+    async def set_wifi_power_state(self, state: bool) -> None:
+        """
+        Turn the device's Wi-Fi radio on or off.
+
+        :param state: True to power Wi-Fi on, False to power it off.
+        """
+        await self._send_recv({"RequestType": "SetWiFiPowerState", "PowerState": state})
+
+    async def erase_device(self, preserve_data_plan: bool, disallow_proximity_setup: bool) -> None:
+        """
+        Erase all content and settings from the device.
+
+        The connection is normally terminated by the device as it begins erasing; that
+        termination is suppressed so the call returns cleanly.
+
+        :param preserve_data_plan: whether to preserve the cellular data plan across the erase.
+        :param disallow_proximity_setup: whether to disallow proximity setup after the erase.
+        """
+        with contextlib.suppress(ConnectionTerminatedError):
+            await self._send_recv({
                 "RequestType": "EraseDevice",
                 "PreserveDataPlan": preserve_data_plan,
                 "DisallowProximitySetup": disallow_proximity_setup,
             })
 
-    def get_profile_list(self) -> dict:
-        return self._send_recv({"RequestType": "GetProfileList"})
+    async def get_profile_list(self) -> dict[str, Any]:
+        """
+        List the configuration profiles installed on the device.
 
-    def install_profile(self, payload: bytes) -> None:
-        self._send_recv({"RequestType": "InstallProfile", "Payload": payload})
+        :returns: the device's response plist (including ``ProfileMetadata`` keyed by
+            profile identifier).
+        """
+        return await self._send_recv({"RequestType": "GetProfileList"})
 
-    def install_profile_silent(self, keybag_file: Path, profile: bytes) -> None:
-        self.escalate(keybag_file)
-        self._send_recv({"RequestType": "InstallProfileSilent", "Payload": profile})
+    async def install_profile(self, payload: bytes) -> None:
+        """
+        Install a configuration profile, prompting the user for confirmation.
 
-    def remove_profile(self, identifier: str) -> None:
-        profiles = self.get_profile_list()
+        :param payload: raw configuration profile bytes to install.
+        """
+        await self._send_recv({"RequestType": "InstallProfile", "Payload": payload})
+
+    async def install_profile_silent(self, keybag_file: Path, profile: bytes) -> None:
+        """
+        Install a configuration profile silently, without user interaction.
+
+        Escalates to supervisor privileges with the supervision identity, then installs
+        the profile.
+
+        :param keybag_file: path to a PEM file containing the supervisor certificate and
+            its private key, used to escalate.
+        :param profile: raw configuration profile bytes to install.
+        """
+        await self.escalate(keybag_file)
+        await self._send_recv({"RequestType": "InstallProfileSilent", "Payload": profile})
+
+    async def remove_profile(self, identifier: str) -> None:
+        """
+        Remove an installed configuration profile by its identifier.
+
+        Looks up the profile's metadata in the installed profile list and, if present,
+        sends a signed-free removal request. Does nothing if no profiles are installed or
+        the identifier is not currently installed.
+
+        :param identifier: payload identifier of the profile to remove.
+        """
+        profiles = await self.get_profile_list()
         if not profiles:
             return
         if identifier not in profiles["ProfileMetadata"]:
@@ -112,20 +230,111 @@ class MobileConfigService(LockdownService):
             "PayloadUUID": meta["PayloadUUID"],
             "PayloadVersion": meta["PayloadVersion"],
         })
-        self._send_recv({"RequestType": "RemoveProfile", "ProfileIdentifier": data})
+        await self._send_recv({"RequestType": "RemoveProfile", "ProfileIdentifier": data})
 
-    def _send_recv(self, request: dict) -> dict:
-        response = self.service.send_recv_plist(request)
+    async def request_unlock_token(self) -> bytes:
+        """
+        Fetch the passcode unlock token, which `clear_passcode` can later use to remove a passcode.
+
+        Requires a connection escalated with `escalate`. The device must have no passcode set:
+        while one is active the keybag refuses to mint a token.
+
+        :returns: the raw unlock token.
+        :raises PasscodeSetError: the device has a passcode set.
+        """
+        response = await self._send_recv({"RequestType": "RequestUnlockToken"}, redact=True)
+        token = response.get("UnlockToken")
+        if not isinstance(token, bytes):
+            raise ProfileError("The RequestUnlockToken response carries no UnlockToken")
+        return token
+
+    async def clear_passcode(self, unlock_token: bytes) -> None:
+        """
+        Remove the device passcode without knowing it.
+
+        Requires a connection escalated with `escalate`. The device drops this host's pairing
+        afterwards, as it does whenever the passcode changes; re-pair with `pair_supervised`.
+
+        :param unlock_token: a token previously fetched by `request_unlock_token`, before the
+            passcode was set.
+        """
+        await self._send_recv({"RequestType": "ClearPasscode", "UnlockToken": unlock_token}, redact=True)
+
+    async def clear_restrictions_password(self) -> None:
+        """
+        Clear the Screen Time (restrictions) passcode. No unlock token is needed.
+
+        Requires a connection escalated with `escalate`. iOS 27.2 always fails it with a
+        ``ScreenTimeSettingsServiceClientError``: the device's own sandbox denies mc_mobile_tunnel
+        the lookup of ``com.apple.ScreenTimeSettingsAgent.private``.
+        """
+        await self._send_recv({"RequestType": "ClearRestrictionsPassword"})
+
+    async def get_security_info(self) -> dict[str, Any]:
+        """
+        Query the device's security status. Read-only; performs no keybag operation.
+
+        Requires a connection escalated with `escalate` (unescalated, the device answers
+        ``CommandFormatError``). The reply includes ``PasscodePresent``, which reliably tells
+        whether a passcode is set, unlike lockdown's ``PasswordProtected`` (which reflects whether
+        the device is currently locked), along with passcode compliance, lock grace periods,
+        hardware encryption capabilities and management status.
+
+        :returns: the ``SecurityInfo`` dictionary.
+        """
+        info = (await self._send_recv({"RequestType": "SecurityInfo"})).get("SecurityInfo")
+        if not isinstance(info, dict):
+            raise ProfileError("The SecurityInfo response carries no SecurityInfo dictionary")
+        return cast(dict[str, Any], info)
+
+    async def set_wallpaper(self, image: bytes, screen: WallpaperScreen = WallpaperScreen.HOME) -> None:
+        """
+        Set the device wallpaper via the ``Settings`` request's ``Wallpaper`` item.
+
+        Requires a connection escalated with `escalate`. Since iOS 16 the lock and home screen
+        wallpapers form a pair, so the device may apply the image to both regardless of `screen`.
+
+        :param image: JPEG or PNG image bytes.
+        :param screen: which screen(s) to apply the wallpaper to.
+        """
+        response = await self._send_recv({
+            "RequestType": "Settings",
+            "Settings": [{"Item": "Wallpaper", "Where": screen.value, "Image": image}],
+        })
+        settings = response.get("Settings")
+        if not isinstance(settings, list) or not settings or not isinstance(settings[0], dict):
+            raise ProfileError(f"The wallpaper Settings response carries no item status: {response}")
+        item = cast(dict[str, Any], settings[0])
+        if item.get("Status") != "Acknowledged":
+            raise ProfileError(f"The device rejected the wallpaper: {item}")
+
+    async def _send_recv(self, request: dict[str, Any], redact: bool = False) -> dict[str, Any]:
+        response = await self.service.send_recv_plist(request)
         if response.get("Status", None) != "Acknowledged":
-            error_chain = response.get("ErrorChain")
-            if error_chain is not None:
-                error_code = error_chain[0]["ErrorCode"]
+            error_chain = cast(list[dict[str, Any]], response.get("ErrorChain") or [])
+            if error_chain:
+                error_code = error_chain[0].get("ErrorCode")
                 if error_code == ERROR_CLOUD_CONFIGURATION_ALREADY_PRESENT:
                     raise CloudConfigurationAlreadyPresentError()
-            raise ProfileError(f"invalid response {response}")
+            if any(
+                error.get("ErrorDomain") == KEYBAG_ERROR_DOMAIN and error.get("ErrorCode") == ERROR_KEYBAG_PASSCODE_SET
+                for error in error_chain
+            ):
+                raise PasscodeSetError()
+            if redact:
+                # The response may echo or carry an unlock token, so only describe the failure.
+                errors = "; ".join(
+                    f"{error.get('ErrorDomain')}({error.get('ErrorCode')}): {error.get('LocalizedDescription')}"
+                    for error in error_chain
+                )
+                raise ProfileError(
+                    f"The device rejected the {request['RequestType']} request: Status={response.get('Status')}"
+                    + (f"; {errors}" if errors else "")
+                )
+            raise ProfileError(f"The device rejected the profile request: {response}")
         return response
 
-    def install_wifi_profile(
+    async def install_wifi_profile(
         self,
         encryption_type: str,
         ssid: str,
@@ -137,8 +346,23 @@ class MobileConfigService(LockdownService):
         is_hotspot: bool = False,
         keybag_file: Optional[Path] = None,
     ) -> None:
+        """
+        Build and install a ``com.apple.wifi.managed`` profile for a Wi-Fi network.
+
+        :param encryption_type: Wi-Fi encryption type (e.g. ``WPA``, ``WEP``, ``None``).
+        :param ssid: network SSID.
+        :param password: network password.
+        :param auto_join: whether the device should automatically join the network.
+        :param captive_bypass: whether to bypass the captive portal check.
+        :param disable_association_mac_randomization: whether to disable MAC-address
+            randomization when associating.
+        :param hidden_network: whether the network is hidden (does not broadcast its SSID).
+        :param is_hotspot: whether the network is treated as a personal hotspot.
+        :param keybag_file: when provided, install silently using this supervision identity;
+            otherwise install with a user prompt.
+        """
         payload_uuid = str(uuid4())
-        self.install_managed_profile(
+        await self.install_managed_profile(
             f"WiFi Profile For {ssid}",
             {
                 "AutoJoin": auto_join,
@@ -160,9 +384,20 @@ class MobileConfigService(LockdownService):
             keybag_file=keybag_file,
         )
 
-    def install_http_proxy(self, server: str, server_port: int, keybag_file: Optional[Path] = None) -> None:
+    async def install_http_proxy(self, server: str, server_port: int, keybag_file: Optional[Path] = None) -> None:
+        """
+        Build and install a global manual HTTP-proxy profile.
+
+        The profile uses the fixed `GLOBAL_HTTP_PROXY_UUID` so it can later be removed by
+        `remove_http_proxy`.
+
+        :param server: proxy server host.
+        :param server_port: proxy server port.
+        :param keybag_file: when provided, install silently using this supervision identity;
+            otherwise install with a user prompt.
+        """
         payload_uuid = str(uuid4())
-        self.install_managed_profile(
+        await self.install_managed_profile(
             f"HTTP Proxy for {server}:{server_port}",
             {
                 "PayloadDescription": "Global HTTP Proxy",
@@ -180,13 +415,24 @@ class MobileConfigService(LockdownService):
             keybag_file=keybag_file,
         )
 
-    def remove_http_proxy(self) -> None:
-        self.remove_profile(GLOBAL_HTTP_PROXY_UUID)
+    async def remove_http_proxy(self) -> None:
+        """Remove the global HTTP-proxy profile previously installed by `install_http_proxy`."""
+        await self.remove_profile(GLOBAL_HTTP_PROXY_UUID)
 
-    def supervise(self, organization: str, keybag_file: Path) -> None:
+    async def supervise(self, organization: str, keybag_file: Path) -> None:
+        """
+        Place the device under supervision by writing a cloud configuration.
+
+        Sets a supervised cloud configuration that names the organization, registers the
+        supervisor certificate, and skips all setup-assistant panes.
+
+        :param organization: organization name recorded in the cloud configuration.
+        :param keybag_file: path to a PEM file containing the supervisor certificate whose
+            DER public bytes are registered as a supervisor host certificate.
+        """
         cer = x509.load_pem_x509_certificate(keybag_file.read_bytes())
         public_key = cer.public_bytes(Encoding.DER)
-        self.set_cloud_configuration({
+        await self.set_cloud_configuration({
             "AllowPairing": True,
             "CloudConfigurationUIComplete": True,
             "ConfigurationSource": 2,
@@ -280,17 +526,29 @@ class MobileConfigService(LockdownService):
                 "SafetyAndHandling",
                 "Tips",
                 "AgeBasedSafetySettings",
+                "LiquidGlass",
+                "AgeAssurance",
+                "DeviceFeaturesTour",
             ],
             "SupervisorHostCertificates": [public_key],
         })
 
-    def install_managed_profile(
+    async def install_managed_profile(
         self,
         display_name: str,
         payload_content: dict[str, Any],
         payload_uuid: str = str(uuid4()),
         keybag_file: Optional[Path] = None,
     ) -> None:
+        """
+        Wrap a single payload in a ``Configuration`` profile and install it.
+
+        :param display_name: profile display name.
+        :param payload_content: the inner payload dictionary to wrap.
+        :param payload_uuid: UUID used as both the profile identifier and UUID.
+        :param keybag_file: when provided, install silently using this supervision identity;
+            otherwise install with a user prompt.
+        """
         profile_data = plistlib.dumps({
             "PayloadContent": [payload_content],
             "PayloadDisplayName": display_name,
@@ -301,17 +559,29 @@ class MobileConfigService(LockdownService):
             "PayloadVersion": 1,
         })
         if keybag_file is not None:
-            self.install_profile_silent(keybag_file, profile_data)
+            await self.install_profile_silent(keybag_file, profile_data)
         else:
-            self.install_profile(profile_data)
+            await self.install_profile(profile_data)
 
-    def install_restrictions_profile(
+    async def install_restrictions_profile(
         self,
         enforced_software_update_delay: int = 0,
         payload_uuid: str = GLOBAL_RESTRICTIONS_UUID,
         keybag_file: Optional[Path] = None,
     ) -> None:
-        self.install_managed_profile(
+        """
+        Build and install a ``com.apple.applicationaccess`` restrictions profile.
+
+        The profile permits essentially every restricted capability; only the software
+        update delay is parameterized.
+
+        :param enforced_software_update_delay: number of days to delay visibility of
+            software updates.
+        :param payload_uuid: UUID used as the profile identifier and UUID.
+        :param keybag_file: when provided, install silently using this supervision identity;
+            otherwise install with a user prompt.
+        """
+        await self.install_managed_profile(
             "Restrictions",
             {
                 "PayloadDescription": "Configures restrictions",

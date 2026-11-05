@@ -2,15 +2,14 @@
 
 import enum
 import time
-from collections.abc import Generator
-from typing import Optional
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
+from typing import Annotated, Any, BinaryIO, Optional, Union, cast
 
 import pcapng.blocks as blocks
-from construct import Byte, Bytes, Container, CString, Int16ub, Int32ub, Int32ul, Padded, Seek, Struct, this
+from bytestruct import BinaryStruct, ByteReader, BytesLike, PaddedString, u8, u16, u32, u32le
 from pcapng import FileWriter
 
-from pymobiledevice3.lockdown import LockdownClient
-from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 from pymobiledevice3.services.lockdown_service import LockdownService
 
 INTERFACE_NAMES = enum.Enum(
@@ -301,27 +300,40 @@ LINKTYPE_RAW = 101
 
 ETHERNET_HEADER = b"\xbe\xef" * 6 + b"\x08\x00"
 
-device_packet_struct = Struct(
-    "header_length" / Int32ub,
-    "header_version" / Byte,
-    "packet_length" / Int32ub,
-    "interface_type" / Byte,
-    "unit" / Int16ub,
-    "io" / Byte,
-    "protocol_family" / Int32ub,
-    "frame_pre_length" / Int32ub,
-    "frame_post_length" / Int32ub,
-    "interface_name" / Padded(16, CString("utf8")),
-    "pid" / Int32ul,
-    "comm" / Padded(17, CString("utf8")),
-    "svc" / Int32ub,
-    "epid" / Int32ul,
-    "ecomm" / Padded(17, CString("utf8")),
-    "seconds" / Int32ub,
-    "microseconds" / Int32ub,
-    Seek(this.header_length),
-    "data" / Bytes(this.packet_length),
-)
+_COMM_SIZE = 17
+
+
+@dataclass
+class DevicePacket(BinaryStruct, byte_order=">"):
+    """A packet captured by pcapd: per-packet metadata (big-endian, except ``pid``/``epid``) followed by the
+    raw frame ``data``, which starts at ``header_length``."""
+
+    header_length: u32
+    header_version: u8
+    packet_length: u32
+    interface_type: Annotated[Union[int, enum.Enum], u8]
+    unit: u16
+    io: u8
+    protocol_family: u32
+    frame_pre_length: u32
+    frame_post_length: u32
+    interface_name: Annotated[str, PaddedString(16)]
+    pid: u32le
+    # The kernel truncates process names at a byte boundary, which can split a UTF-8 character.
+    comm: Annotated[str, PaddedString(_COMM_SIZE, errors="replace")]
+    svc: u32
+    epid: u32le
+    ecomm: Annotated[str, PaddedString(_COMM_SIZE, errors="replace")]
+    seconds: u32
+    microseconds: u32
+    data: bytes = b""
+
+
+def parse_device_packet(data: BytesLike) -> DevicePacket:
+    """Parse a raw pcapd packet; the frame starts at ``header_length``, which may exceed the fixed header size."""
+    packet = DevicePacket.parse(data)
+    packet.data = ByteReader(data[packet.header_length :], base=packet.header_length).read(packet.packet_length)
+    return packet
 
 
 class CrossPlatformAddressFamily(enum.IntEnum):
@@ -332,30 +344,41 @@ class CrossPlatformAddressFamily(enum.IntEnum):
 
 class PcapdService(LockdownService):
     """
-    Starting iOS 5, apple added a remote virtual interface (RVI) facility that allows mirroring networks traffic from
-    an iOS device. On macOS, the virtual interface can be enabled with the rvictl command. This script allows to use
-    this service on other systems.
+    Capture network traffic from an iOS device.
+
+    Starting with iOS 5, Apple added a remote virtual interface (RVI) facility that mirrors the device's
+    network traffic. On macOS the virtual interface is enabled with the ``rvictl`` command; this service
+    exposes the same capability on other platforms. The service name used depends on the lockdown type
+    (legacy ``com.apple.pcapd`` for `LockdownClient`, RSD shim otherwise).
     """
 
     RSD_SERVICE_NAME = "com.apple.pcapd.shim.remote"
     SERVICE_NAME = "com.apple.pcapd"
 
-    def __init__(self, lockdown: LockdownServiceProvider):
-        if isinstance(lockdown, LockdownClient):
-            super().__init__(lockdown, self.SERVICE_NAME)
-        else:
-            super().__init__(lockdown, self.RSD_SERVICE_NAME)
-
-    def watch(
+    async def watch(
         self, packets_count: int = -1, process: Optional[str] = None, interface_name: Optional[str] = None
-    ) -> Generator[Container, None, None]:
+    ) -> AsyncGenerator[DevicePacket, None]:
+        """
+        Stream captured packets from the device as they arrive.
+
+        Each packet is parsed into its per-packet metadata fields (process pid/name, interface, timing,
+        protocol family, etc.) plus the raw frame data. For interfaces that lack a link-layer header
+        (and for ``pdp_ip`` cellular packets), a synthetic Ethernet header is prepended to ``data`` so
+        the output is valid for standard pcap consumers.
+
+        :param packets_count: Number of packets to yield before stopping; -1 streams indefinitely.
+        :param process: If set, only yield packets whose pid (as a string) or process name matches.
+        :param interface_name: If set, only yield packets captured on this interface.
+        :yields: A parsed `DevicePacket`; ``interface_type`` is an `INTERFACE_NAMES` value and
+            ``protocol_family`` a `CrossPlatformAddressFamily` value.
+        """
         packet_index = 0
         while packet_index != packets_count:
-            d = self.service.recv_plist()
+            d = await self.service.recv_plist()
             if not d:
                 break
 
-            packet = device_packet_struct.parse(d)
+            packet = parse_device_packet(cast(bytes, d))
 
             if process is not None and process != str(packet.pid) and process != packet.comm:
                 continue
@@ -376,8 +399,18 @@ class PcapdService(LockdownService):
 
             packet_index += 1
 
-    def write_to_pcap(self, out, packet_generator) -> None:
-        shb = blocks.SectionHeader(
+    async def write_to_pcap(self, out: BinaryIO, packet_generator: AsyncIterator[DevicePacket]) -> None:
+        """
+        Write captured packets to a pcapng stream.
+
+        Consumes an async packet generator (such as `watch`) and writes each packet as an enhanced
+        packet block, annotating it with the originating process metadata. Each block carries the
+        device's capture time (``seconds``/``microseconds``), or the host's clock if the device sent none.
+
+        :param out: A writable binary file-like object to receive the pcapng data.
+        :param packet_generator: Async iterable yielding parsed packets.
+        """
+        shb: Any = blocks.SectionHeader(
             options={
                 "shb_hardware": "artificial",
                 "shb_os": "iOS",
@@ -389,12 +422,13 @@ class PcapdService(LockdownService):
             link_type=1,
             options={"if_description": "iOS Packet Capture", "if_os": f"iOS {self.lockdown.product_version}"},
         )
-        writer = FileWriter(out, shb)
+        writer: Any = FileWriter(out, shb)
 
-        for packet in packet_generator:
-            packet_time = packet.timestamp if hasattr(packet, "timestamp") else time.time()
-
-            timestamp_microseconds = int(packet_time * 1_000_000)
+        async for packet in packet_generator:
+            if packet.seconds:
+                timestamp_microseconds = packet.seconds * 1_000_000 + packet.microseconds
+            else:
+                timestamp_microseconds = int(time.time() * 1_000_000)
             timestamp_high = (timestamp_microseconds >> 32) & 0xFFFFFFFF
             timestamp_low = timestamp_microseconds & 0xFFFFFFFF
 

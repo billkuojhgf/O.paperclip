@@ -1,13 +1,14 @@
 import logging
+import re
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
 import typer
-from tqdm import tqdm
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep
-from pymobiledevice3.services.mobilebackup2 import Mobilebackup2Service
+from pymobiledevice3.cli.cli_common import ServiceProviderDep, async_command
+from pymobiledevice3.progress import ProgressBar
+from pymobiledevice3.services.mobilebackup2 import BackupSelection, Mobilebackup2Service
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,20 @@ cli = InjectingTyper(
     help="Create, inspect, and restore MobileBackup2 backups.",
     no_args_is_help=True,
 )
+
+
+def validate_regex_patterns(
+    _ctx: typer.Context, _param: typer.CallbackParam, value: Optional[list[str]]
+) -> Optional[list[str]]:
+    if not value:
+        return value
+
+    for pattern in value:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise typer.BadParameter(f"Invalid regex pattern {pattern!r}: {exc}") from exc
+    return value
 
 
 SourceOption = Annotated[
@@ -34,7 +49,6 @@ PasswordOption = Annotated[
 BackupDirectoryArg = Annotated[
     Path,
     typer.Argument(
-        exists=True,
         file_okay=False,
     ),
 ]
@@ -47,16 +61,72 @@ BackupDirectoryOption = Annotated[
         file_okay=False,
     ),
 ]
+BackupSelectionOption = Annotated[
+    Optional[list[BackupSelection]],
+    typer.Option(
+        "--only",
+        case_sensitive=False,
+        help="Preserve only selected backup payload presets. Repeat to keep multiple presets.",
+    ),
+]
+BackupRegexOption = Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--only-regex",
+        callback=validate_regex_patterns,
+        help="Preserve only backup payloads whose device path or manifest path matches this regex. Repeat to keep multiple regexes.",
+    ),
+]
+
+
+def validate_backup_filter_options(filtered: bool, patch_manifest: bool, unback: bool) -> None:
+    if patch_manifest and not filtered:
+        raise typer.BadParameter(
+            "--patch-manifest requires --only or --only-regex.",
+            param_hint="--patch-manifest",
+        )
+    if unback and filtered and not patch_manifest:
+        raise typer.BadParameter(
+            "--unback with --only or --only-regex requires --patch-manifest.",
+            param_hint="--patch-manifest",
+        )
 
 
 @cli.command()
-def backup(
+@async_command
+async def backup(
     service_provider: ServiceProviderDep,
     backup_directory: BackupDirectoryArg,
     full: Annotated[
         bool,
         typer.Option(
-            help="Whether to do a full backup. If full is True, any previous backup attempts will be discarded.",
+            help=(
+                "Force a full backup and discard previous local backup state. "
+                "By default, backup is incremental when valid local metadata exists, "
+                "and automatically becomes full for an empty or incomplete backup directory."
+            ),
+        ),
+    ] = False,
+    only: BackupSelectionOption = None,
+    only_regex: BackupRegexOption = None,
+    patch_manifest: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Remove entries for discarded payloads from Manifest.db. "
+                "Encrypted backups require --password when this option is used."
+            ),
+        ),
+    ] = False,
+    password: PasswordOption = "",
+    unback: Annotated[
+        bool,
+        typer.Option(
+            "--unback",
+            help=(
+                "Also unpack the completed backup locally using pyiosbackup. "
+                "Existing unpacked contents are replaced. Filtered backups require --patch-manifest."
+            ),
         ),
     ] = False,
 ) -> None:
@@ -65,18 +135,40 @@ def backup(
 
     All backup data will be written to BACKUP_DIRECTORY, under a directory named with the device's udid.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    with tqdm(total=100, dynamic_ncols=True) as pbar:
+    backup_directory.mkdir(parents=True, exist_ok=True)
+    preserve_rules = tuple(rule for selection in (only or ()) for rule in selection.rules())
+    filter_callback = Mobilebackup2Service.combine_filter_callbacks(
+        Mobilebackup2Service.selection_filter_callback(preserve_rules) if preserve_rules else None,
+        Mobilebackup2Service.regex_filter_callback(only_regex) if only_regex else None,
+    )
+    validate_backup_filter_options(filter_callback is not None, patch_manifest, unback)
 
-        def update_bar(percentage) -> None:
-            pbar.n = percentage
-            pbar.refresh()
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        if patch_manifest and not password and await backup_client.get_will_encrypt():
+            raise typer.BadParameter(
+                "--password is required when patching an encrypted backup manifest.",
+                param_hint="--password",
+            )
 
-        backup_client.backup(full=full, backup_directory=str(backup_directory), progress_callback=update_bar)
+        with ProgressBar(total=100, desc="backup") as pbar:
+
+            def update_bar(percentage: float) -> None:
+                pbar.n = percentage
+
+            await backup_client.backup(
+                full=full,
+                backup_directory=str(backup_directory),
+                progress_callback=update_bar,
+                filter_callback=filter_callback,
+                patch_manifest=patch_manifest,
+                password=password,
+                unback=unback,
+            )
 
 
 @cli.command()
-def restore(
+@async_command
+async def restore(
     service_provider: ServiceProviderDep,
     backup_directory: BackupDirectoryArg,
     system: Annotated[
@@ -111,49 +203,53 @@ def restore(
 
     The backup will be restored from a directory with the device udid under BACKUP_DIRECTORY.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    with tqdm(total=100, dynamic_ncols=True) as pbar:
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        with ProgressBar(total=100, desc="restore") as pbar:
 
-        def update_bar(percentage) -> None:
-            pbar.n = percentage
-            pbar.refresh()
+            def update_bar(percentage: float) -> None:
+                pbar.n = percentage
 
-        backup_client.restore(
-            backup_directory=str(backup_directory),
-            progress_callback=update_bar,
-            system=system,
-            reboot=reboot,
-            copy=copy,
-            settings=settings,
-            remove=remove,
-            password=password,
-            source=source,
-            skip_apps=skip_apps,
-        )
+            await backup_client.restore(
+                backup_directory=str(backup_directory),
+                progress_callback=update_bar,
+                system=system,
+                reboot=reboot,
+                copy=copy,
+                settings=settings,
+                remove=remove,
+                password=password,
+                source=source,
+                skip_apps=skip_apps,
+            )
 
 
 @cli.command()
-def info(service_provider: ServiceProviderDep, backup_directory: BackupDirectoryArg, source: SourceOption = "") -> None:
+@async_command
+async def info(
+    service_provider: ServiceProviderDep, backup_directory: BackupDirectoryArg, source: SourceOption = ""
+) -> None:
     """
     Print information about a backup.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    print(backup_client.info(backup_directory=str(backup_directory), source=source))
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        print(await backup_client.info(backup_directory=str(backup_directory), source=source))
 
 
 @cli.command("list")
-def list_(
+@async_command
+async def list_(
     service_provider: ServiceProviderDep, backup_directory: BackupDirectoryArg, source: SourceOption = ""
 ) -> None:
     """
     List all file in the backup in a CSV format.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    print(backup_client.list(backup_directory=str(backup_directory), source=source))
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        print(await backup_client.list(backup_directory=str(backup_directory), source=source))
 
 
 @cli.command()
-def unback(
+@async_command
+async def unback(
     service_provider: ServiceProviderDep,
     backup_directory: BackupDirectoryArg,
     password: PasswordOption = "",
@@ -162,12 +258,13 @@ def unback(
     """
     Convert all files in the backup to the correct directory hierarchy.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    backup_client.unback(backup_directory=str(backup_directory), password=password, source=source)
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        await backup_client.unback(backup_directory=str(backup_directory), password=password, source=source)
 
 
 @cli.command()
-def extract(
+@async_command
+async def extract(
     service_provider: ServiceProviderDep,
     domain_name: str,
     relative_path: str,
@@ -181,42 +278,67 @@ def extract(
     The file that belongs to the domain DOMAIN_NAME and located on the device in the path RELATIVE_PATH,
     will be extracted to the BACKUP_DIRECTORY.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    backup_client.extract(
-        domain_name, relative_path, backup_directory=str(backup_directory), password=password, source=source
-    )
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        await backup_client.extract(
+            domain_name, relative_path, backup_directory=str(backup_directory), password=password, source=source
+        )
+
+
+def _validate_encryption_password(ctx: typer.Context, _param: typer.CallbackParam, value: str) -> str:
+    if ctx.params.get("mode") is not None and not value:
+        raise typer.BadParameter("PASSWORD is required when setting encryption on or off.")
+    return value
 
 
 @cli.command()
-def encryption(
+@async_command
+async def encryption(
     service_provider: ServiceProviderDep,
     *,
     backup_directory: BackupDirectoryOption = Path("."),
     mode: Annotated[
-        Literal["on", "off"],
+        Optional[Literal["on", "off"]],
         typer.Argument(case_sensitive=False),
-    ],
-    password: str,
+    ] = None,
+    password: Annotated[str, typer.Argument(callback=_validate_encryption_password)] = "",
 ) -> None:
     """
-    Set backup encryption on / off.
+    Set backup encryption on / off, or report the current encryption state when run without arguments.
 
     When on, PASSWORD will be the new backup password.
     When off, PASSWORD is the current backup password.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    should_encrypt = mode.lower() == "on"
-    if should_encrypt == backup_client.will_encrypt:
-        logger.error("Encryption already " + ("on!" if should_encrypt else "off!"))
-        return
-    if should_encrypt:
-        backup_client.change_password(str(backup_directory), new=password)
-    else:
-        backup_client.change_password(str(backup_directory), old=password)
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        will_encrypt = await backup_client.get_will_encrypt()
+        if mode is None:
+            typer.echo("on" if will_encrypt else "off")
+            return
+        should_encrypt = mode.lower() == "on"
+        if should_encrypt == will_encrypt:
+            logger.error("Encryption already " + ("on!" if should_encrypt else "off!"))
+            return
+        if should_encrypt:
+            await backup_client.change_password(str(backup_directory), new=password)
+        else:
+            await backup_client.change_password(str(backup_directory), old=password)
 
 
 @cli.command()
-def change_password(
+@async_command
+async def cloud(
+    service_provider: ServiceProviderDep,
+    mode: Annotated[Literal["on", "off"], typer.Argument(case_sensitive=False)],
+) -> None:
+    """
+    Turn iCloud Backup on / off.
+    """
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        await backup_client.set_cloud_backup(mode.lower() == "on")
+
+
+@cli.command()
+@async_command
+async def change_password(
     service_provider: ServiceProviderDep,
     old_password: str,
     new_password: str,
@@ -225,17 +347,18 @@ def change_password(
     """
     Change the backup password.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    if not backup_client.will_encrypt:
-        logger.error("Encryption is not turned on!")
-        return
-    backup_client.change_password(str(backup_directory), old=old_password, new=new_password)
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        if not await backup_client.get_will_encrypt():
+            logger.error("Encryption is not turned on!")
+            raise typer.Exit(1)
+        await backup_client.change_password(str(backup_directory), old=old_password, new=new_password)
 
 
 @cli.command()
-def erase_device(service_provider: ServiceProviderDep, backup_directory: BackupDirectoryArg) -> None:
+@async_command
+async def erase_device(service_provider: ServiceProviderDep, backup_directory: BackupDirectoryArg) -> None:
     """
     Erase all data on the device.
     """
-    backup_client = Mobilebackup2Service(service_provider)
-    backup_client.erase_device(str(backup_directory))
+    async with Mobilebackup2Service(service_provider) as backup_client:
+        await backup_client.erase_device(str(backup_directory))

@@ -1,12 +1,32 @@
 import logging
+from enum import Enum
+from typing import Annotated, Any, Optional
 
+import typer
 from typer_injector import InjectingTyper
 
-from pymobiledevice3.cli.cli_common import ServiceProviderDep, print_json
+from pymobiledevice3.cli.cli_common import (
+    OutputFormat,
+    OutputFormatOption,
+    ServiceProviderDep,
+    async_command,
+    print_json,
+    print_json_line,
+)
 from pymobiledevice3.cli.developer.accessibility import settings
-from pymobiledevice3.services.accessibilityaudit import AccessibilityAudit
+from pymobiledevice3.services.accessibilityaudit import AccessibilityAudit, Direction
 
 logger = logging.getLogger(__name__)
+
+
+class FocusDirection(str, Enum):
+    FIRST = "first"
+    NEXT = "next"
+    PREVIOUS = "previous"
+    LAST = "last"
+
+    def to_direction(self) -> Direction:
+        return Direction[self.value.capitalize()]
 
 
 cli = InjectingTyper(
@@ -18,22 +38,25 @@ cli.add_typer(settings.cli)
 
 
 @cli.command("run-audit")
-def accessibility_run_audit(service_provider: ServiceProviderDep, test_types: list[str]) -> None:
+@async_command
+async def accessibility_run_audit(service_provider: ServiceProviderDep, test_types: list[str]) -> None:
     """runs accessibility audit tests"""
-    audit_issues = AccessibilityAudit(service_provider).run_audit(test_types)
+    audit_issues = await AccessibilityAudit(service_provider).run_audit(test_types)
     print_json([audit_issue.json() for audit_issue in audit_issues], False)
 
 
 @cli.command("supported-audit-types")
-def accessibility_supported_audit_types(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def accessibility_supported_audit_types(service_provider: ServiceProviderDep) -> None:
     """lists supported accessibility audit test types"""
-    print_json(AccessibilityAudit(service_provider).supported_audits_types())
+    print_json(await AccessibilityAudit(service_provider).supported_audits_types())
 
 
 @cli.command("capabilities")
-def accessibility_capabilities(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def accessibility_capabilities(service_provider: ServiceProviderDep) -> None:
     """display accessibility capabilities"""
-    print_json(AccessibilityAudit(service_provider).capabilities)
+    print_json(await AccessibilityAudit(service_provider).capabilities())
 
 
 @cli.command("shell")
@@ -43,23 +66,61 @@ def accessibility_shell(service_provider: ServiceProviderDep) -> None:
 
 
 @cli.command("notifications")
-def accessibility_notifications(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def accessibility_notifications(
+    service_provider: ServiceProviderDep, output_format: OutputFormatOption = OutputFormat.TEXT
+) -> None:
     """show notifications"""
     service = AccessibilityAudit(service_provider)
-    for event in service.iter_events():
+    async for event in service.iter_events():
         if event.name in (
             "hostAppStateChanged:",
             "hostInspectorCurrentElementChanged:",
         ):
             for focus_item in event.data:
-                logger.info(focus_item)
+                if output_format is OutputFormat.JSON:
+                    print_json_line(focus_item.to_dict())
+                else:
+                    print(focus_item, flush=True)
 
 
 @cli.command("list-items")
-def accessibility_list_items(service_provider: ServiceProviderDep) -> None:
+@async_command
+async def accessibility_list_items(service_provider: ServiceProviderDep) -> None:
     """List elements available in the currently shown menu."""
-    elements = []
-    with AccessibilityAudit(service_provider) as service:
-        for element in service.iter_elements():
+    elements: list[dict[str, Any]] = []
+    async with AccessibilityAudit(service_provider) as service:
+        async for element in service.iter_elements():
             elements.append(element.to_dict())
     print_json(elements)
+
+
+@cli.command("element-attributes")
+@async_command
+async def accessibility_element_attributes(
+    service_provider: ServiceProviderDep,
+    attributes: Annotated[
+        Optional[list[str]],
+        typer.Argument(help="Attribute names to read (default: Label, Identifier, Value)."),
+    ] = None,
+    direction: Annotated[
+        FocusDirection,
+        typer.Option(help="How to move the inspector focus before reading the newly focused element."),
+    ] = FocusDirection.NEXT,
+) -> None:
+    """Move the accessibility inspector focus and read attributes (label, identifier, value, ...) of the focused element."""
+    if not attributes:
+        attributes = ["Label", "Identifier", "Value"]
+    async with AccessibilityAudit(service_provider) as service:
+        try:
+            focus = await service.move_focus_and_wait(direction.to_direction())
+        except TimeoutError:
+            logger.error(f"The focus did not move ({direction.value}); it may already be on that element.")
+            raise typer.Exit(1) from None
+        element = focus.element
+        if element is None:
+            logger.error("The focused item does not identify an element.")
+            raise typer.Exit(1)
+        result = focus.to_dict()
+        result["attributes"] = await service.element_attributes(element.identifier, attributes)
+    print_json(result)

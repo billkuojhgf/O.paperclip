@@ -5,10 +5,10 @@ import os
 import plistlib
 import typing
 
-from tqdm import trange
-
-from pymobiledevice3.exceptions import PyMobileDevice3Exception
+from pymobiledevice3.exceptions import ConnectionFailedError, NotConnectedError, ProtocolError
+from pymobiledevice3.progress import BYTES_UNIT, ProgressBar
 from pymobiledevice3.service_connection import ServiceConnection
+from pymobiledevice3.utils import current_task_name
 
 ASR_VERSION = 1
 ASR_STREAM_ID = 1
@@ -18,6 +18,8 @@ ASR_PACKETS_PER_FEC = 25
 ASR_PAYLOAD_PACKET_SIZE = 1450
 ASR_PAYLOAD_CHUNK_SIZE = 0x20000
 ASR_CHECKSUM_CHUNK_SIZE = ASR_PAYLOAD_CHUNK_SIZE
+ASR_CONNECT_ATTEMPTS = 30
+ASR_CONNECT_RETRY_DELAY = 2.0
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +31,34 @@ class ASRClient:
 
     def __init__(self, udid: str) -> None:
         self._udid: str = udid
-        self.logger = logging.getLogger(f"{asyncio.current_task().get_name()}-{__name__}")
-        self.service: typing.Optional[ServiceConnection] = None
+        self.logger = logging.getLogger(f"{current_task_name()}-{__name__}")
+        self._service: typing.Optional[ServiceConnection] = None
         self.checksum_chunks: bool = False
 
+    @property
+    def service(self) -> ServiceConnection:
+        """The ASR service connection.
+
+        :raises NotConnectedError: if accessed before ``connect()`` has run.
+        """
+        if self._service is None:
+            raise NotConnectedError("ASRClient is not connected. Call connect() first.")
+        return self._service
+
     async def connect(self, port: int = DEFAULT_ASR_SYNC_PORT) -> None:
-        self.service = ServiceConnection.create_using_usbmux(self._udid, port, connection_type="USB")
-        await self.service.aio_start()
+        """Connect to ASR, retrying while restored brings its listener up.
+
+        :raises ConnectionFailedError: if the port is still closed after ``ASR_CONNECT_ATTEMPTS`` attempts.
+        """
+        for attempt in range(1, ASR_CONNECT_ATTEMPTS + 1):
+            try:
+                self._service = await ServiceConnection.create_using_usbmux(self._udid, port, connection_type="USB")
+                break
+            except ConnectionFailedError:
+                if attempt >= ASR_CONNECT_ATTEMPTS:
+                    raise
+                self.logger.debug(f"ASR connection failed, retrying ({attempt}/{ASR_CONNECT_ATTEMPTS})")
+                await asyncio.sleep(ASR_CONNECT_RETRY_DELAY)
 
         # receive Initiate command message
         data = await self.recv_plist()
@@ -43,25 +66,25 @@ class ASRClient:
 
         command = data.get("Command")
         if command != "Initiate":
-            raise PyMobileDevice3Exception(f"invalid command received: {command}")
+            raise ProtocolError(f"ASR did not start with the expected Initiate command: {command}")
 
         self.checksum_chunks = data.get("Checksum Chunks", False)
         self.logger.debug(f"Checksum Chunks: {self.checksum_chunks}")
 
-    async def recv_plist(self) -> dict:
+    async def recv_plist(self) -> dict[str, typing.Any]:
         buf = b""
         while not buf.endswith(b"</plist>\n"):
-            buf += await self.service.aio_recvall(1)
+            buf += await self.service.recvall(1)
         return plistlib.loads(buf)
 
-    async def send_plist(self, plist: dict) -> None:
+    async def send_plist(self, plist: dict[str, typing.Any]) -> None:
         self.logger.debug(plistlib.dumps(plist).decode())
         await self.send_buffer(plistlib.dumps(plist))
 
     async def send_buffer(self, buf: bytes) -> None:
-        await self.service.aio_sendall(buf)
+        await self.service.sendall(buf)
 
-    async def handle_oob_data_request(self, packet: dict, filesystem: typing.IO):
+    async def handle_oob_data_request(self, packet: dict[str, typing.Any], filesystem: typing.IO[bytes]):
         oob_length = packet["OOB Length"]
         oob_offset = packet["OOB Offset"]
         filesystem.seek(oob_offset, os.SEEK_SET)
@@ -71,17 +94,13 @@ class ASRClient:
 
         await self.send_buffer(oob_data)
 
-    async def perform_validation(self, filesystem: typing.IO) -> None:
-        filesystem.seek(0, os.SEEK_END)
-        length = filesystem.tell()
-        filesystem.seek(0, os.SEEK_SET)
-
+    async def send_validation_packet_info(self, length: int) -> None:
         payload_info = {
             "Port": 1,
             "Size": length,
         }
 
-        packet_info = {}
+        packet_info: dict[str, typing.Any] = {}
         if self.checksum_chunks:
             packet_info["Checksum Chunk Size"] = ASR_CHECKSUM_CHUNK_SIZE
 
@@ -94,6 +113,14 @@ class ASRClient:
 
         await self.send_plist(packet_info)
 
+    async def perform_validation(self, filesystem: typing.IO[bytes]) -> None:
+        filesystem.seek(0, os.SEEK_END)
+        length = filesystem.tell()
+        filesystem.seek(0, os.SEEK_SET)
+
+        # Expected by the device after every Initiate
+        await self.send_validation_packet_info(length)
+
         while True:
             packet = await self.recv_plist()
             self.logger.debug(f"perform_validation: {packet}")
@@ -102,24 +129,36 @@ class ASRClient:
             if command == "Payload":
                 break
 
+            elif command == "Initiate":
+                # First seen in iBridgeOS 9.0: a second Initiate may switch Checksum Chunks on
+                checksum_chunks = packet.get("Checksum Chunks")
+                if isinstance(checksum_chunks, bool):
+                    self.checksum_chunks = checksum_chunks
+                self.logger.debug(f"Checksum Chunks: {self.checksum_chunks}")
+                await self.send_validation_packet_info(length)
+
             elif command == "OOBData":
                 await self.handle_oob_data_request(packet, filesystem)
 
             else:
-                raise PyMobileDevice3Exception(f"unknown packet: {packet}")
+                raise ProtocolError(f"ASR sent an unexpected packet while validating the filesystem: {packet}")
 
-    async def send_payload(self, filesystem: typing.IO) -> None:
+    async def send_payload(self, filesystem: typing.IO[bytes]) -> None:
         filesystem.seek(0, os.SEEK_END)
         length = filesystem.tell()
         filesystem.seek(0, os.SEEK_SET)
 
-        for _ in trange(0, length, ASR_PAYLOAD_CHUNK_SIZE, dynamic_ncols=True):
-            chunk = filesystem.read(ASR_PAYLOAD_CHUNK_SIZE)
+        with ProgressBar(total=length, desc="filesystem", unit=BYTES_UNIT) as bar:
+            for _ in range(0, length, ASR_PAYLOAD_CHUNK_SIZE):
+                chunk = filesystem.read(ASR_PAYLOAD_CHUNK_SIZE)
+                bar.update(len(chunk))
 
-            if self.checksum_chunks:
-                chunk += hashlib.sha1(chunk).digest()
+                if self.checksum_chunks:
+                    chunk += hashlib.sha1(chunk).digest()
 
-            await self.send_buffer(chunk)
+                await self.send_buffer(chunk)
 
     async def close(self) -> None:
-        await self.service.aio_close()
+        # Tolerant of never-connected instances.
+        if self._service is not None:
+            await self._service.close()

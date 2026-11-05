@@ -1,7 +1,9 @@
 # extracted from ac2
 import logging
+import math
 import uuid
-from typing import Optional
+from collections.abc import Mapping
+from typing import Any, Optional, cast
 
 from ipsw_parser.build_identity import BuildIdentity
 
@@ -74,6 +76,12 @@ SUPPORTED_DATA_TYPES = {
     "MessageUseStreamedImageFile": True,
     "UpdateVolumeOverlayRootDataCount": True,
     "URLAsset": True,
+    # Added for macOS 27 / iOS 27. Values taken from Apple's own host
+    # (MobileDevice.framework `restored_get_supported_data_types`, macOS 27.0), which
+    # advertises the two new request types as supported; idevicerestore lists them as 0.
+    "BootabilityBundleV2": False,
+    "DeviceRestoreInfoPreflight": True,
+    "SourceBootObjectV5": True,
 }
 
 # extracted from ac2
@@ -82,7 +90,9 @@ SUPPORTED_MESSAGE_TYPES = {
     "CheckpointMsg": True,
     "CrashLog": True,
     "DataRequestMsg": False,
-    "FDRSubmit": True,
+    # Apple's host answers FDRSubmit only after uploading the data to Apple's FDR data store, which
+    # is not implemented here, so do not invite restored to send it (see Restore.handle_fdr_submit_msg).
+    "FDRSubmit": False,
     "MsgType": False,
     "PreviousRestoreLogMsg": False,
     "ProgressMsg": False,
@@ -96,20 +106,67 @@ SUPPORTED_MESSAGE_TYPES = {
     "AsyncDataRequestMsg": True,
     "AsyncWait": True,
     "RestoreAttestation": True,
+    # Added for macOS 27 / iOS 27 (MobileDevice.framework `restored_get_supported_message_types`)
+    "RestoreProtocol": True,
 }
+
+# MobileDevice.framework `restored_get_supported_protocols`: the transports the host can serve
+# data requests over. Only the usbmuxd socket is implemented here.
+SUPPORTED_HOST_PROTOCOLS = ["MuxSocket"]
+
+# components that are always counted into the RecoveryOS partition size, on top of everything
+# loaded by iBoot (idevicerestore `_restore_calculate_recovery_os_partition_size`)
+RECOVERY_OS_PARTITION_ASSETS = (
+    "OS",
+    "KernelCache",
+    "DeviceTree",
+    "iBEC",
+    "AppleLogo",
+    "StaticTrustCache",
+    "iBootData",
+    "Diags",
+    "Ap,SystemVolumeCanonicalMetadata",
+    "SystemVolume",
+    "BaseSystemVolume",
+    "Ap,BaseSystemTrustCache",
+    "AVISP1,RTKitOS",
+)
+
+
+def recovery_os_partition_size(recovery_variant: BuildIdentity, file_sizes: Mapping[str, int]) -> tuple[int, int]:
+    """
+    Calculate the (minimum, maximum) RecoveryOS partition size in MiB, the way idevicerestore does.
+
+    :param recovery_variant: the build identity of the recovery OS
+    :param file_sizes: IPSW member path -> size in bytes (components missing from it are not counted)
+    """
+    total = 0.0
+    for component, entry in recovery_variant["Manifest"].items():
+        if not isinstance(entry, dict):
+            continue
+        info = cast(dict[str, Any], entry).get("Info", {})
+        if component not in RECOVERY_OS_PARTITION_ASSETS and info.get("IsLoadedByiBoot") is not True:
+            continue
+        size = file_sizes.get(info.get("Path", ""))
+        if size is not None:
+            total += size / 0x100000
+    total = math.ceil(total)
+    return int(total * 1.05 + 25), int(total * 1.25 + 25)
 
 
 class RestoreOptions:
     def __init__(
         self,
-        firmware_preflight_info=None,
-        sep=None,
-        macos_variant=None,
-        build_identity: BuildIdentity = None,
-        restore_boot_args=None,
-        spp=None,
+        firmware_preflight_info: Optional[dict[str, Any]] = None,
+        sep: Optional[dict[str, Any]] = None,
+        macos_variant: Optional[BuildIdentity] = None,
+        build_identity: Optional[BuildIdentity] = None,
+        restore_boot_args: Optional[str] = None,
+        spp: Optional[dict[str, Any]] = None,
         restore_behavior: Optional[str] = None,
-        msp=None,
+        msp: Optional[int] = None,
+        recovery_variant: Optional[BuildIdentity] = None,
+        recovery_os_partition_sizes: Optional[tuple[int, int]] = None,
     ):
         self.AutoBootDelay = 0
 
@@ -128,16 +185,17 @@ class RestoreOptions:
 
         self.SupportedDataTypes = SUPPORTED_DATA_TYPES
         self.SupportedMessageTypes = SUPPORTED_MESSAGE_TYPES
+        self.SupportedHostProtocols = SUPPORTED_HOST_PROTOCOLS
 
         # FIXME: Should be adjusted for update behaviors
         if macos_variant:
+            if build_identity is None:
+                raise ValueError("build_identity is required when macos_variant is set")
             self.AddSystemPartitionPadding = True
             self.AllowUntetheredRestore = False
             self.AuthInstallEnableSso = False
 
-            macos_variant = build_identity.macos_variant
-            if macos_variant is not None:
-                self.AuthInstallRecoveryOSVariant = macos_variant
+            self.AuthInstallRecoveryOSVariant = build_identity.macos_variant
 
             self.AuthInstallRestoreBehavior = restore_behavior
             self.AutoBootDelay = 0
@@ -177,17 +235,21 @@ class RestoreOptions:
             self.SystemImageType = "User"
             self.UpdateBaseband = False
 
+            if recovery_variant is not None:
+                self.InstallRecoveryOS = True
+                self.RecoveryOSBundlePath = "/tmp/Per2.tmp"
+                self.AuthInstallRecoveryOSVariant = recovery_variant["Info"]["Variant"]
+                if recovery_os_partition_sizes is not None:
+                    min_size, max_size = recovery_os_partition_sizes
+                    logger.info(f"Calculated recoveryOSPartitionSize as {min_size} MB")
+                    logger.info(f"Calculated recoveryOSMaxPartitionSize as {max_size} MB")
+                    self.recoveryOSPartitionSize = min_size
+                    self.recoveryOSMaxPartitionSize = max_size
+
             # Added for iOS 18.0 beta1
             self.HostHasFixFor99053849 = True
             self.SystemImageFormat = "AEAWrappedDiskImage"
             self.WaitForDeviceConnectionToFinishStateMachine = False
-            self.SupportedAsyncDataTypes = {
-                "BasebandData": False,
-                "RecoveryOSASRImage": False,
-                "StreamedImageDecryptionKey": False,
-                "SystemImageData": False,
-                "URLAsset": True,
-            }
 
             if sep is not None:
                 required_capacity = sep.get("RequiredCapacity")
@@ -196,6 +258,15 @@ class RestoreOptions:
                     self.TZ0RequiredCapacity = required_capacity
 
             self.PersonalizedDuringPreflight = True
+
+        # Added for iOS 18.0 and macOS 15.0
+        self.SupportedAsyncDataTypes = {
+            "BasebandData": False,
+            "RecoveryOSASRImage": False,
+            "StreamedImageDecryptionKey": False,
+            "SystemImageData": False,
+            "URLAsset": True,
+        }
 
         self.RootToInstall = False
         self.UUID = str(uuid.uuid4()).upper()

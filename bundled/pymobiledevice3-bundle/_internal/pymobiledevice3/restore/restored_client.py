@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from pymobiledevice3 import usbmux
 from pymobiledevice3.exceptions import ConnectionFailedError, NoDeviceConnectedError
@@ -16,21 +16,24 @@ class RestoredClient:
     SERVICE_PORT = 62078
 
     @classmethod
-    async def create(cls, ecid: str) -> "RestoredClient":
-        for mux_device in select_devices_by_connection_type("USB"):
+    async def create(cls, ecid: int) -> "RestoredClient":
+        for mux_device in await select_devices_by_connection_type("USB"):
             logger.debug(f"Iterating: {mux_device}")
-            service = ServiceConnection.create_using_usbmux(
+            if mux_device.ecid is not None and mux_device.ecid != ecid:
+                # Another device, possibly mid-restore: don't open a connection to its restored.
+                logger.debug(f"Skipping: {mux_device.serial} as its UDID doesn't carry ECID {ecid:#x}")
+                continue
+            service = await ServiceConnection.create_using_usbmux(
                 mux_device.serial, cls.SERVICE_PORT, connection_type=mux_device.connection_type
             )
-            await service.aio_start()
 
-            query_type = await service.aio_send_recv_plist({"Request": "QueryType"})
-            version = query_type.get("RestoreProtocolVersion")
+            query_type = await service.send_recv_plist({"Request": "QueryType"})
+            version = cast(str, query_type.get("RestoreProtocolVersion"))
             logger.debug(f"RestoreProtocolVersion: {version}")
 
             if query_type.get("Type") != "com.apple.mobile.restored":
                 logger.debug(f"Skipping: {mux_device.serial} as its not a restored device")
-                await service.aio_close()
+                await service.close()
                 continue
 
             restored_client = cls(mux_device.serial, version, service)
@@ -41,7 +44,7 @@ class RestoredClient:
                     f"Skipping: {restored_client.ecid} as its not the right ECID ({restored_client.ecid} "
                     f"instead of {ecid})"
                 )
-                await service.aio_close()
+                await service.close()
                 continue
 
             return restored_client
@@ -55,12 +58,12 @@ class RestoredClient:
 
     async def _connect(self) -> None:
         self.hardware_info = (await self.query_value("HardwareInfo"))["HardwareInfo"]
-        self.ecid = self.hardware_info["UniqueChipID"]
+        self.ecid = self.hardware_info["UniqueChipID"] & 0xFFFFFFFFFFFFFFFF
         self.saved_debug_info = (await self.query_value("SavedDebugInfo"))["SavedDebugInfo"]
 
     @staticmethod
-    def _get_or_verify_udid(udid: Optional[str] = None) -> str:
-        device = usbmux.select_device(udid)
+    async def _get_or_verify_udid(udid: Optional[str] = None) -> str:
+        device = await usbmux.select_device(udid)
         if device is None:
             if udid:
                 raise ConnectionFailedError()
@@ -74,23 +77,23 @@ class RestoredClient:
         if key:
             req["QueryKey"] = key
 
-        return await self.service.aio_send_recv_plist(req)
+        return await self.service.send_recv_plist(req)
 
     async def start_restore(self, opts: Optional[RestoreOptions] = None) -> None:
-        req = {"Request": "StartRestore", "Label": self.label, "RestoreProtocolVersion": self.version}
+        req: dict[str, Any] = {"Request": "StartRestore", "Label": self.label, "RestoreProtocolVersion": self.version}
 
         if opts is not None:
             req["RestoreOptions"] = opts.to_dict()
 
         logger.debug(f"start_restore request: {req}")
 
-        return await self.service.aio_send_plist(req)
+        return await self.service.send_plist(req)
 
-    async def reboot(self) -> dict:
-        return await self.service.aio_send_recv_plist({"Request": "Reboot", "Label": self.label})
+    async def reboot(self) -> dict[str, Any]:
+        return await self.service.send_recv_plist({"Request": "Reboot", "Label": self.label})
 
-    async def send(self, message: dict) -> None:
-        await self.service.aio_send_plist(message)
+    async def send(self, message: dict[str, Any]) -> None:
+        await self.service.send_plist(message)
 
-    async def recv(self) -> dict:
-        return await self.service.aio_recv_plist()
+    async def recv(self) -> dict[str, Any]:
+        return await self.service.recv_plist()

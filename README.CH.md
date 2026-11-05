@@ -32,8 +32,15 @@
 ```bash
 git clone https://github.com/agocia/O.Paperclip.git
 cd O.Paperclip
+uv python install 3.13
+uv venv --managed-python --python 3.13 build/python-bundle
+uv pip sync --python build/python-bundle/bin/python --require-hashes scripts/requirements-bundled.txt
+zsh scripts/build-bundled-pymobiledevice3.sh
+bash scripts/build-dvt-stream.sh
 xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Release build
 ```
+
+CLI 與每裝置 worker 固定使用 `pymobiledevice3 11.49.2` 及同一份含 hashes 的依賴鎖。Python 僅重建工具時需要。使用支援 OpenSSL PSK 的 managed Python，重建後須核對所有內嵌 library 的最低系統不高於 macOS 14；不能直接封裝最低系統較新的 Homebrew Python。建置成功不代表真機、Intel 或 universal2 相容性已驗證。
 
 ---
 
@@ -65,7 +72,7 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 2. 開啟 O.Paperclip
 3. 在側邊欄的「連線模式」分段切換中確認「USB」已選取
 4. 點「開始連線」
-5. 若出現密碼提示，輸入 Mac 管理員密碼（建立 tunnel 需要）
+5. 準備開發者映像與定位服務時保持裝置解鎖；App 不要求 Mac 管理員授權。
 
 **Wi‑Fi 無線連線：**
 1. 確保 iPhone 與 Mac 在同一個 Wi‑Fi 網路
@@ -111,6 +118,8 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 
 > 也可在搜尋欄輸入地址或地名直接跳轉。
 
+地圖會在操作結束後保存相機中心、距離、朝向與俯角，重新啟動及啟動時還原視窗尺寸後仍保留原視角。
+
 ---
 
 ### 步驟四：停止模擬
@@ -134,11 +143,11 @@ xcodebuild -project O.Paperclip.xcodeproj -scheme O.Paperclip -configuration Rel
 **Q: 點「開始連線」後一直轉圈？**  
 A: 確認 iPhone 已解鎖、USB 已信任此 Mac。若使用 Wi‑Fi，確認同一網路。
 
-**Q: 出現「需要管理員密碼」提示？**  
-A: 正常現象。建立 tunnel 需要短暫的 root 權限，輸入 Mac 密碼即可。
+**Q: 連線需要管理員密碼或 Touch ID 嗎？**
+A: 不需要。每台裝置由一般使用者 worker 持有 userspace tunnel 與定位服務。只有明確缺少 CoreDeviceProxy 的 USB 裝置才改用系統原生通道，該路徑可能與 Xcode／remoted 競爭；不退回 sudo 或 root helper。iPhone 的信任、密碼、開發者模式及配對仍必要。真機 GPS 穩定性、Wi‑Fi 配對與 macOS 14 運作需另做實機驗收，不能由自動化 fixture 推定。
 
 **Q: Wi‑Fi 連線失敗，自動切換為 USB？**  
-A: App 會自動 fallback。若要強制 Wi‑Fi，確認裝置在同一網路且防火牆未封鎖。
+A: 僅 Wi‑Fi 不可用／不支援時，才可切換至同一 UDID 的 USB；配對、鎖定或協定錯誤不切換。缺少 RemotePairing／altIRK 資料時須先接上已信任的 USB；程式不自動刪除或強制更新舊配對記錄。
 
 **Q: 已經用 USB 連上了，能不能直接切換成 Wi‑Fi？**  
 A: 可以。直接在側邊欄把連線模式切到「Wi‑Fi」，App 會自動中斷目前 USB 連線並重新建立 Wi‑Fi tunnel。

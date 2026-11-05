@@ -9,7 +9,11 @@ from pymobiledevice3.lockdown_service_provider import LockdownServiceProvider
 
 class HeartbeatService:
     """
-    Use to keep an active connection with lockdownd
+    Keep an active connection alive with the device's heartbeat lockdown service.
+
+    The device periodically sends ``Marco`` messages over ``com.apple.mobile.heartbeat`` and expects a
+    ``Polo`` reply; exchanging them prevents the connection from being torn down. The RSD/tunnel variant
+    of the service is selected automatically when the provider is not a plain `LockdownClient`.
     """
 
     SERVICE_NAME = "com.apple.mobile.heartbeat"
@@ -24,15 +28,23 @@ class HeartbeatService:
         else:
             self.service_name = self.RSD_SERVICE_NAME
 
-    def start(self, interval: Optional[float] = None) -> None:
+    async def start(self, interval: Optional[float] = None) -> None:
+        """
+        Start the heartbeat exchange loop.
+
+        Opens the heartbeat service and, in a loop, receives each message from the device and replies
+        with ``Polo`` to keep the connection alive.
+
+        :param interval: when set, stop the loop once roughly this many seconds have elapsed since it
+            started; when None, the loop runs indefinitely.
+        """
         start = time.time()
-        service = self.lockdown.start_lockdown_service(self.service_name)
+        async with await self.lockdown.start_lockdown_service(self.service_name) as service:
+            while True:
+                response = await service.recv_plist()
+                self.logger.debug(response)
 
-        while True:
-            response = service.recv_plist()
-            self.logger.debug(response)
+                if interval is not None and time.time() >= start + interval:
+                    break
 
-            if interval is not None and time.time() >= start + interval:
-                break
-
-            service.send_plist({"Command": "Polo"})
+                await service.send_plist({"Command": "Polo"})

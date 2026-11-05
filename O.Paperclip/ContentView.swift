@@ -34,7 +34,7 @@ struct ContentView: View {
 
     init() {
         let region = PersistedMapRegionStore.load()
-        _cameraPosition = State(initialValue: .region(region))
+        _cameraPosition = State(initialValue: PersistedMapRegionStore.loadCamera().map { .camera($0) } ?? .region(region))
         _visibleMapRegion = State(initialValue: region)
         let initialOverlays = PurePointOverlayRepository.initialOverlays()
         _purePointOverlays = State(initialValue: initialOverlays)
@@ -177,6 +177,7 @@ struct ContentView: View {
                                             .fill(PurePointRenderEngine.safeMapColor(for: entry.category))
                                     .frame(width: 10, height: 10)
                                     .overlay(Circle().stroke(Color.white, lineWidth: 1.5))
+                                    .accessibilityIdentifier("pure-point-\(entry.point.name)")
                             }
                         }
 
@@ -260,11 +261,15 @@ struct ContentView: View {
                             }
                         }
                     }
+                    .id([geometry.size.width, geometry.size.height])
                     .mapStyle(.standard(elevation: .flat))
                     .environment(\.locale, Locale(identifier: "zh_TW"))
                     .onMapCameraChange(frequency: .onEnd) { context in
                         visibleMapRegion = vm.normalizeMapRegion(context.region)
                         vm.persistMapRegion(from: .region(visibleMapRegion))
+                        let camera = context.camera
+                        UserDefaults.standard.set([camera.centerCoordinate.latitude, camera.centerCoordinate.longitude,
+                                                   camera.distance, camera.heading, camera.pitch], forKey: "map.camera")
                     }
                     .simultaneousGesture(
                         SpatialTapGesture()
