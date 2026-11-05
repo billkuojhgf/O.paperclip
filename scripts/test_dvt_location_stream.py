@@ -302,6 +302,25 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         await worker.bootstrap_usb_pairing(runtime, resource())
         self.assertEqual(len(calls), 6)
 
+    async def test_valid_old_pairing_without_altirk_is_refreshed_for_wifi(self):
+        runtime, calls, resource = self.runtime(pair_record=False)
+        records = [("phone-A", None, {"private_key": b"existing"})]
+        runtime["iter_remote_pair_records_by_identifier"] = lambda: iter(records)
+        class Pairing:
+            @classmethod
+            async def create(cls, lockdown):
+                return cls()
+            async def connect(self, autopair):
+                calls.append("old-record-verified")
+            async def _pair(self):
+                records[0] = ("phone-A", None, {"peer_alt_irk": b"new-key"})
+            async def close(self):
+                calls.append("pair-close")
+        runtime["tunnel_service"].RemotePairingLockdownService = Pairing
+        await worker.bootstrap_usb_pairing(runtime, resource())
+        self.assertTrue(worker.has_wifi_pair_record(runtime, "phone-A"))
+        self.assertEqual(calls, ["old-record-verified", "pair-close"])
+
     async def test_stale_wifi_metadata_does_not_block_valid_usb(self):
         runtime, calls, resource = self.runtime(pair_record=False)
         class Pairing:
@@ -310,6 +329,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 return cls()
             async def connect(self, autopair):
                 calls.append("pair-verified")
+            async def _pair(self):
+                calls.append("pair-no-wifi-metadata")
             async def close(self):
                 calls.append("pair-close")
         runtime["tunnel_service"].RemotePairingLockdownService = Pairing

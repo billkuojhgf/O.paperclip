@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import signal
 import ssl
 import sys
@@ -20,7 +21,7 @@ MOUNT_TIMEOUT = 45
 VALIDATION_TIMEOUT = 25
 COMMAND_TIMEOUT = 15
 LOG = logging.getLogger(__name__)
-PAIRING_GUIDANCE = "Wi‑Fi 配對資料需要更新，請先以 USB 信任並配對此裝置；未刪除既有配對記錄。"
+PAIRING_GUIDANCE = "Wi‑Fi 遠端配對資料尚未就緒，請切換 USB 連線以建立本 App 的配對；既有信任與配對檔未刪除。"
 
 
 class WorkerError(Exception):
@@ -37,6 +38,11 @@ class WorkerError(Exception):
 
 def load_runtime():
     """Load the same modules used by the bundled worker without opening a device."""
+    os.umask(0o077)
+    from pymobiledevice3 import common
+    # Worker 私有程序統一使用 App 配對目錄，避免讀寫舊版 root-only 記錄。
+    common._HOMEFOLDER = Path.home() / "Library/Application Support/fregata.O-PaperclipPackaging/Pairing"
+    common._HOMEFOLDER.mkdir(parents=True, exist_ok=True, mode=0o700)
     from pymobiledevice3 import exceptions
     from pymobiledevice3.lockdown import create_using_usbmux
     from pymobiledevice3.pair_records import iter_remote_pair_records_by_identifier
@@ -102,6 +108,8 @@ async def bootstrap_usb_pairing(runtime, lockdown):
             stack.push_async_callback(service.close)
             try:
                 await service.connect(autopair=True)
+                if not has_wifi_pair_record(runtime, lockdown.udid):
+                    await service._pair()
             except runtime["exceptions"].RemotePairingCompletedError:
                 if attempt == 0:
                     continue

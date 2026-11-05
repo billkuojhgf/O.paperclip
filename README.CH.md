@@ -74,6 +74,8 @@ CLI 與每裝置 worker 固定使用 `pymobiledevice3 11.49.2` 及同一份含 h
 4. 點「開始連線」
 5. 準備開發者映像與定位服務時保持裝置解鎖；App 不要求 Mac 管理員授權。
 
+遠端配對另存於 `~/Library/Application Support/fregata.O-PaperclipPackaging/Pairing`，不刪除或修改舊版 `~/.pymobiledevice3` 配對檔。每台裝置首次需以 USB 建立本 App 的遠端配對；這可能更新裝置端同一台 Mac 的金鑰，舊版遠端連線不保證繼續有效。Wi‑Fi 探索另需允許執行 App 的「本機網路」權限。
+
 **Wi‑Fi 無線連線：**
 1. 確保 iPhone 與 Mac 在同一個 Wi‑Fi 網路
 2. 開啟 O.Paperclip

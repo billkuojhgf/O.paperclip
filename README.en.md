@@ -75,6 +75,8 @@ Run full automated acceptance with `python3 O.PaperclipTests/SimulatorEvidence/p
 4. Click `Start Connection`
 5. Keep the device unlocked while developer services are prepared. No Mac administrator authorization is requested.
 
+Remote pairing uses `~/Library/Application Support/fregata.O-PaperclipPackaging/Pairing`, leaving legacy `~/.pymobiledevice3` records untouched. Connect each device over USB once to create the app's pairing. This may replace the device-side key for this Mac; legacy remote connections are not guaranteed to remain valid. Wi-Fi discovery also requires Local Network permission for the running app.
+
 **Wi-Fi connection:**
 1. Make sure your iPhone and Mac are on the same Wi-Fi network
 2. Open O.Paperclip

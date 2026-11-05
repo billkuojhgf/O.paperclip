@@ -12,6 +12,13 @@
 
 ## 執行證據（持續更新，非結案）
 
+### 非 root 遠端配對權限修復（2026-11-05）
+
+- 使用者已信任且 USB 仍失敗；真機 worker traceback 定位為讀取 `~/.pymobiledevice3/remote_<UDID>.plist` 的 `PermissionError`，三台舊檔均為 root 擁有、權限 600。不是尚未信任。
+- worker 改用 App 專用使用者配對目錄與限制性 umask，不移動／刪除／覆寫舊檔；有效但缺 altIRK 的遠端配對需重新 pair，不能只依賴 upstream connect 的驗證成功返回。
+- 真機 Yun USB 已回報 ready：`userspace-usb`、`dvt`、`euid=501`；新配對由 UID501 擁有且含 altIRK，舊 root 檔仍存在且權限不變。31 項 worker 測試通過。
+- Wi‑Fi 已越過缺配對檢查，但 mDNS 回報 `No route to host`／本機網路權限受阻，尚未驗證 Wi‑Fi tunnel 成功；未更改系統權限，未宣稱全套真機 GPS 驗收通過。
+
 ### main 整合測試版（2026-11-05）
 
 - 合入右欄版本 `4c94110` 後，補齊收藏測試的新版 worker process fixture，保留收藏操作不得中斷三裝置連線的斷言。
