@@ -242,7 +242,9 @@ final class LiveMapQAUITests: XCTestCase {
 
     private func reveal(_ element: XCUIElement) {
         XCTAssertTrue(element.waitForExistence(timeout: 5))
-        let scroll = app.scrollViews.firstMatch
+        let rightPanel = app.scrollViews["rightPanelScrollView"]
+        let scroll = rightPanel.exists && element.frame.midX >= rightPanel.frame.minX
+            ? rightPanel : app.scrollViews.firstMatch
         func visible() -> Bool { element.isHittable && (app.sheets.firstMatch.exists || scroll.frame.contains(element.frame)) }
         if visible() { return }
         for delta in [450.0, -450.0] {

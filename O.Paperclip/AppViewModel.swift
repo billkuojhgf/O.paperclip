@@ -33,6 +33,11 @@ struct MKDirectionsRouteCalculator: RouteCalculating {
     }
 }
 
+private struct SavableItemCandidate {
+    let draft: SavedLocationDraft
+    let sourceLabel: String
+}
+
 @MainActor
 @Observable
 final class AppViewModel {
@@ -93,11 +98,36 @@ final class AppViewModel {
             if isClosedLoop { isEndlessLoop = false }
             if operationMode == .multiPoint {
                 routeGeneration += 1
-                clearDraftGeometry()
-                appState = .selectingA
+                if isExactRouteDraft, hasReadyDraft {
+                    draftRoutePoints = waypoints
+                    if isClosedLoop, let first = waypoints.first, !coordinatesFormLoop(waypoints) {
+                        draftRoutePoints.append(first)
+                    }
+                    draftCumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: draftRoutePoints)
+                    draftTotalRouteDistance = draftCumulativeRouteDistances.last ?? 0
+                    var coordinates = draftRoutePoints
+                    customRoutePolyline = MKPolyline(coordinates: &coordinates, count: coordinates.count)
+                } else {
+                    clearDraftGeometry()
+                    appState = .selectingA
+                }
             }
         }
     }
+
+    // MARK: - Imported routes and saved locations
+    var importedGPXRoutes: [ImportedGPXRoute]
+    var selectedImportedGPXRouteID: String?
+    var pendingImportedGPXRoutes: [ImportedGPXRoute] = []
+    var pendingImportedGPXRouteTitles: [String: String] = [:]
+    var isShowingImportedGPXRouteNamingSheet = false
+    var gpxImportError: String?
+    var savedLocations: [SavedLocationItem]
+    var isShowingSaveLocationSheet = false
+    var pendingSavedLocationTitle = ""
+    var savedLocationError: String?
+    var savedLocationRenamingTarget: SavedLocationItem?
+    var pendingSavedLocationPreview: CurrentSavableItemPreview?
 
     // MARK: - Location input
     var placeKeyword: String = "" {
@@ -120,6 +150,11 @@ final class AppViewModel {
     @ObservationIgnored private var moveTimer: Timer?
     @ObservationIgnored private var pinnedKeepAliveTimer: Timer?
     @ObservationIgnored private var cancellables: Set<AnyCancellable> = []
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private let savedItemsDirectory: URL?
+    @ObservationIgnored private var pendingSavedLocationDraft: SavedLocationDraft?
+    @ObservationIgnored private var suppressNextOperationModeReset = false
+    @ObservationIgnored private var isExactRouteDraft = false
     private(set) var lastSentPosition: CLLocationCoordinate2D?
     private(set) var lastSentAt: Date?
     var dependencyVersion: Int = 0
@@ -133,6 +168,19 @@ final class AppViewModel {
         routes.indices.contains(selectedRouteIndex) ? routes[selectedRouteIndex] : routes.first
     }
 
+
+    var selectedImportedGPXRoute: ImportedGPXRoute? {
+        importedGPXRoutes.first { $0.id == selectedImportedGPXRouteID }
+    }
+
+    var canSaveCurrentSelection: Bool {
+        currentSaveCandidate() != nil
+    }
+
+    var currentSavableItemPreview: CurrentSavableItemPreview {
+        guard let candidate = currentSaveCandidate() else { return .unavailable }
+        return preview(for: candidate)
+    }
     var pinnedCoordinate: CLLocationCoordinate2D? {
         currentPosition ?? lastSentPosition
     }
@@ -289,11 +337,17 @@ final class AppViewModel {
     init(
         deviceManager: any DeviceControlling,
         locationSearchService: any LocationSearching,
-        routeCalculator: any RouteCalculating = MKDirectionsRouteCalculator()
+        routeCalculator: any RouteCalculating = MKDirectionsRouteCalculator(),
+        defaults: UserDefaults = .standard,
+        savedItemsDirectory: URL? = nil
     ) {
         self.deviceManager = deviceManager
         self.locationSearchService = locationSearchService
         self.routeCalculator = routeCalculator
+        self.defaults = defaults
+        self.savedItemsDirectory = savedItemsDirectory
+        importedGPXRoutes = ImportedGPXRouteStore.loadRoutes(defaults: defaults)
+        savedLocations = SavedLocationStore.loadItems(defaults: defaults)
 
         deviceManager.objectWillChange
             .receive(on: RunLoop.main)
@@ -433,6 +487,448 @@ final class AppViewModel {
                 locationInputError = "搜尋失敗，請重試"
             }
         }
+    }
+
+    // MARK: - GPX routes
+
+    func prepareImportedGPXRoutes(from urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        resetImportedGPXRouteSession()
+
+        do {
+            var seen: Set<String> = []
+            pendingImportedGPXRoutes = try ImportedGPXRouteStore.previewRoutes(from: urls)
+                .filter { seen.insert($0.id).inserted }
+            pendingImportedGPXRouteTitles = [String: String](
+                uniqueKeysWithValues: pendingImportedGPXRoutes.map { ($0.id, $0.title) }
+            )
+            isShowingImportedGPXRouteNamingSheet = true
+            gpxImportError = nil
+        } catch let error as GPXImportError {
+            gpxImportError = error.localizedDescription
+        } catch {
+            gpxImportError = error.localizedDescription
+        }
+    }
+
+    func finalizeImportedGPXRoutes() {
+        do {
+            let renamedRoutes = pendingImportedGPXRoutes.map { route in
+                route.renamed(to: pendingImportedGPXRouteTitles[route.id] ?? route.title)
+            }
+            let persistedRoutes = try ImportedGPXRouteStore.persistImportedRoutes(renamedRoutes, directory: savedItemsDirectory)
+            commitImportedGPXRoutes(persistedRoutes)
+            gpxImportError = nil
+            resetImportedGPXRouteSession()
+        } catch let error as GPXImportError {
+            gpxImportError = error.localizedDescription
+        } catch {
+            gpxImportError = error.localizedDescription
+        }
+    }
+
+    func cancelImportedGPXRoutes() {
+        resetImportedGPXRouteSession()
+    }
+
+    func useImportedGPXRoute(_ route: ImportedGPXRoute) {
+        let normalized = normalizeRoutePoints(route.points)
+        guard normalized.count > 1 else {
+            locationInputError = "固定路線資料異常，請重新匯入。"
+            return
+        }
+
+        setOperationModeProgrammatically(.multiPoint)
+        resetDraftStateForSavedLocation()
+        isClosedLoop = coordinatesFormLoop(normalized)
+        isEndlessLoop = false
+        selectedImportedGPXRouteID = route.id
+        waypoints = normalized
+        draftRoutePoints = normalized
+        draftCumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: normalized)
+        draftTotalRouteDistance = route.totalDistance.isFinite && route.totalDistance > 0
+            ? route.totalDistance
+            : (draftCumulativeRouteDistances.last ?? 0)
+        var coords = normalized
+        customRoutePolyline = MKPolyline(coordinates: &coords, count: coords.count)
+        isExactRouteDraft = true
+        locationInputError = nil
+        appState = .readyToMove
+    }
+
+    func removeImportedGPXRoute(_ route: ImportedGPXRoute) {
+        ImportedGPXRouteStore.deleteStoredRoute(route)
+        importedGPXRoutes.removeAll { $0.id == route.id }
+
+        if selectedImportedGPXRouteID == route.id {
+            clearDraftWorkflow()
+        }
+
+        persistImportedGPXRouteSettings()
+    }
+
+    func persistImportedGPXRouteSettings() {
+        let paths = importedGPXRoutes.compactMap(\.sourceFilePath)
+        let titles = importedGPXRoutes.reduce(into: [String: String]()) { partialResult, route in
+            guard let path = route.sourceFilePath else { return }
+            partialResult[path] = route.title
+        }
+        ImportedGPXRouteStore.savePaths(paths, defaults: defaults)
+        ImportedGPXRouteStore.saveTitleOverrides(titles, defaults: defaults)
+    }
+
+    func resetImportedGPXRouteSession() {
+        pendingImportedGPXRoutes = []
+        pendingImportedGPXRouteTitles = [:]
+        isShowingImportedGPXRouteNamingSheet = false
+    }
+
+    private func commitImportedGPXRoutes(_ routes: [ImportedGPXRoute]) {
+        var routesByPath: [String: ImportedGPXRoute] = Dictionary(
+            uniqueKeysWithValues: importedGPXRoutes.compactMap { route in
+                guard let path = route.sourceFilePath else { return nil }
+                return (path, route)
+            }
+        )
+
+        for route in routes {
+            if let path = route.sourceFilePath {
+                routesByPath[path] = route
+            }
+        }
+
+        importedGPXRoutes = routesByPath.values.sorted {
+            $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+        persistImportedGPXRouteSettings()
+    }
+
+    // MARK: - Saved locations
+
+    func prepareSaveCurrentSelection() {
+        guard let candidate = currentSaveCandidate() else {
+            savedLocationError = "目前沒有可儲存的位置或路線。"
+            return
+        }
+        pendingSavedLocationDraft = candidate.draft
+        pendingSavedLocationPreview = preview(for: candidate)
+        pendingSavedLocationTitle = candidate.draft.title
+        savedLocationError = nil
+        isShowingSaveLocationSheet = true
+    }
+
+    func confirmSaveCurrentSelection() {
+        guard let draft = pendingSavedLocationDraft else {
+            savedLocationError = "目前沒有可儲存的位置或路線。"
+            return
+        }
+
+        let title = pendingSavedLocationTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            savedLocationError = "請先輸入名稱。"
+            return
+        }
+
+        do {
+            let saved = try SavedLocationStore.persist(
+                SavedLocationDraft(
+                    title: title,
+                    kind: draft.kind,
+                    coordinates: draft.coordinates,
+                    totalDistance: draft.totalDistance,
+                    createdAt: draft.createdAt,
+                    sourceMode: draft.sourceMode
+                ),
+                defaults: defaults,
+                directory: savedItemsDirectory
+            )
+            savedLocations.removeAll { $0.id == saved.id }
+            savedLocations.insert(saved, at: 0)
+            pendingSavedLocationDraft = nil
+            pendingSavedLocationPreview = nil
+            pendingSavedLocationTitle = ""
+            savedLocationError = nil
+            isShowingSaveLocationSheet = false
+        } catch {
+            savedLocationError = error.localizedDescription
+        }
+    }
+
+    func cancelSaveCurrentSelection() {
+        pendingSavedLocationDraft = nil
+        pendingSavedLocationPreview = nil
+        pendingSavedLocationTitle = ""
+        savedLocationError = nil
+        isShowingSaveLocationSheet = false
+    }
+
+    func beginRenamingSavedLocation(_ item: SavedLocationItem) {
+        savedLocationRenamingTarget = item
+        pendingSavedLocationTitle = item.title
+        savedLocationError = nil
+    }
+
+    func confirmRenameSavedLocation() {
+        guard let item = savedLocationRenamingTarget else { return }
+        let title = pendingSavedLocationTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            savedLocationError = "請先輸入名稱。"
+            return
+        }
+
+        do {
+            let renamed = try SavedLocationStore.rename(item, to: title)
+            if let index = savedLocations.firstIndex(where: { $0.id == renamed.id }) {
+                savedLocations[index] = renamed
+            }
+            savedLocationRenamingTarget = nil
+            pendingSavedLocationTitle = ""
+            savedLocationError = nil
+        } catch {
+            savedLocationError = error.localizedDescription
+        }
+    }
+
+    func cancelRenameSavedLocation() {
+        savedLocationRenamingTarget = nil
+        pendingSavedLocationTitle = ""
+        savedLocationError = nil
+    }
+
+    func removeSavedLocation(_ item: SavedLocationItem) {
+        SavedLocationStore.deleteStoredItem(item, defaults: defaults)
+        savedLocations.removeAll { $0.id == item.id }
+        if savedLocationRenamingTarget?.id == item.id {
+            savedLocationRenamingTarget = nil
+            pendingSavedLocationTitle = ""
+        }
+    }
+
+    func applySavedLocation(_ item: SavedLocationItem) {
+        savedLocationError = nil
+
+        switch item.kind {
+        case .point:
+            applySavedPoint(item)
+        case .route:
+            applySavedRoute(item, mode: targetOperationMode(for: item))
+        case .loop:
+            applySavedRoute(item, mode: .multiPoint)
+        }
+    }
+
+    private func applySavedPoint(_ item: SavedLocationItem) {
+        guard let coordinate = item.coordinates.first,
+              coordinate.latitude.isFinite, coordinate.longitude.isFinite,
+              CLLocationCoordinate2DIsValid(coordinate) else {
+            savedLocationError = "這筆收藏的點位資料異常。"
+            return
+        }
+
+        setOperationModeProgrammatically(.fixedPoint)
+        resetDraftStateForSavedLocation()
+        pointA = coordinate
+        isClosedLoop = false
+        isEndlessLoop = false
+        appState = .readyToMove
+    }
+
+    private func applySavedRoute(_ item: SavedLocationItem, mode: OperationMode) {
+        let normalized = normalizeRoutePoints(item.coordinates)
+        guard normalized.count > 1 else {
+            savedLocationError = "這筆收藏的路線資料異常。"
+            return
+        }
+
+        setOperationModeProgrammatically(mode)
+        resetDraftStateForSavedLocation()
+
+        switch mode {
+        case .routeAB:
+            pointA = normalized.first
+            pointB = normalized.last
+            isClosedLoop = false
+        case .multiPoint:
+            pointA = nil
+            pointB = nil
+            waypoints = normalized
+            isClosedLoop = item.kind == .loop
+        case .fixedPoint:
+            pointA = nil
+            pointB = nil
+            isClosedLoop = false
+        }
+
+        isEndlessLoop = false
+        draftRoutePoints = normalized
+        draftCumulativeRouteDistances = RouteMotionEngine.cumulativeDistances(for: normalized)
+        draftTotalRouteDistance = item.totalDistance.isFinite && item.totalDistance > 0
+            ? item.totalDistance : (draftCumulativeRouteDistances.last ?? 0)
+        var coords = normalized
+        customRoutePolyline = MKPolyline(coordinates: &coords, count: coords.count)
+        isExactRouteDraft = true
+        appState = .readyToMove
+    }
+
+    private func targetOperationMode(for item: SavedLocationItem) -> OperationMode {
+        switch item.kind {
+        case .point:
+            return .fixedPoint
+        case .route:
+            if item.sourceMode == OperationMode.routeAB.rawValue {
+                return .routeAB
+            }
+            return .multiPoint
+        case .loop:
+            return .multiPoint
+        }
+    }
+
+    private func resetDraftStateForSavedLocation() {
+        clearDraftWorkflow()
+        searchGeneration += 1
+        placeResults = []
+        locationSearchService.clearSuggestions()
+    }
+
+    private func currentSaveCandidate() -> SavableItemCandidate? {
+        if hasActiveRouteSnapshot {
+            guard let draft = makeSavedLocationDraft(
+                modeLabel: activeOperationMode.rawValue,
+                coordinateSource: activeCoordinatesForSaving(),
+                totalDistance: totalRouteDistance,
+                isClosedLoop: activeIsClosedLoop
+            ) else {
+                return nil
+            }
+            return SavableItemCandidate(
+                draft: draft,
+                sourceLabel: "活動中的內容"
+            )
+        }
+        if hasReadyDraft {
+            guard let draft = makeSavedLocationDraft(
+                modeLabel: operationMode.rawValue,
+                coordinateSource: draftCoordinatesForSaving(),
+                totalDistance: draftTotalRouteDistance,
+                isClosedLoop: isClosedLoop
+            ) else {
+                return nil
+            }
+            return SavableItemCandidate(
+                draft: draft,
+                sourceLabel: "已完成草稿"
+            )
+        }
+        return nil
+    }
+
+    private func preview(for candidate: SavableItemCandidate) -> CurrentSavableItemPreview {
+        CurrentSavableItemPreview(
+            kind: candidate.draft.kind,
+            sourceLabel: candidate.sourceLabel,
+            suggestedTitle: candidate.draft.title,
+            summaryText: saveSummaryText(
+                kind: candidate.draft.kind,
+                coordinates: candidate.draft.coordinates,
+                totalDistance: candidate.draft.totalDistance
+            ),
+            coordinates: candidate.draft.coordinates,
+            isAvailable: true
+        )
+    }
+
+    private func makeSavedLocationDraft(
+        modeLabel: String,
+        coordinateSource: [CLLocationCoordinate2D],
+        totalDistance: Double,
+        isClosedLoop: Bool
+    ) -> SavedLocationDraft? {
+        let createdAt = Date()
+        let coordinates = normalizeRoutePoints(coordinateSource)
+        guard let first = coordinates.first else { return nil }
+        let formsLoop = coordinatesFormLoop(coordinates)
+
+        let kind: SavedLocationKind
+        if coordinates.count == 1 {
+            kind = .point
+        } else if isClosedLoop || formsLoop {
+            kind = .loop
+        } else {
+            kind = .route
+        }
+
+        let title = suggestedSavedLocationTitle(
+            kind: kind,
+            coordinate: first,
+            createdAt: createdAt
+        )
+        return SavedLocationDraft(
+            title: title,
+            kind: kind,
+            coordinates: coordinates,
+            totalDistance: totalDistance,
+            createdAt: createdAt,
+            sourceMode: modeLabel
+        )
+    }
+
+    private func activeCoordinatesForSaving() -> [CLLocationCoordinate2D] {
+        if activeOperationMode == .fixedPoint {
+            return currentPosition.map { [$0] } ?? []
+        }
+        return currentRoutePoints
+    }
+
+    private func draftCoordinatesForSaving() -> [CLLocationCoordinate2D] {
+        if operationMode == .fixedPoint {
+            return pointA.map { [$0] } ?? []
+        }
+        return draftRoutePoints
+    }
+
+    private func suggestedSavedLocationTitle(
+        kind: SavedLocationKind,
+        coordinate: CLLocationCoordinate2D,
+        createdAt: Date
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_TW")
+        formatter.dateFormat = "MM/dd HH:mm"
+        let prefix: String
+        switch kind {
+        case .point:
+            prefix = "定點"
+        case .route:
+            prefix = "線路"
+        case .loop:
+            prefix = "迴路"
+        }
+        return "\(prefix) \(formatter.string(from: createdAt)) (\(String(format: "%.3f", coordinate.latitude)), \(String(format: "%.3f", coordinate.longitude)))"
+    }
+
+    private func saveSummaryText(
+        kind: SavedLocationKind,
+        coordinates: [CLLocationCoordinate2D],
+        totalDistance: CLLocationDistance
+    ) -> String {
+        switch kind {
+        case .point:
+            guard let coordinate = coordinates.first else { return "1 個點位" }
+            return String(
+                format: "座標 %.5f, %.5f",
+                coordinate.latitude,
+                coordinate.longitude
+            )
+        case .route, .loop:
+            return "\(coordinates.count) 點，\(String(format: "%.2f", totalDistance / 1000)) km"
+        }
+    }
+
+    private func coordinatesFormLoop(_ coordinates: [CLLocationCoordinate2D]) -> Bool {
+        guard coordinates.count > 2, let first = coordinates.first, let last = coordinates.last else { return false }
+        return abs(first.latitude - last.latitude) < 0.0000001
+            && abs(first.longitude - last.longitude) < 0.0000001
     }
 
     // MARK: - Main action
@@ -890,6 +1386,18 @@ final class AppViewModel {
 
     // MARK: - Draft / active state
 
+
+    func consumeProgrammaticModeResetSuppression() -> Bool {
+        let shouldSuppress = suppressNextOperationModeReset
+        suppressNextOperationModeReset = false
+        return shouldSuppress
+    }
+
+    func setOperationModeProgrammatically(_ mode: OperationMode) {
+        guard operationMode != mode else { return }
+        suppressNextOperationModeReset = true
+        operationMode = mode
+    }
     func switchModePreservingPinnedLocation() {
         clearDraftWorkflow()
     }
@@ -933,6 +1441,7 @@ final class AppViewModel {
 
     private func clearDraftWorkflow() {
         routeGeneration += 1
+        selectedImportedGPXRouteID = nil
         isShowingRouteReplacementConfirmation = false
         appState = .selectingA
         pointA = nil
@@ -944,6 +1453,7 @@ final class AppViewModel {
     }
 
     private func clearDraftGeometry() {
+        isExactRouteDraft = false
         routes = []
         selectedRouteIndex = 0
         customRoutePolyline = nil

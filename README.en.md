@@ -133,9 +133,19 @@ Click `Stop` or `Clear Route` to stop GPS spoofing and return the device to its 
 
 You can import KML geographic data and display custom markers on the map:
 
-1. Click `Import KML` in the sidebar
+1. Click `Import KML` in the right-hand `匯入與收藏` panel
 2. Select a `.kml` file
 3. The overlay will appear on the map, and you can filter markers by category
+
+### Imports and saved locations
+
+The right-hand panel remains separate from the three-device controls. Collapse it with the header button; reopen it from the map's right edge. Visibility and sort order persist across launches.
+
+Import or drop a `.gpx`, name it, then choose `使用` to load its exact track as a ready multi-point draft without directions recalculation. Save a completed point/route locally; apply, focus, rename, delete, or sort it from the same panel. Existing upstream v1.2.1 GPX and favorite snapshots remain compatible. Applying a draft does not disconnect devices.
+
+For a ready imported track, enabling `閉圈` adds a straight closing segment from the last point to the first and recomputes geometry and cumulative distance. Disabling it restores the original track; neither action requests road directions.
+
+This restores the [upstream v1.2.1 panel](https://github.com/agocia/O.Paperclip/tree/dc10107c3b474d90c19b6a1c48e0d2c2f3e84a45) omitted when multi-device support was integrated on the v1.04 baseline. Regression coverage: `ImportedAndSavedLocationTests.swift` and the right-panel scenarios in `O_PaperclipUITests.swift`.
 
 ---
 

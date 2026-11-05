@@ -13,6 +13,11 @@ struct ContentView: View {
     @State var cameraPosition: MapCameraPosition
     @State var purePointOverlays: [PurePointOverlay]
     @State var purePointOverlayStates: [String: PurePointOverlayUIState]
+    @AppStorage("sidebar.right.visible") var isRightSidebarVisible = true
+    @AppStorage("saved-location.sort-mode") var savedLocationSortMode: SavedLocationSortMode = .createdAt
+    @State var isImportingGPXRoute = false
+    @State var purePointDropError: String?
+    @State var gpxDropError: String?
     @State var isImportingPurePointKML: Bool = false
     @State var purePointImportError: String?
     @State var pendingImportedOverlays: [PurePointOverlay] = []
@@ -112,6 +117,12 @@ struct ContentView: View {
         ) { result in
             handlePurePointImport(result)
         }
+        .fileImporter(
+            isPresented: $isImportingGPXRoute,
+            allowedContentTypes: [.gpx],
+            allowsMultipleSelection: true,
+            onCompletion: handleGPXRouteImport
+        )
         .sheet(isPresented: $isShowingImportedOverlayNamingSheet) {
             importedOverlayNamingSheet
         }
@@ -120,6 +131,24 @@ struct ContentView: View {
         }
         .sheet(isPresented: routeReplacementSheetBinding) {
             routeReplacementSheet
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.isShowingImportedGPXRouteNamingSheet },
+            set: { vm.isShowingImportedGPXRouteNamingSheet = $0 }
+        )) {
+            importedGPXRouteNamingSheet
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.isShowingSaveLocationSheet },
+            set: { if !$0 { vm.cancelSaveCurrentSelection() } }
+        )) {
+            saveCurrentLocationSheet
+        }
+        .sheet(item: Binding(
+            get: { vm.savedLocationRenamingTarget },
+            set: { if $0 == nil { vm.cancelRenameSavedLocation() } }
+        )) { item in
+            renameSavedLocationSheet(item)
         }
         .onDisappear {
             resetPurePointImportSession()
@@ -158,10 +187,30 @@ struct ContentView: View {
 
     private var splitViewContent: some View {
         HStack(spacing: 0) {
-                    sidebarPane(isCompactSidebar: true)
+            sidebarPane(isCompactSidebar: true)
                 .frame(width: 320)
             Divider()
-            detailPane
+            ZStack(alignment: .trailing) {
+                detailPane
+                if !isRightSidebarVisible {
+                    Button(action: { isRightSidebarVisible = true }) {
+                        Image(systemName: "sidebar.right")
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 14)
+                            .background(ModernTheme.panelRaised)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("顯示右側欄")
+                    .padding(.trailing, 12)
+                }
+            }
+            .frame(minWidth: 280)
+            if isRightSidebarVisible {
+                Divider()
+                rightSidebarPane
+                    .frame(width: 360)
+            }
         }
     }
 

@@ -20,6 +20,23 @@
 - pinned Python runtime 的 worker 測試 30 項通過；Release build、deep/strict codesign 驗證與 bundled worker byte comparison exit 0。既有 AppViewModel Sendable warning 仍存在。
 - 完整 `prepare.py` 驗收依 GUI 排他協調中止，不能作為全套通過證據；新 Release GUI smoke 與真機 GPS 驗收仍未完成。已讓出 GUI 給 `fix-right-panel`；本分支未合併、未安裝至 `/Applications`。
 
+### 右側欄回歸修復（2026-11-02）
+
+- 安裝 gate（2026-11-05）：fork 版號 `1.1.1 (123)`。模型／流程 27 項於 `/tmp/paperclip-v1.1.1-install-gate.xcresult` 全通過；該輪 UI 同 bundle ID 與 admin 工作樹並行，整體 29 通過／1 失敗。協調 GUI 排他後，原生面板 helper 採直接 `open-panel` 快捷鍵、ASCII 鍵盤與貼上值回讀，撤掉未驗證的 suggestion 點擊／DownArrow；保留系統逐次授權，未修改持久安全政策。三項 UI 最終全通過／0 失敗／0 跳過，`/tmp/paperclip-v1.1.1-authorized-ui.xcresult`，exit 0。這是相關 30 項分批通過，不是完整套件或真機 GPS 驗收。安裝前原版已備份至 `~/Library/Application Support/O.Paperclip Backups/O.Paperclip-1.2.1-122-before-right-panel.zip`，壓縮完整性驗證通過。
+
+- 閉圈補充修正：`isClosedLoop` 原本使就緒 GPX 草稿失效並走道路重算。精確匯入／收藏草稿現在直接補上末點→起點直線、重算 polyline／累積距離／總距離；關閉還原原軌跡，已閉合軌跡不重複補點。一般道路草稿沿用原本計算流程。
+- 新增 `WorkflowQATests.importedGPXLoopIncludesReturnSegmentWhenActivated`：開放 GPX→閉圈→關閉→重新閉圈→啟動，檢查回程位置、跨圈連續性與零道路請求。修正前 suite-level 實跑失敗 `/tmp/paperclip-gpx-loop-red-workflow.xcresult`；修正後相關 20 項全通過／0 跳過 `/tmp/paperclip-gpx-loop-green.xcresult`。
+- 真實 GPX UI 現在另外切換閉圈開／關並確認維持準備就緒及收藏類型更新，再完成原匯入儲存重啟套用流程；1 項通過、exit 0，`/tmp/paperclip-gpx-loop-ui.xcresult`。Release 已重建。單一 Swift Testing 方法選擇器曾產生 0 tests，已改 suite-level 執行，未當作成功證據。
+- 歷史釐清：原作者 4/11 還原 `main` 早於 4/12 `develop` v1.2 新增右欄，沒有作者刻意停用右欄的證據。上游 issue #3 與 v1.1 release 明確回退的是 v1.06 連線 helper 架構，而非右欄；本 fork 未同步後續 `develop` 功能。
+
+- 已下載並開啟 fork 最新 release v1.1.0（build 2），SHA-256 與 release metadata 一致；實際確認只有左欄與地圖。原安裝版 1.2.1（build 122）有右欄；原上游 `agocia/O.Paperclip` 的 `dc10107` 可恢復對應來源。多裝置分支以還原過的 v1.04 基底合併，未帶入 v1.2.1 右欄／GPX／收藏，並非視窗寬度隱藏。
+- 修正保留 `DeviceGroup`、既有三種操作模式及流程保護；恢復右欄、KML／GPX、收藏與原 v1.2.1 快照格式。GPX 原始幾何直接載入多點就緒草稿，不重新規劃道路。
+- 修正前 UI 回歸確實失敗：`/tmp/paperclip-right-panel-red-ui.xcresult`，斷言「多裝置版本仍須呈現右側匯入與收藏欄」。
+- 模型／流程 26 項全通過：`ImportedAndSavedLocationTests` 6、`WorkflowQATests` 11、`ConnectionCRUDTests` 7、`CrossFeatureQATests` 2；證據 `/tmp/paperclip-right-panel-accepted.xcresult`。同輪 UI 兩項因原生面板不在欄位檢視而失敗，該輪整體為 27 通過／2 失敗／0 跳過，不當作全部通過。
+- 修正測試 helper 對 `ColumnView` 的假設後，三項真實 UI 全通過／0 失敗／0 跳過，exit 0：KML 命名取消匯入更新刪除重啟、GPX 匯入使用儲存重啟套用刪除、三裝置欄位與三模式下右欄位置及收合重啟。證據 `/tmp/paperclip-right-panel-ui-accepted.xcresult`。
+- Release build 成功，ad-hoc 簽章驗證成功；實際開啟並以系統視窗 API 設為 1400／1050 寬度，三欄皆可見，原有三筆收藏正常載入。XCTest runner 的直接 AX resize 缺權限，邊緣拖曳亦未改變尺寸，故縮放是人工／系統 API smoke 證據，不宣稱自動化 resize 通過。
+- 本輪不是完整套件或實機 GPS 驗收。三裝置保留案例使用既有 Python process endpoint，不宣稱三台實體 iPhone 驗證。仍觀察既有 QoS priority-inversion runtime warnings，未在此範圍修復。
+
 
 ### 最新根因與證據（16:07，尚未結案）
 

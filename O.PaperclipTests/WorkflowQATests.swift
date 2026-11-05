@@ -272,6 +272,43 @@ struct WorkflowQATests {
         #expect(vm.locationInputError?.contains("第 1 段") == true)
     }
 
+    @Test("開放 GPX 啟用閉圈後沿末點回起點移動，不重算道路或瞬移")
+    func importedGPXLoopIncludesReturnSegmentWhenActivated() throws {
+        let (vm, _, _, calculator) = make()
+        defer { vm.cleanup() }
+        let imported = try #require(GPXRouteParser.parse(
+            data: Data("<gpx><rte><rtept lat=\"0\" lon=\"0\"/><rtept lat=\"0\" lon=\"0.001\"/></rte></gpx>".utf8),
+            fallbackTitle: "開放軌跡", sourceName: "open.gpx", stableIDPrefix: "open", sourceFilePath: nil
+        ).first)
+        vm.useImportedGPXRoute(imported)
+        vm.isClosedLoop = true
+        #expect(vm.hasReadyDraft)
+        #expect(vm.draftRoutePoints.map(\.longitude) == [0, 0.001, 0])
+        #expect(vm.draftTotalRouteDistance > 222 && vm.draftTotalRouteDistance < 223)
+        #expect(vm.customRoutePolyline?.pointCount == 3)
+        vm.isClosedLoop = false
+        #expect(vm.hasReadyDraft)
+        #expect(vm.draftRoutePoints.map(\.longitude) == [0, 0.001])
+        vm.isClosedLoop = true
+        vm.handleMainAction()
+        #expect(calculator.requests.isEmpty)
+        #expect(vm.isActiveSimulationRunning)
+        #expect(vm.activeIsClosedLoop)
+        #expect(vm.currentRoutePoints.map(\.longitude) == [0, 0.001, 0])
+        #expect(vm.cumulativeRouteDistances.count == 3)
+        #expect(vm.totalRouteDistance > 222 && vm.totalRouteDistance < 223)
+        vm.speed = 36
+        vm.advanceSimulation(by: 16.7)
+        let returning = try #require(vm.currentPosition)
+        #expect(abs(returning.longitude - 0.0005) < 0.00001)
+        vm.advanceSimulation(by: 5.5)
+        let beforeWrap = try #require(vm.currentPosition)
+        vm.advanceSimulation(by: 0.1)
+        let afterWrap = try #require(vm.currentPosition)
+        #expect(CLLocation(latitude: beforeWrap.latitude, longitude: beforeWrap.longitude)
+            .distance(from: CLLocation(latitude: afterWrap.latitude, longitude: afterWrap.longitude)) < 1.1)
+    }
+
     @Test("GPS-04,25: failed and stale A-B/multi-point callbacks")
     func staleRoutes() {
         let (vm, _, _, calculator) = make()
