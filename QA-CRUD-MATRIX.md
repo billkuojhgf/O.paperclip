@@ -12,6 +12,10 @@
 
 ## 執行證據（持續更新，非結案）
 
+### 1.2.0 版本整合（2026-11-06）
+
+- 使用者驗收配對修復版後，要求合併回 main 並設版本為 `1.2.0`；App Debug／Release 同步為 `1.2.0 (124)`。包含 `20177e8` 的非 root 配對修復，不代表新增完整 Wi‑Fi／多裝置長跑驗收證據。
+
 ### 非 root 遠端配對權限修復（2026-11-05）
 
 - 使用者已信任且 USB 仍失敗；真機 worker traceback 定位為讀取 `~/.pymobiledevice3/remote_<UDID>.plist` 的 `PermissionError`，三台舊檔均為 root 擁有、權限 600。不是尚未信任。
