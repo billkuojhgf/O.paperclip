@@ -129,6 +129,8 @@ The map saves its camera center, distance, heading, and pitch after gestures, an
 
 Click `Stop` or `Clear Route` to stop GPS spoofing and return the device to its real location.
 
+While at least one device is connected and O.Paperclip is applying or holding a simulated location, it prevents idle sleep for the Mac and its display, even on battery. Pausing a route or reaching its endpoint keeps the protection; clearing the active location, disconnecting the last device, or closing the session window releases it. It does not prevent manual sleep or sleep when closing the lid.
+
 ---
 
 ## PurePoint Overlay

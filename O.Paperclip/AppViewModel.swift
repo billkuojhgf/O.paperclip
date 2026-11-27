@@ -149,6 +149,7 @@ final class AppViewModel {
     // MARK: - Private
     @ObservationIgnored private var moveTimer: Timer?
     @ObservationIgnored private var pinnedKeepAliveTimer: Timer?
+    @ObservationIgnored private(set) var locationActivity: (any NSObjectProtocol)? = nil
     @ObservationIgnored private var cancellables: Set<AnyCancellable> = []
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let savedItemsDirectory: URL?
@@ -1324,6 +1325,7 @@ final class AppViewModel {
             startStreamingAndSend(current)
             startPinnedLocationKeepAlive()
         } else {
+            setLocationActivityEnabled(false)
             stopPinnedLocationKeepAlive()
             deviceManager.stopContinuousLocationStream()
         }
@@ -1369,7 +1371,23 @@ final class AppViewModel {
         }
     }
 
+    private func setLocationActivityEnabled(_ enabled: Bool) {
+        if enabled {
+            guard locationActivity == nil else { return }
+            locationActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled],
+                reason: "O.Paperclip：模擬裝置定位"
+            )
+        } else if let locationActivity {
+            ProcessInfo.processInfo.endActivity(locationActivity)
+            self.locationActivity = nil
+        }
+    }
+
     private func startStreamingAndSend(_ coordinate: CLLocationCoordinate2D, updateLastSent: Bool = true) {
+        if updateLastSent {
+            setLocationActivityEnabled(deviceManager.isConnected)
+        }
         deviceManager.startContinuousLocationStream()
         sendCoordinateAsync(coordinate, updateLastSent: updateLastSent)
     }

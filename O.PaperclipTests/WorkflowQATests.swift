@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MapKit
+import SwiftUI
 import Testing
 @testable import O_Paperclip
 
@@ -115,8 +116,10 @@ struct WorkflowQATests {
     }
 
     @Test("GPS-01,02,17,21; LOC-05,06,07: fixed input, validation, explicit stop")
-    func fixedPointAndCoordinateInput() async {
+    func fixedPointAndCoordinateInput() async throws {
         let (vm, device, _, _) = make()
+        vm.startIfReadyAndConnected()
+        #expect(vm.locationActivity == nil)
         vm.operationMode = .fixedPoint
         vm.handleMainAction()
         #expect(device.sent.isEmpty)
@@ -130,28 +133,41 @@ struct WorkflowQATests {
         vm.insertCoordinateFromInput()
         #expect(vm.locationInputError == nil)
         #expect(vm.pointA?.latitude == 25)
+        #expect(vm.locationActivity == nil)
         vm.handleMainAction()
         defer { vm.stopSimulation(keepPinned: false) }
         #expect(device.sent.last?.latitude == 25)
         #expect(vm.isActiveSimulationRunning)
+        let activity = try #require(vm.locationActivity)
         vm.operationMode = .routeAB
         vm.switchModePreservingPinnedLocation()
         #expect(vm.activeOperationMode == .fixedPoint)
         #expect(vm.currentPosition?.latitude == 25)
+        #expect(vm.locationActivity === activity)
         vm.operationMode = .fixedPoint
         vm.switchModePreservingPinnedLocation()
         vm.handleMainAction()
+        #expect(vm.locationActivity == nil)
         #expect(!vm.hasActiveRouteSnapshot)
         #expect(vm.currentPosition == nil)
         #expect(device.stops > 0)
+
+        vm.insertPoint(a)
+        vm.handleMainAction()
+        #expect(vm.locationActivity != nil)
+        vm.cleanup()
+        #expect(vm.locationActivity == nil)
+        vm.cleanup()
+        #expect(vm.locationActivity == nil)
     }
 
     @Test("GPS-03,12..16,20,23,24,27,28; SET-04,05: route lifecycle and endpoint")
-    func routeLifecycle() {
+    func routeLifecycle() throws {
         let (vm, device, _, _) = make()
         route(vm)
         vm.handleMainAction()
         defer { vm.stopSimulation(keepPinned: false) }
+        let activity = try #require(vm.locationActivity)
         vm.speed = 36
         vm.advanceSimulation(by: 1)
         #expect(vm.traveledDistance == 10)
@@ -159,7 +175,13 @@ struct WorkflowQATests {
         vm.handleMainAction()
         #expect(!vm.isActiveSimulationRunning)
         #expect(device.sent.last?.latitude == position)
+        #expect(vm.locationActivity === activity)
+        vm.handleScenePhaseChange(.background)
+        #expect(vm.locationActivity === activity)
+        vm.handleScenePhaseChange(.active)
+        #expect(vm.locationActivity === activity)
         vm.handleMainAction()
+        #expect(vm.locationActivity === activity)
         vm.advanceSimulation(by: 1)
         #expect(vm.traveledDistance == 20)
         vm.operationMode = .multiPoint
@@ -169,23 +191,29 @@ struct WorkflowQATests {
         #expect(vm.waypoints.isEmpty)
         #expect(vm.isActiveSimulationRunning)
         #expect(vm.activeOperationMode == .routeAB)
+        #expect(vm.locationActivity === activity)
         vm.handleDeviceDisconnected()
         #expect(vm.isActiveSimulationRunning)
         #expect(vm.traveledDistance == 20)
+        #expect(vm.locationActivity === activity)
         device.isConnected = false
         vm.handleDeviceDisconnected()
+        #expect(vm.locationActivity == nil)
         #expect(!vm.isActiveSimulationRunning)
         #expect(vm.shouldResumeActiveAfterReconnect)
         device.isConnected = true
         vm.startIfReadyAndConnected()
+        let reconnectedActivity = try #require(vm.locationActivity)
         #expect(vm.traveledDistance == 20)
         vm.advanceSimulation(by: 20)
         #expect(!vm.isActiveSimulationRunning)
+        #expect(vm.locationActivity === reconnectedActivity)
         // MKPolyline projects coordinates; 1e-9 degrees permits sub-millimeter round-trip error.
         #expect(abs((vm.currentPosition?.latitude ?? .infinity) - b.latitude) < 1e-9)
         #expect(abs((device.sent.last?.latitude ?? .infinity) - b.latitude) < 1e-9)
         #expect(abs((vm.lastSentPosition?.latitude ?? .infinity) - b.latitude) < 1e-9)
         vm.resetActiveSession()
+        #expect(vm.locationActivity == nil)
         #expect(!vm.hasActiveRouteSnapshot)
         #expect(vm.currentPosition == nil)
         #expect(device.stops > 0)
