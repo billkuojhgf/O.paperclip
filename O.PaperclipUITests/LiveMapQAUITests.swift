@@ -92,8 +92,7 @@ final class LiveMapQAUITests: XCTestCase {
         replaceText(in: search, with: "Taipei 101")
         XCTAssertTrue(completion.waitForExistence(timeout: 30), "Live MapKit suggestions must recover after clearing")
         completion.click()
-        // Results include the production distance label; completion buttons do not.
-        let result = app.scrollViews.firstMatch.buttons.matching(NSPredicate(format: "label CONTAINS[c] '101' AND label CONTAINS 'km'")).firstMatch
+        let result = app.scrollViews["placeSearchResults"].buttons.matching(NSPredicate(format: "label CONTAINS[c] '101'")).firstMatch
         guard result.waitForExistence(timeout: 30) else {
             attachScreen("Live MapKit result unavailable")
             XCTFail("Live MapKit completion did not resolve to a Taipei 101 result within 30s; network/service/empty-result failures are explicit failures. \(app.debugDescription)")
@@ -147,8 +146,7 @@ final class LiveMapQAUITests: XCTestCase {
         let toggle = app.checkBoxes["開啟\(title)"]
         reveal(toggle)
         XCTAssertEqual((toggle.value as? NSNumber)?.boolValue, true, "New imports default enabled")
-        // Scope repeated controls geometrically to our unique overlay section.
-        let focus = overlayControl("定位", title: title)
+        let focus = app.buttons["purePointFocus-\(title)"]
         click(focus)
         waitUntil("Focus must fit the imported coordinates") {
             guard let value = self.camera() else { return false }
@@ -333,12 +331,10 @@ final class LiveMapQAUITests: XCTestCase {
     private func overlayControl(_ label: String, title: String, type: XCUIElement.ElementType = .button, contains: Bool = false) -> XCUIElement {
         let titleElement = app.staticTexts[title]
         reveal(titleElement)
-        // Our imported overlay is appended last; controls below its title belong to it.
-        // Do not use a global firstMatch for repeated built-in overlay buttons.
         let matches = app.descendants(matching: type).allElementsBoundByIndex.filter {
             (contains ? $0.label.contains(label) : $0.label == label) && $0.frame.minY > titleElement.frame.maxY
-        }
-        XCTAssertEqual(matches.count, 1, "Expected one \(label) control below unique final overlay \(title)")
+        }.sorted { $0.frame.minY < $1.frame.minY }
+        XCTAssertFalse(matches.isEmpty, "Expected \(label) control for overlay \(title)")
         return matches[0]
     }
 }

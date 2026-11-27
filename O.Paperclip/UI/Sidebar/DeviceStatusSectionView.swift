@@ -4,6 +4,7 @@ struct DeviceStatusSectionView: View {
     @Bindable var vm: AppViewModel
     let isCompactSidebar: Bool
     @Binding var isWirelessMode: Bool
+    @State private var showingWiFiDevices = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -21,7 +22,13 @@ struct DeviceStatusSectionView: View {
                     .foregroundColor((vm.deviceManager.isConnected || vm.deviceManager.isConnecting) ? .primary : .secondary)
                 Spacer()
                 if let group = vm.deviceManager as? DeviceGroup {
-                    Button(group.isConnecting ? "連線中…" : (group.isConnected ? "新增連線" : "開始連線")) { group.connectDevice() }
+                    Button(group.isConnecting ? "連線中…" : (group.isConnected ? "新增連線" : "開始連線")) {
+                        if isWirelessMode && group.manualRsdHost.isEmpty && group.manualRsdPort.isEmpty {
+                            showingWiFiDevices = true
+                        } else {
+                            group.connectDevice()
+                        }
+                    }
                         .disabled(group.isConnecting || group.devices.allSatisfy { $0.isConnected })
                     if group.isConnected || group.isConnecting {
                         Button("全部中斷") { group.disconnect() }
@@ -76,6 +83,11 @@ struct DeviceStatusSectionView: View {
             }
 
         }
+        .sheet(isPresented: $showingWiFiDevices) {
+            if let group = vm.deviceManager as? DeviceGroup {
+                WiFiDeviceSelectionView(group: group)
+            }
+        }
     }
 
     private var debugLogPanel: some View {
@@ -97,6 +109,75 @@ struct DeviceStatusSectionView: View {
         .cornerRadius(6)
     }
 
+}
+
+private struct WiFiDeviceSelectionView: View {
+    @ObservedObject var group: DeviceGroup
+    @Environment(\.dismiss) private var dismiss
+    @State private var devices: [DiscoveredWiFiDevice] = []
+    @State private var discoveredCount = 0
+    @State private var selected = Set<String>()
+    @State private var scanning = true
+    @State private var error: String?
+    @State private var showingLimit = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("選擇 Wi‑Fi 裝置").font(.headline)
+            if scanning {
+                ProgressView("正在掃描 Wi‑Fi 裝置…")
+            } else if let error {
+                Text(error).foregroundStyle(.red)
+            } else {
+                Text("找到 \(discoveredCount) 台裝置，可新增 \(devices.count) 台。")
+                Text("已選取 \(selected.count) 台")
+                if devices.isEmpty { Text("找不到新的裝置，請確認裝置與 Mac 位於同一個 Wi‑Fi 網路。") }
+                List(devices, selection: $selected) { device in
+                    VStack(alignment: .leading) {
+                        Text(device.name)
+                        Text(device.id).font(.caption).foregroundStyle(.secondary)
+                    }
+                    .tag(device.id)
+                }
+            }
+            Text("請先透過 USB 信任並配對裝置。⌘ 可多選，⇧ 可選取範圍。")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("確定連線") {
+                    let available = group.devices.filter { !$0.isConnected && !$0.isConnecting }.count
+                    guard selected.count <= available else { showingLimit = true; return }
+                    let identifiers = devices.filter { selected.contains($0.id) }.map(\.id)
+                    group.connectDevice(selected: identifiers)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(scanning || selected.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 480, height: 400)
+        .alert("最多同時連線三台裝置", isPresented: $showingLimit) {
+            Button("好", role: .cancel) { }
+        } message: {
+            Text("目前還可新增 \(group.devices.filter { !$0.isConnected && !$0.isConnecting }.count) 台，請調整選取。")
+        }
+        .task {
+            do {
+                let found = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[DiscoveredWiFiDevice], Error>) in
+                    group.devices[0].discoverWiFiDevices { continuation.resume(with: $0) }
+                }
+                guard !Task.isCancelled else { return }
+                discoveredCount = found.count
+                let occupied = Set(group.devices.filter { $0.isConnected || $0.isConnecting }.map(\.tunnelUDID))
+                devices = found.filter { !occupied.contains($0.id) }
+            } catch {
+                self.error = "掃描失敗：\(error.localizedDescription)"
+            }
+            scanning = false
+        }
+    }
 }
 
 private struct DeviceSlotView: View {

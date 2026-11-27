@@ -20,6 +20,29 @@ struct ConnectionCRUDTests {
     }
 
     @MainActor
+    @Test func selectedDevicesPreserveExistingConnectionAndRejectOverLimitAtomically() async throws {
+        let (root, group) = try processGroup(identifiers: ["phone-0", "phone-1", "phone-2", "phone-3"])
+        defer { group.disconnect(); try? FileManager.default.removeItem(at: root) }
+        func waitForConnection() async throws {
+            let deadline = Date().addingTimeInterval(20)
+            while group.isConnecting && Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            #expect(!group.isConnecting)
+        }
+        group.connectDevice(selected: ["phone-1"])
+        try await waitForConnection()
+        #expect(group.devices.filter(\.isConnected).map(\.tunnelUDID) == ["phone-1"])
+        group.connectDevice(selected: ["phone-0", "phone-2", "phone-3"])
+        try await waitForConnection()
+        #expect(group.lastError == "最多只能連線三台裝置。")
+        #expect(group.devices.filter(\.isConnected).map(\.tunnelUDID) == ["phone-1"])
+        group.connectDevice(selected: ["phone-3", "phone-0"])
+        try await waitForConnection()
+        #expect(group.devices.filter(\.isConnected).map(\.tunnelUDID) == ["phone-1", "phone-3", "phone-0"])
+        #expect(try lifecycle(at: root).filter { $0["event"] as? String == "setup" }.compactMap { $0["udid"] as? String } == ["phone-1", "phone-3", "phone-0"])
+        await group.disconnectAsync()
+    }
+
+    @MainActor
     @Test func oneDeviceThenAddWithoutRebuildingAndDeleteIndividually() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("crud-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

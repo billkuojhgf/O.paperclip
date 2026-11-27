@@ -63,7 +63,7 @@ CLI 與每裝置 worker 固定使用 `pymobiledevice3 11.49.2` 及同一份含 h
 
 ### 步驟一：連線裝置
 
-最多同時連線三台不同裝置。「開始連線／新增連線」只探索當次可用裝置並逐台連線；一台成功即可啟動 GPS，不會等待湊滿三台。新增不重建已連線裝置，各台可單獨中斷，也可全部中斷。已連線裝置同步位置／路線；重啟 App 後連線欄位清空，不恢復舊 UDID 或手動 RSD。UDID 欄位顯示本次連線身分，探索結果不會受上次殘留值限制。
+最多同時連線三台不同裝置。USB 模式會探索當次可用裝置並逐台連線；Wi‑Fi 模式會先掃描，再由使用者選取裝置。一台成功即可啟動 GPS，不會等待湊滿三台。新增不重建已連線裝置，各台可單獨中斷，也可全部中斷。已連線裝置同步位置／路線；重啟 App 後連線欄位清空，不恢復舊 UDID 或手動 RSD。
 
 開發驗收需先安裝 Xcode 與 iOS 27.0 Simulator runtime，再執行 `python3 O.PaperclipTests/SimulatorEvidence/prepare.py`（其他 runtime 可透過 `PAPERCLIP_SIMULATOR_RUNTIME` 指定）。此命令建立三個暫時 Simulator、以 Core Location 觀察程式執行完整測試，結束後刪除測試裝置。GUI 測試暫用 ASCII 鍵盤配置並恢復原輸入法。模擬通訊端點不代表已驗證實體手機 USB／Wi-Fi 配對或 tunnel。
 
@@ -80,7 +80,9 @@ CLI 與每裝置 worker 固定使用 `pymobiledevice3 11.49.2` 及同一份含 h
 1. 確保 iPhone 與 Mac 在同一個 Wi‑Fi 網路
 2. 開啟 O.Paperclip
 3. 在側邊欄的「連線模式」分段切換中切換為「Wi‑Fi」
-4. 點「開始連線」
+4. 點「開始連線」或「新增連線」，等待掃描完成。
+5. 在清單點選裝置：單擊選一台、按住 Command 點擊增減裝置、按住 Shift 點擊選取連續範圍。點「確定連線」後逐台連線；若加上已連線裝置超過三台，會顯示警告並保留選取供調整。
+6. 掃描只顯示 Mac 能探索到的 iPhone／iPad；找到裝置不表示配對已完成。首次使用仍須先透過 USB 信任並建立本 App 的遠端配對。
 
 > 若目前已經透過 USB 成功連線，可直接切換為 Wi‑Fi；App 會自動中斷目前連線並重新建立 Wi‑Fi tunnel。
 

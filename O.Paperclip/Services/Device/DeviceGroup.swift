@@ -65,7 +65,9 @@ final class DeviceGroup: ObservableObject, DeviceControlling {
         set { devices.forEach { $0.isWirelessMode = newValue } }
     }
 
-    func connectDevice() {
+    func connectDevice() { connectDevice(selected: nil) }
+
+    func connectDevice(selected: [String]?) {
         guard !connecting else { return }
         generation += 1
         let current = generation
@@ -77,7 +79,7 @@ final class DeviceGroup: ObservableObject, DeviceControlling {
                 if self.generation == current { self.connecting = false; self.connectionTask = nil }
             }
             do {
-                if !self.devices[0].isConnected && (!self.manualRsdHost.isEmpty || !self.manualRsdPort.isEmpty) {
+                if selected == nil && !self.devices[0].isConnected && (!self.manualRsdHost.isEmpty || !self.manualRsdPort.isEmpty) {
                     try await self.devices[0].connectDeviceAsync()
                     try Task.checkCancellation()
                     guard self.generation == current else { return }
@@ -86,16 +88,25 @@ final class DeviceGroup: ObservableObject, DeviceControlling {
                         try await self.devices[0].sendLocationToDeviceAsync(latitude: coordinate.latitude, longitude: coordinate.longitude)
                     }
                 }
-                let identifiers = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
-                    self.devices[0].discoverDeviceIdentifiers { continuation.resume(with: $0) }
+                let identifiers: [String]
+                if let selected {
+                    identifiers = selected
+                } else {
+                    identifiers = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
+                        self.devices[0].discoverDeviceIdentifiers { continuation.resume(with: $0) }
+                    }
                 }
                 try Task.checkCancellation()
                 guard self.generation == current else { return }
-                let occupied = Set(self.devices.filter { $0.isConnected }.map { $0.tunnelUDID })
+                let occupied = Set(self.devices.filter { $0.isConnected || $0.isConnecting }.map { $0.tunnelUDID })
                 var seen = occupied
                 let candidates = identifiers.filter { !$0.isEmpty && seen.insert($0).inserted }
-                let slots = self.devices.filter { !$0.isConnected }
+                let slots = self.devices.filter { !$0.isConnected && !$0.isConnecting }
                 guard !slots.isEmpty else { self.operationError = "最多只能連線三台裝置。"; return }
+                if selected != nil && candidates.count > slots.count {
+                    self.operationError = "最多只能連線三台裝置。"
+                    return
+                }
                 guard !candidates.isEmpty else {
                     if self.devices[0].activeConnectionLabel == "手動 RSD" { return }
                     self.operationError = self.isConnected ? "沒有新的可連線裝置。" : "未找到可連線的裝置。"

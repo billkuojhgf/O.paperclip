@@ -79,6 +79,7 @@ struct PurePointOverlaySection: View {
                         .foregroundColor(.secondary)
                     Spacer()
                     Button("定位") { onFocus() }
+                        .accessibilityIdentifier("purePointFocus-\(overlay.title)")
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(visiblePoints.isEmpty)

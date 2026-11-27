@@ -92,6 +92,7 @@ struct LocationInputSectionView: View {
                     }
                 }
                 .frame(maxHeight: 140)
+                .accessibilityIdentifier("placeSearchResults")
             }
 
             HStack(spacing: 6) {

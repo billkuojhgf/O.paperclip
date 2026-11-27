@@ -248,6 +248,11 @@ final class RotatingRuntimeLogStore: @unchecked Sendable {
 }
 
 
+struct DiscoveredWiFiDevice: Identifiable, Sendable {
+    let id: String
+    let name: String
+}
+
 enum RemoteBrowseOutputParser {
     nonisolated static func identifiers(in raw: String) -> [String] {
         let jsonIdentifiers = identifiersFromJSON(raw)
@@ -324,6 +329,13 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
         }
     }
 
+    private struct NativeWiFiDevice: Decodable {
+        let udid: String
+        let name: String?
+        let networkAdvertActive: Bool?
+    }
+
+
     private let sendQueue = DispatchQueue(label: "paperclip.gps.sender", qos: .utility)
     private let connectionQueue = DispatchQueue(label: "paperclip.connection", qos: .utility)
     private let stateLock = NSLock()
@@ -374,6 +386,21 @@ final class DeviceManager: ObservableObject, DeviceControlling, @unchecked Senda
                 }
                 var seen = Set<String>()
                 completion(.success(ids.filter { !$0.isEmpty && seen.insert($0).inserted }))
+            } catch { completion(.failure(error)) }
+        }
+    }
+
+    func discoverWiFiDevices(completion: @escaping @Sendable (Result<[DiscoveredWiFiDevice], Error>) -> Void) {
+        connectionQueue.async {
+            do {
+                let cmd = try self.resolveCLI()
+                let raw = try self.runWithTimeout(cmd + ["remote", "browse", "--native"], timeout: 8)
+                let devices = try JSONDecoder().decode([NativeWiFiDevice].self, from: Data(raw.utf8))
+                var seen = Set<String>()
+                completion(.success(devices.compactMap { device in
+                    guard device.networkAdvertActive != false, !device.udid.isEmpty, seen.insert(device.udid).inserted else { return nil }
+                    return DiscoveredWiFiDevice(id: device.udid, name: device.name ?? device.udid)
+                }))
             } catch { completion(.failure(error)) }
         }
     }

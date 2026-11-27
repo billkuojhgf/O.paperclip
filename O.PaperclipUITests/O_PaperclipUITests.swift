@@ -75,6 +75,44 @@ final class O_PaperclipUITests: XCTestCase {
         if app.buttons["顯示右側欄"].exists { app.buttons["顯示右側欄"].click() }
     }
 
+    func testWiFiConnectionOpensDeviceSelectionBeforeConnecting() throws {
+        launchAppWindow()
+        let wifi = app.radioButtons["Wi‑Fi"]
+        reveal(wifi)
+        wifi.click()
+        let connect = app.buttons["開始連線"]
+        reveal(connect)
+        connect.click()
+        XCTAssertTrue(app.sheets.staticTexts["選擇 Wi‑Fi 裝置"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.sheets.buttons["取消"].exists)
+        XCTAssertTrue(app.sheets.buttons["確定連線"].exists)
+        app.sheets.buttons["取消"].click()
+    }
+
+    func testPhysicalWiFiSelectionModifiers() throws {
+        launchAppWindow()
+        let wifi = app.radioButtons["Wi‑Fi"]
+        reveal(wifi)
+        wifi.click()
+        let connect = app.buttons["開始連線"]
+        reveal(connect)
+        connect.click()
+        let rows = app.sheets.firstMatch.outlineRows
+        XCTAssertTrue(rows.element(boundBy: 1).waitForExistence(timeout: 20), "需要至少兩台可探索的實體裝置")
+        XCTAssertTrue(app.sheets.staticTexts["已選取 0 台"].waitForExistence(timeout: 5))
+        let first = rows.element(boundBy: 0).staticTexts.firstMatch
+        let second = rows.element(boundBy: 1).staticTexts.firstMatch
+        first.click()
+        XCTAssertTrue(app.sheets.staticTexts["已選取 1 台"].waitForExistence(timeout: 5))
+        XCUIElement.perform(withKeyModifiers: .command) { second.click() }
+        XCTAssertTrue(app.sheets.staticTexts["已選取 2 台"].waitForExistence(timeout: 5))
+        second.click()
+        XCTAssertTrue(app.sheets.staticTexts["已選取 1 台"].waitForExistence(timeout: 5))
+        XCUIElement.perform(withKeyModifiers: .shift) { first.click() }
+        XCTAssertTrue(app.sheets.staticTexts["已選取 2 台"].waitForExistence(timeout: 5))
+        app.sheets.buttons["取消"].click()
+    }
+
     func testRightPanelGPXImportSaveRelaunchAndApplyPreservesRoute() throws {
         let token = UUID().uuidString
         let routeTitle = "XCUI-GPX-\(token)"

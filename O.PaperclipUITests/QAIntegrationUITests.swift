@@ -375,11 +375,8 @@ final class QAIntegrationUITests: XCTestCase {
         importButton.click()
         let panel = app.sheets["open-panel"]
         XCTAssertTrue(panel.waitForExistence(timeout: 5))
-        let browser = panel.descendants(matching: .browser)["ColumnView"]
-        XCTAssertTrue(browser.waitForExistence(timeout: 5))
-        browser.click()
         selectASCIIKeyboard()
-        browser.typeKey("g", modifierFlags: [.command, .shift])
+        panel.typeKey("g", modifierFlags: [.command, .shift])
         let pathSheet = panel.sheets.firstMatch
         let pathField = pathSheet.textFields.firstMatch
         XCTAssertTrue(pathField.waitForExistence(timeout: 5))
